@@ -36,6 +36,13 @@ type PublicKeyResponse = {
   public_key_pem: string
 }
 
+type AppInfo = {
+  name: string
+  version: string
+  project_url: string
+  ui_path: string
+}
+
 type Profile = {
   username: string
 }
@@ -209,6 +216,7 @@ const addingClientRule = ref(false)
 const clientControlError = ref('')
 const clientStatusFilter = ref<ClientStatusFilter>('all')
 const clientKeywordFilter = ref('')
+const visibleApiKeyServers = ref<Record<string, boolean>>({})
 let dashboardTimer: number | undefined
 let logsTimer: number | undefined
 
@@ -229,6 +237,13 @@ const passwordForm = reactive({
   current_password: '',
   new_password: '',
   confirm_password: '',
+})
+
+const appInfo = reactive<AppInfo>({
+  name: 'EmbyPanel',
+  version: '',
+  project_url: '',
+  ui_path: '/ui/',
 })
 
 const manualClientRule = reactive({
@@ -372,6 +387,7 @@ async function bootstrap() {
   mode.value = 'loading'
   error.value = ''
   try {
+    await refreshAppInfo()
     publicKey.value = await fetchPublicKey()
     const status = await api<{ initialized: boolean }>('/api/setup-status')
     if (!status.initialized) {
@@ -387,6 +403,14 @@ async function bootstrap() {
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
     mode.value = token.value ? 'app' : 'login'
+  }
+}
+
+async function refreshAppInfo() {
+  try {
+    Object.assign(appInfo, await api<AppInfo>('/api/app-info'))
+  } catch {
+    appInfo.version = ''
   }
 }
 
@@ -561,11 +585,24 @@ function removeServer(serverId: string) {
   const confirmed = window.confirm('确定删除这个服务器配置吗？对应反代端口保存后会停止监听。')
   if (!confirmed) return
   settings.servers = settings.servers.filter((server) => server.id !== serverId)
+  const { [serverId]: _removed, ...visibleServers } = visibleApiKeyServers.value
+  visibleApiKeyServers.value = visibleServers
 }
 
 function newServerId() {
   const bytes = randomBytes(8)
   return `server-${bytesToBase64Url(bytes)}`
+}
+
+function isApiKeyVisible(serverId: string) {
+  return Boolean(visibleApiKeyServers.value[serverId])
+}
+
+function toggleApiKeyVisible(serverId: string) {
+  visibleApiKeyServers.value = {
+    ...visibleApiKeyServers.value,
+    [serverId]: !visibleApiKeyServers.value[serverId],
+  }
 }
 
 async function saveProfile() {
@@ -1243,8 +1280,8 @@ onBeforeUnmount(stopDashboardPolling)
       <div class="brand-row compact">
         <div class="logo-mark">E</div>
         <div>
-          <strong>EmbyPanel</strong>
-          <small>v0.1.0</small>
+          <strong>{{ appInfo.name }}</strong>
+          <small>{{ appInfo.version || '版本读取中' }}</small>
         </div>
       </div>
 
@@ -1446,7 +1483,23 @@ onBeforeUnmount(stopDashboardPolling)
                 </label>
                 <label>
                   <span>Emby API Key</span>
-                  <input v-model="server.emby_api_key" type="password" />
+                  <div class="secret-input">
+                    <input
+                      v-model="server.emby_api_key"
+                      :type="isApiKeyVisible(server.id) ? 'text' : 'password'"
+                      autocomplete="off"
+                    />
+                    <button
+                      type="button"
+                      class="secret-toggle"
+                      :aria-pressed="isApiKeyVisible(server.id)"
+                      :aria-label="isApiKeyVisible(server.id) ? '隐藏 Emby API Key' : '显示 Emby API Key'"
+                      :title="isApiKeyVisible(server.id) ? '隐藏 Emby API Key' : '显示 Emby API Key'"
+                      @click="toggleApiKeyVisible(server.id)"
+                    >
+                      <span :class="['eye-icon', { off: !isApiKeyVisible(server.id) }]" aria-hidden="true" />
+                    </button>
+                  </div>
                 </label>
                 <label>
                   <span>反代端口</span>

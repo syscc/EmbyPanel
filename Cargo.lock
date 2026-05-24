@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "emby302gateway-rs"
-version = "0.1.0"
+version = "0.0.5"
 dependencies = [
  "aes-gcm",
  "argon2",

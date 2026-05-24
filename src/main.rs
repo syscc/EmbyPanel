@@ -24,7 +24,7 @@ use std::{
 };
 
 use axum::{
-    Router,
+    Json, Router,
     extract::{ConnectInfo, Request, State},
     http::{Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
@@ -35,6 +35,7 @@ use config::Config;
 use crypto_api::CryptoKeys;
 use db::SettingsStore;
 use error::{AppError, AppResult};
+use serde::Serialize;
 use tokio::{
     sync::{Mutex, RwLock, oneshot},
     task::JoinHandle,
@@ -51,6 +52,37 @@ use crate::cache::DirectLinkCache;
 use activity_log::{ActivityKind, ActivityLevel, ActivityLogStore, PlaybackLogRecord};
 
 const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
+const PROJECT_NAME: &str = "EmbyPanel";
+const PROJECT_URL: &str = "https://github.com/syscc/EmbyPanel";
+
+#[derive(Serialize)]
+struct AppInfo {
+    name: &'static str,
+    version: String,
+    project_url: &'static str,
+    ui_path: &'static str,
+}
+
+async fn app_info() -> Json<AppInfo> {
+    Json(AppInfo {
+        name: PROJECT_NAME,
+        version: app_version(),
+        project_url: PROJECT_URL,
+        ui_path: "/ui/",
+    })
+}
+
+fn app_version() -> String {
+    env::var("EMBYPANEL_VERSION")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            option_env!("EMBYPANEL_BUILD_VERSION")
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")))
+}
 
 #[derive(Clone)]
 struct TzTimer {
@@ -304,9 +336,15 @@ async fn main() -> AppResult<()> {
         ActivityKind::General,
         ActivityLevel::Info,
         None,
-        "EmbyPanel",
+        PROJECT_NAME,
         "面板服务初始化",
         format!("数据库 {}", db::database_path().display()),
+    );
+    tracing::info!(
+        project = PROJECT_NAME,
+        version = %app_version(),
+        url = PROJECT_URL,
+        "EmbyPanel startup"
     );
 
     if state.settings_store.has_admin()? && !state.config.read().await.proxy_configs().is_empty() {
@@ -320,13 +358,16 @@ async fn main() -> AppResult<()> {
         ActivityKind::General,
         ActivityLevel::Info,
         None,
-        "EmbyPanel",
+        PROJECT_NAME,
         "管理 API 运行中",
         format!("http://{}", listener.local_addr()?),
     );
     tracing::info!(
-        "EmbyPanel management API listening on http://{}",
-        listener.local_addr()?
+        project = PROJECT_NAME,
+        version = %app_version(),
+        project_url = PROJECT_URL,
+        ui = %format!("http://{}/ui/", listener.local_addr()?),
+        "EmbyPanel management UI listening"
     );
 
     let result = axum::serve(listener, app)
@@ -478,6 +519,7 @@ fn build_management_app(state: AppState) -> Router {
             get(|| async { proxy::redirect_response("/ui/".to_string()) }),
         )
         .route("/api/setup-status", get(auth::setup_status))
+        .route("/api/app-info", get(app_info))
         .route("/api/public-key", get(crypto_api::public_key))
         .route("/api/setup", axum::routing::post(auth::setup))
         .route("/api/login", axum::routing::post(auth::login))

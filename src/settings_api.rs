@@ -92,10 +92,6 @@ pub async fn restart_proxy_server(
 }
 
 fn redact_config_secrets(mut config: Config) -> Config {
-    config.emby_api_key = String::new();
     config.openlist_token = None;
-    for server in &mut config.servers {
-        server.emby_api_key = String::new();
-    }
     config
 }

@@ -1106,6 +1106,69 @@ label span {
   font-weight: 700;
 }
 
+.secret-input {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 42px;
+  align-items: center;
+}
+
+.secret-input input {
+  border-radius: 6px 0 0 6px;
+}
+
+.secret-toggle {
+  height: 38px;
+  border: 1px solid var(--border-strong);
+  border-left: 0;
+  border-radius: 0 6px 6px 0;
+  background: var(--button-bg);
+  color: var(--button-text);
+  padding: 0;
+  display: grid;
+  place-items: center;
+}
+
+.secret-toggle:hover {
+  background: var(--button-hover);
+}
+
+.secret-input:focus-within input,
+.secret-input:focus-within .secret-toggle {
+  border-color: var(--primary);
+}
+
+.eye-icon {
+  position: relative;
+  width: 19px;
+  height: 12px;
+  border: 2px solid currentColor;
+  border-radius: 999px / 760px;
+}
+
+.eye-icon::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  transform: translate(-50%, -50%);
+}
+
+.eye-icon.off::before {
+  content: "";
+  position: absolute;
+  top: -5px;
+  left: 8px;
+  width: 2px;
+  height: 22px;
+  border-radius: 999px;
+  background: currentColor;
+  transform: rotate(45deg);
+}
+
 label {
   display: grid;
   gap: 7px;

@@ -1,5 +1,29 @@
 # 版本更新日志
 
+## v0.0.5
+
+发布时间：2026-05-24
+
+### 新增
+
+- Docker 启动日志增加项目名称、项目地址、项目版本号和管理 UI 地址。
+- 新增 `/api/app-info` 接口，前端左上角版本号从后端读取，不再硬编码。
+- Docker 构建时自动把 Git tag 注入容器版本号，例如 `v0.0.5`。
+
+### 优化
+
+- 服务器配置里的 `Emby API Key` 默认隐藏，改为眼睛按钮切换显示/隐藏。
+- 管理员登录后，服务器配置页面支持查看已保存的 `Emby API Key`。
+- 源码运行时版本号与 `Cargo.toml` 保持一致。
+
+### 验证
+
+- `cargo fmt --check`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test`
+- `cd frontend && npm run build`
+- `cargo build --release --locked`
+
 ## v0.0.4
 
 发布时间：2026-05-24

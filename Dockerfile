@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1
 
+ARG APP_VERSION=dev
+
 FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
@@ -10,6 +12,8 @@ RUN npm run build
 FROM --platform=$BUILDPLATFORM rust:1-bookworm AS backend-builder
 WORKDIR /app
 ARG TARGETARCH
+ARG APP_VERSION
+ENV EMBYPANEL_BUILD_VERSION=$APP_VERSION
 RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
     && rm -rf /var/lib/apt/lists/*
@@ -29,8 +33,10 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
 
 FROM --platform=$TARGETPLATFORM gcr.io/distroless/cc-debian12
 WORKDIR /app
+ARG APP_VERSION
 ENV TZ=Asia/Shanghai \
-    EMBYPANEL_API_ADDR=0.0.0.0:8090
+    EMBYPANEL_API_ADDR=0.0.0.0:8090 \
+    EMBYPANEL_VERSION=$APP_VERSION
 COPY --from=backend-builder /app/emby302gateway-rs /app/emby302gateway-rs
 COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
 COPY data/config.toml.example /data/config.toml.example
