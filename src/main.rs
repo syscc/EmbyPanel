@@ -340,12 +340,9 @@ async fn main() -> AppResult<()> {
         "面板服务初始化",
         format!("数据库 {}", db::database_path().display()),
     );
-    tracing::info!(
-        project = PROJECT_NAME,
-        version = %app_version(),
-        url = PROJECT_URL,
-        "EmbyPanel startup"
-    );
+    tracing::info!("项目名称: {}", PROJECT_NAME);
+    tracing::info!("项目版本: {}", app_version());
+    tracing::info!("项目地址: {}", PROJECT_URL);
 
     if state.settings_store.has_admin()? && !state.config.read().await.proxy_configs().is_empty() {
         proxy_manager.ensure_running(state.clone()).await?;
@@ -362,13 +359,7 @@ async fn main() -> AppResult<()> {
         "管理 API 运行中",
         format!("http://{}", listener.local_addr()?),
     );
-    tracing::info!(
-        project = PROJECT_NAME,
-        version = %app_version(),
-        project_url = PROJECT_URL,
-        ui = %format!("http://{}/ui/", listener.local_addr()?),
-        "EmbyPanel management UI listening"
-    );
+    tracing::info!("管理 UI: http://{}/ui/", listener.local_addr()?);
 
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
