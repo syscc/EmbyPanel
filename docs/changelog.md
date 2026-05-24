@@ -1,5 +1,21 @@
 # 版本更新日志
 
+## v0.0.4
+
+发布时间：2026-05-24
+
+### 修复
+
+- 过期面板登录态请求不再写入容器运行日志。
+  - 旧浏览器页面、旧手机页面或未刷新的面板标签页可能继续用失效 token 轮询接口。
+  - 这类请求属于正常鉴权拒绝，不影响 Emby 反代和播放，不再输出 `invalid or expired session` 日志。
+
+### 验证
+
+- `cargo fmt --check`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test`
+
 ## v0.0.3
 
 发布时间：2026-05-24

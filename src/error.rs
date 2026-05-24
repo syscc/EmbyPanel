@@ -64,7 +64,7 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match &self {
-            Self::Unauthorized(_) => tracing::info!(error = %self, "request unauthorized"),
+            Self::Unauthorized(_) => {}
             Self::Validation(_) => tracing::warn!(error = %self, "request validation failed"),
             _ => tracing::error!(error = %self, "request failed"),
         }
