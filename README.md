@@ -24,7 +24,8 @@ EmbyPanel 是一个 Rust + Vue 实现的 Emby STRM 直链反代面板。后端�
 ├── data/
 │   └── config.toml.example        # 配置模板；运行数据库和日志不提交
 ├── docs/
-│   └── 302-redirect.md            # 302 直链反代实现原理
+│   ├── 302-redirect.md            # 302 直链反代实现原理
+│   └── changelog.md               # 版本更新日志
 ├── frontend/
 │   ├── src/                       # Vue 面板源码
 │   ├── index.html
