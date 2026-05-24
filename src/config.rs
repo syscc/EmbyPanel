@@ -32,6 +32,14 @@ pub struct Config {
     pub internal_redirect_timeout_seconds: u64,
     #[serde(default)]
     pub strm_url_mappings: String,
+    #[serde(default = "default_connectivity_check_enabled")]
+    pub connectivity_check_enabled: bool,
+    #[serde(default = "default_connectivity_check_interval_seconds")]
+    pub connectivity_check_interval_seconds: u64,
+    #[serde(default = "default_connectivity_check_timeout_seconds")]
+    pub connectivity_check_timeout_seconds: u64,
+    #[serde(default = "default_connectivity_auto_restart_seconds")]
+    pub connectivity_auto_restart_seconds: u64,
     #[serde(skip)]
     pub strm_url_mapping_rules: Vec<UrlMappingRule>,
 }
@@ -68,6 +76,10 @@ impl Config {
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: default_internal_redirect_timeout_seconds(),
             strm_url_mappings: String::new(),
+            connectivity_check_enabled: default_connectivity_check_enabled(),
+            connectivity_check_interval_seconds: default_connectivity_check_interval_seconds(),
+            connectivity_check_timeout_seconds: default_connectivity_check_timeout_seconds(),
+            connectivity_auto_restart_seconds: default_connectivity_auto_restart_seconds(),
             strm_url_mapping_rules: Vec::new(),
         }
     }
@@ -142,6 +154,11 @@ impl Config {
                 "internal_redirect_timeout_seconds must be positive".to_string(),
             ));
         }
+        self.connectivity_check_interval_seconds =
+            self.connectivity_check_interval_seconds.clamp(10, 3600);
+        self.connectivity_check_timeout_seconds =
+            self.connectivity_check_timeout_seconds.clamp(1, 60);
+        self.connectivity_auto_restart_seconds = self.connectivity_auto_restart_seconds.min(86400);
         self.strm_url_mapping_rules = url_mapping::parse_rules(&self.strm_url_mappings)?;
         Ok(())
     }
@@ -250,6 +267,22 @@ fn default_internal_redirect_timeout_seconds() -> u64 {
     15
 }
 
+fn default_connectivity_check_enabled() -> bool {
+    true
+}
+
+fn default_connectivity_check_interval_seconds() -> u64 {
+    60
+}
+
+fn default_connectivity_check_timeout_seconds() -> u64 {
+    5
+}
+
+fn default_connectivity_auto_restart_seconds() -> u64 {
+    180
+}
+
 fn required(name: &str, value: &str) -> AppResult<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -352,6 +385,10 @@ mod tests {
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            connectivity_check_enabled: true,
+            connectivity_check_interval_seconds: 60,
+            connectivity_check_timeout_seconds: 5,
+            connectivity_auto_restart_seconds: 180,
             strm_url_mapping_rules: Vec::new(),
         };
 
@@ -375,6 +412,10 @@ mod tests {
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            connectivity_check_enabled: true,
+            connectivity_check_interval_seconds: 60,
+            connectivity_check_timeout_seconds: 5,
+            connectivity_auto_restart_seconds: 180,
             strm_url_mapping_rules: Vec::new(),
         };
 
@@ -398,6 +439,10 @@ mod tests {
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            connectivity_check_enabled: true,
+            connectivity_check_interval_seconds: 60,
+            connectivity_check_timeout_seconds: 5,
+            connectivity_auto_restart_seconds: 180,
             strm_url_mapping_rules: Vec::new(),
         };
 
@@ -427,6 +472,10 @@ mod tests {
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            connectivity_check_enabled: true,
+            connectivity_check_interval_seconds: 60,
+            connectivity_check_timeout_seconds: 5,
+            connectivity_auto_restart_seconds: 180,
             strm_url_mapping_rules: Vec::new(),
         };
 
@@ -450,6 +499,10 @@ mod tests {
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            connectivity_check_enabled: true,
+            connectivity_check_interval_seconds: 60,
+            connectivity_check_timeout_seconds: 5,
+            connectivity_auto_restart_seconds: 180,
             strm_url_mapping_rules: Vec::new(),
         };
 
@@ -473,6 +526,10 @@ mod tests {
             enable_internal_redirect: true,
             internal_redirect_timeout_seconds: 0,
             strm_url_mappings: String::new(),
+            connectivity_check_enabled: true,
+            connectivity_check_interval_seconds: 60,
+            connectivity_check_timeout_seconds: 5,
+            connectivity_auto_restart_seconds: 180,
             strm_url_mapping_rules: Vec::new(),
         };
 
@@ -496,6 +553,10 @@ mod tests {
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: "https://openlist\\.yyej\\.com => http://localhost:5244".to_string(),
+            connectivity_check_enabled: true,
+            connectivity_check_interval_seconds: 60,
+            connectivity_check_timeout_seconds: 5,
+            connectivity_auto_restart_seconds: 180,
             strm_url_mapping_rules: Vec::new(),
         };
 

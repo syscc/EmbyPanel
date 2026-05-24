@@ -476,6 +476,11 @@ pub async fn get_media_overview(
     })
 }
 
+pub async fn validate_connection(client: &reqwest::Client, config: &Config) -> AppResult<()> {
+    let _ = get_system_info(client, config).await?;
+    Ok(())
+}
+
 async fn get_item_counts(
     client: &reqwest::Client,
     config: &Config,

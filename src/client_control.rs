@@ -985,6 +985,42 @@ pub async fn notify_client_rule_hit(
     }
 }
 
+pub async fn notify_connectivity_issue(
+    state: &AppState,
+    server_id: &str,
+    server_name: &str,
+    title: &str,
+    text: &str,
+) {
+    let Ok(config) = load_or_default(state) else {
+        return;
+    };
+    if !config.notify_enabled {
+        return;
+    }
+
+    for webhook in active_webhooks(config.webhooks) {
+        if let Err(err) = send_webhook(
+            &state.client,
+            &webhook.url,
+            Some(webhook.secret.as_str()),
+            title,
+            text,
+        )
+        .await
+        {
+            state.activity_log.record(
+                crate::activity_log::ActivityKind::General,
+                crate::activity_log::ActivityLevel::Warn,
+                Some(server_id),
+                server_name,
+                "连通性巡检通知发送失败",
+                format!("{} 发送失败: {err}", webhook.name),
+            );
+        }
+    }
+}
+
 pub async fn enforce_playback_rate_limit(
     state: &AppState,
     input: PlaybackRateLimitInput<'_>,

@@ -3,6 +3,7 @@ mod auth;
 mod cache;
 mod client_control;
 mod config;
+mod connectivity;
 mod crypto_api;
 mod db;
 mod emby;
@@ -21,7 +22,7 @@ use std::{
     env, fmt,
     net::SocketAddr,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -34,7 +35,7 @@ use axum::{
 use bytes::Bytes;
 use config::Config;
 use crypto_api::CryptoKeys;
-use db::{RequestStatKind, SettingsStore};
+use db::{ProxyRequestDetailInsert, RequestStatKind, SettingsStore};
 use error::{AppError, AppResult};
 use serde::Serialize;
 use tokio::{
@@ -163,6 +164,7 @@ struct AppState {
     crypto_keys: CryptoKeys,
     activity_log: Arc<ActivityLogStore>,
     file_log: Arc<FileLogStore>,
+    connectivity: Arc<connectivity::ConnectivityMonitor>,
     proxy_manager: Option<Arc<ProxyManager>>,
     proxy_server_id: Option<String>,
     playback_users: Arc<Mutex<HashMap<String, String>>>,
@@ -279,7 +281,7 @@ impl ProxyManager {
         self.ensure_running(state).await
     }
 
-    async fn restart_server(&self, state: AppState, server_id: &str) -> AppResult<()> {
+    pub(crate) async fn restart_server(&self, state: AppState, server_id: &str) -> AppResult<()> {
         let config = state
             .config
             .read()
@@ -402,6 +404,7 @@ async fn main() -> AppResult<()> {
         crypto_keys: CryptoKeys::generate()?,
         activity_log: Arc::new(ActivityLogStore::new(800)),
         file_log,
+        connectivity: Arc::new(connectivity::ConnectivityMonitor::new()),
         proxy_manager: Some(proxy_manager.clone()),
         proxy_server_id: None,
         playback_users: Arc::new(Mutex::new(HashMap::new())),
@@ -429,6 +432,7 @@ async fn main() -> AppResult<()> {
     if state.settings_store.has_admin()? && !state.config.read().await.proxy_configs().is_empty() {
         proxy_manager.ensure_running(state.clone()).await?;
     }
+    let connectivity_task = connectivity::start_connectivity_monitor(state.clone());
 
     let listen_addr = management_listen_addr()?;
     let app = build_management_app(state.clone());
@@ -452,6 +456,7 @@ async fn main() -> AppResult<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|err| AppError::Internal(format!("server error: {err}")));
+    connectivity_task.abort();
     proxy_manager.shutdown().await;
     result
 }
@@ -516,6 +521,10 @@ async fn handle_request(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     request: Request,
 ) -> AppResult<Response> {
+    let timing = RequestTiming {
+        started_at_ms: now_ms(),
+        started: Instant::now(),
+    };
     let (parts, body) = request.into_parts();
     let method = parts.method;
     let uri = parts.uri;
@@ -568,6 +577,24 @@ async fn handle_request(
             )
             .await;
             record_stat(&state, &config, RequestStatKind::Block).await;
+            record_proxy_request_detail(
+                &state,
+                &config,
+                ProxyRequestDetailInput {
+                    method: method.as_str(),
+                    uri: &uri,
+                    path_type: request_path_type(path),
+                    status_code: StatusCode::FORBIDDEN.as_u16(),
+                    outcome: "UA 拦截",
+                    started_at_ms: timing.started_at_ms,
+                    duration_ms: timing.started.elapsed().as_millis(),
+                    playback_user: &rule.user_name,
+                    playback_ip: &playback_ip,
+                    cache_hit: false,
+                    blocked: true,
+                    detail: &rule.user_agent,
+                },
+            );
             return Ok((StatusCode::FORBIDDEN, "client disabled by EmbyPanel").into_response());
         }
     }
@@ -589,23 +616,89 @@ async fn handle_request(
     }
 
     if rewrite::is_base_html_player(path) {
-        return handle_base_html_player(&state, method, uri, headers, body).await;
+        let result =
+            handle_base_html_player(&state, method.clone(), uri.clone(), headers, body).await;
+        if let Ok(response) = &result {
+            let status = response.status();
+            let config = proxy_config(&state).await;
+            record_proxy_request_detail(
+                &state,
+                &config,
+                ProxyRequestDetailInput {
+                    method: method.as_str(),
+                    uri: &uri,
+                    path_type: "base_html_player",
+                    status_code: status.as_u16(),
+                    outcome: response_outcome(status),
+                    started_at_ms: timing.started_at_ms,
+                    duration_ms: timing.started.elapsed().as_millis(),
+                    playback_user: "--",
+                    playback_ip: "--",
+                    cache_hit: false,
+                    blocked: false,
+                    detail: "",
+                },
+            );
+        }
+        return result;
     }
 
     if rewrite::is_system_info(path) {
-        return handle_system_info(&state, method, uri, headers, body).await;
+        let result = handle_system_info(&state, method.clone(), uri.clone(), headers, body).await;
+        if let Ok(response) = &result {
+            let status = response.status();
+            let config = proxy_config(&state).await;
+            record_proxy_request_detail(
+                &state,
+                &config,
+                ProxyRequestDetailInput {
+                    method: method.as_str(),
+                    uri: &uri,
+                    path_type: "system_info",
+                    status_code: status.as_u16(),
+                    outcome: response_outcome(status),
+                    started_at_ms: timing.started_at_ms,
+                    duration_ms: timing.started.elapsed().as_millis(),
+                    playback_user: "--",
+                    playback_ip: "--",
+                    cache_hit: false,
+                    blocked: false,
+                    detail: "",
+                },
+            );
+        }
+        return result;
     }
 
     if rewrite::is_playback_info(path) {
-        return handle_playback_info(&state, method, uri, headers, body, Some(peer_addr)).await;
+        return handle_playback_info(&state, method, uri, headers, body, Some(peer_addr), timing)
+            .await;
     }
 
     if method != Method::HEAD && rewrite::is_video_stream(path) {
-        return handle_video_stream(&state, method, uri, headers, body, Some(peer_addr)).await;
+        return handle_video_stream(&state, method, uri, headers, body, Some(peer_addr), timing)
+            .await;
     }
 
     let config = proxy_config(&state).await;
-    proxy_to_emby_recorded(&state, &config, method, &uri, &headers, body).await
+    proxy_to_emby_recorded(
+        &state,
+        &config,
+        method,
+        &uri,
+        &headers,
+        body,
+        Some(ProxyRequestTrace {
+            started_at_ms: timing.started_at_ms,
+            started: timing.started,
+            path_type: request_path_type(path),
+            playback_user: "--".to_string(),
+            playback_ip: proxy::real_ip_for_log(&config, &headers)
+                .or_else(|| Some(peer_addr.ip().to_string()))
+                .unwrap_or_else(|| "--".to_string()),
+        }),
+    )
+    .await
 }
 
 fn build_management_app(state: AppState) -> Router {
@@ -641,6 +734,14 @@ fn build_management_app(state: AppState) -> Router {
             get(monitoring::proxy_status),
         )
         .route("/api/monitoring/stats", get(monitoring::request_stats))
+        .route(
+            "/api/monitoring/connectivity",
+            get(monitoring::connectivity_status),
+        )
+        .route(
+            "/api/monitoring/request-details",
+            get(monitoring::request_details),
+        )
         .route("/api/monitoring/audit-logs", get(monitoring::audit_logs))
         .route("/api/monitoring/logs", get(monitoring::list_activity_logs))
         .route(
@@ -767,6 +868,95 @@ async fn record_stat(state: &AppState, config: &Config, kind: RequestStatKind) {
             .increment_request_stats(&server_id, &server_name, config.port, kind);
 }
 
+struct ProxyRequestTrace {
+    started_at_ms: u128,
+    started: Instant,
+    path_type: &'static str,
+    playback_user: String,
+    playback_ip: String,
+}
+
+#[derive(Clone, Copy)]
+struct RequestTiming {
+    started_at_ms: u128,
+    started: Instant,
+}
+
+struct ProxyRequestDetailInput<'a> {
+    method: &'a str,
+    uri: &'a Uri,
+    path_type: &'a str,
+    status_code: u16,
+    outcome: &'a str,
+    started_at_ms: u128,
+    duration_ms: u128,
+    playback_user: &'a str,
+    playback_ip: &'a str,
+    cache_hit: bool,
+    blocked: bool,
+    detail: &'a str,
+}
+
+fn record_proxy_request_detail(
+    state: &AppState,
+    config: &Config,
+    input: ProxyRequestDetailInput<'_>,
+) {
+    let (server_id, server_name) = config_server_label(config);
+    let path = input
+        .uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or_else(|| input.uri.path());
+    let _ = state
+        .settings_store
+        .record_proxy_request_detail(ProxyRequestDetailInsert {
+            timestamp_ms: input.started_at_ms,
+            server_id: &server_id,
+            server_name: &server_name,
+            port: config.port,
+            method: input.method,
+            path,
+            path_type: input.path_type,
+            status_code: input.status_code,
+            outcome: input.outcome,
+            duration_ms: input.duration_ms,
+            playback_user: input.playback_user,
+            playback_ip: input.playback_ip,
+            cache_hit: input.cache_hit,
+            blocked: input.blocked,
+            detail: input.detail,
+        });
+}
+
+fn request_path_type(path: &str) -> &'static str {
+    if rewrite::is_playback_info(path) {
+        "playback_info"
+    } else if rewrite::is_video_stream(path) {
+        "video_stream"
+    } else if rewrite::is_system_info(path) {
+        "system_info"
+    } else if rewrite::is_base_html_player(path) {
+        "base_html_player"
+    } else {
+        "proxy"
+    }
+}
+
+fn response_outcome(status: StatusCode) -> &'static str {
+    if status.is_success() {
+        "代理成功"
+    } else if status.is_redirection() {
+        "重定向"
+    } else if status.is_client_error() {
+        "客户端错误"
+    } else if status.is_server_error() {
+        "服务错误"
+    } else {
+        "代理响应"
+    }
+}
+
 async fn proxy_to_emby_recorded(
     state: &AppState,
     config: &Config,
@@ -774,27 +964,73 @@ async fn proxy_to_emby_recorded(
     uri: &Uri,
     headers: &axum::http::HeaderMap,
     body: Bytes,
+    trace: Option<ProxyRequestTrace>,
 ) -> AppResult<Response> {
+    let method_label = method.as_str().to_string();
     let result = proxy::proxy_to_emby(&state.client, config, method, uri, headers, body).await;
-    if let Err(err) = &result {
-        let (server_id, server_name) = config_server_label(config);
-        record_stat(state, config, RequestStatKind::Error).await;
-        if let Some(proxy_manager) = state.proxy_manager.as_ref() {
-            proxy_manager
-                .record_error(&server_id, err.to_string())
-                .await;
+    match &result {
+        Ok(response) => {
+            if let Some(trace) = trace {
+                record_proxy_request_detail(
+                    state,
+                    config,
+                    ProxyRequestDetailInput {
+                        method: &method_label,
+                        uri,
+                        path_type: trace.path_type,
+                        status_code: response.status().as_u16(),
+                        outcome: response_outcome(response.status()),
+                        started_at_ms: trace.started_at_ms,
+                        duration_ms: trace.started.elapsed().as_millis(),
+                        playback_user: &trace.playback_user,
+                        playback_ip: &trace.playback_ip,
+                        cache_hit: false,
+                        blocked: false,
+                        detail: "",
+                    },
+                );
+            }
         }
-        state.activity_log.record(
-            ActivityKind::General,
-            ActivityLevel::Error,
-            Some(&server_id),
-            &server_name,
-            "代理请求失败",
-            err.to_string(),
-        );
-        state
-            .file_log
-            .write("error", "代理请求失败", &err.to_string());
+        Err(err) => {
+            let (server_id, server_name) = config_server_label(config);
+            record_stat(state, config, RequestStatKind::Error).await;
+            if let Some(proxy_manager) = state.proxy_manager.as_ref() {
+                proxy_manager
+                    .record_error(&server_id, err.to_string())
+                    .await;
+            }
+            state.activity_log.record(
+                ActivityKind::General,
+                ActivityLevel::Error,
+                Some(&server_id),
+                &server_name,
+                "代理请求失败",
+                err.to_string(),
+            );
+            state
+                .file_log
+                .write("error", "代理请求失败", &err.to_string());
+            if let Some(trace) = trace {
+                record_proxy_request_detail(
+                    state,
+                    config,
+                    ProxyRequestDetailInput {
+                        method: &method_label,
+                        uri,
+                        path_type: trace.path_type,
+                        status_code: StatusCode::BAD_GATEWAY.as_u16(),
+                        outcome: "代理失败",
+                        started_at_ms: trace.started_at_ms,
+                        duration_ms: trace.started.elapsed().as_millis(),
+                        playback_user: &trace.playback_user,
+                        playback_ip: &trace.playback_ip,
+                        cache_hit: false,
+                        blocked: false,
+                        detail: &err.to_string(),
+                    },
+                );
+            }
+        }
     }
     result
 }
@@ -929,24 +1165,91 @@ async fn handle_playback_info(
     uri: Uri,
     headers: axum::http::HeaderMap,
     body: Bytes,
-    _peer_addr: Option<SocketAddr>,
+    peer_addr: Option<SocketAddr>,
+    timing: RequestTiming,
 ) -> AppResult<Response> {
     let config = proxy_config(state).await;
     let path = uri.path().to_string();
     let query = uri.query().map(str::to_string);
+    let method_label = method.as_str().to_string();
+    let playback_user = playback_user_name(
+        &state.client,
+        &config,
+        query.as_deref().unwrap_or(""),
+        &headers,
+        state,
+    )
+    .await;
+    let playback_ip = proxy::real_ip_for_log(&config, &headers)
+        .or_else(|| peer_addr.map(|addr| addr.ip().to_string()))
+        .unwrap_or_else(|| "--".to_string());
     remember_playback_user(state, &config, query.as_deref().unwrap_or(""), &headers).await;
     let (status, response_headers, text) =
         proxy::proxy_text(&state.client, &config, method, &uri, &headers, body).await?;
     if !status.is_success() {
+        record_proxy_request_detail(
+            state,
+            &config,
+            ProxyRequestDetailInput {
+                method: &method_label,
+                uri: &uri,
+                path_type: "playback_info",
+                status_code: status.as_u16(),
+                outcome: response_outcome(status),
+                started_at_ms: timing.started_at_ms,
+                duration_ms: timing.started.elapsed().as_millis(),
+                playback_user: &playback_user,
+                playback_ip: &playback_ip,
+                cache_hit: false,
+                blocked: false,
+                detail: "",
+            },
+        );
         return proxy::body_response(status, response_headers, text);
     }
 
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        record_proxy_request_detail(
+            state,
+            &config,
+            ProxyRequestDetailInput {
+                method: &method_label,
+                uri: &uri,
+                path_type: "playback_info",
+                status_code: status.as_u16(),
+                outcome: "代理成功",
+                started_at_ms: timing.started_at_ms,
+                duration_ms: timing.started.elapsed().as_millis(),
+                playback_user: &playback_user,
+                playback_ip: &playback_ip,
+                cache_hit: false,
+                blocked: false,
+                detail: "非 JSON 响应",
+            },
+        );
         return proxy::body_response(status, response_headers, text);
     };
     let stream_query = playback_stream_query(query.as_deref().unwrap_or(""), &headers);
     let modified = rewrite::patch_playback_info(value, &path, stream_query.as_deref());
 
+    record_proxy_request_detail(
+        state,
+        &config,
+        ProxyRequestDetailInput {
+            method: &method_label,
+            uri: &uri,
+            path_type: "playback_info",
+            status_code: status.as_u16(),
+            outcome: "播放信息改写",
+            started_at_ms: timing.started_at_ms,
+            duration_ms: timing.started.elapsed().as_millis(),
+            playback_user: &playback_user,
+            playback_ip: &playback_ip,
+            cache_hit: false,
+            blocked: false,
+            detail: "",
+        },
+    );
     proxy::body_response(
         status,
         rewrite::json_headers(),
@@ -961,12 +1264,32 @@ async fn handle_video_stream(
     headers: axum::http::HeaderMap,
     body: Bytes,
     peer_addr: Option<SocketAddr>,
+    timing: RequestTiming,
 ) -> AppResult<Response> {
     let config = proxy_config(state).await;
     let Some(item_id) = rewrite::parse_item_id(uri.path()) else {
+        record_proxy_request_detail(
+            state,
+            &config,
+            ProxyRequestDetailInput {
+                method: method.as_str(),
+                uri: &uri,
+                path_type: "video_stream",
+                status_code: StatusCode::BAD_REQUEST.as_u16(),
+                outcome: "请求错误",
+                started_at_ms: timing.started_at_ms,
+                duration_ms: timing.started.elapsed().as_millis(),
+                playback_user: "--",
+                playback_ip: "--",
+                cache_hit: false,
+                blocked: false,
+                detail: "缺少媒体项目 ID",
+            },
+        );
         return Ok((StatusCode::BAD_REQUEST, "Bad Request").into_response());
     };
 
+    let method_label = method.as_str().to_string();
     let query = uri.query().unwrap_or("");
     let media_source_id = query_param(query, "MediaSourceId");
     let user_agent = headers
@@ -995,6 +1318,24 @@ async fn handle_video_stream(
     .await?
     {
         record_stat(state, &config, RequestStatKind::Block).await;
+        record_proxy_request_detail(
+            state,
+            &config,
+            ProxyRequestDetailInput {
+                method: &method_label,
+                uri: &uri,
+                path_type: "video_stream",
+                status_code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                outcome: "频率限制",
+                started_at_ms: timing.started_at_ms,
+                duration_ms: timing.started.elapsed().as_millis(),
+                playback_user: &playback_user,
+                playback_ip: &playback_ip,
+                cache_hit: false,
+                blocked: true,
+                detail: &item_id,
+            },
+        );
         return Ok((
             StatusCode::TOO_MANY_REQUESTS,
             "playback rate limit exceeded",
@@ -1024,6 +1365,24 @@ async fn handle_video_stream(
             source = rewrite::source_label(media_source_id.as_deref()),
             "direct link cache hit"
         );
+        record_proxy_request_detail(
+            state,
+            &config,
+            ProxyRequestDetailInput {
+                method: &method_label,
+                uri: &uri,
+                path_type: "video_stream",
+                status_code: StatusCode::FOUND.as_u16(),
+                outcome: "直链缓存命中",
+                started_at_ms: timing.started_at_ms,
+                duration_ms: timing.started.elapsed().as_millis(),
+                playback_user: &playback_user,
+                playback_ip: &playback_ip,
+                cache_hit: true,
+                blocked: false,
+                detail: &cached,
+            },
+        );
         return Ok(proxy::redirect_response(cached));
     }
 
@@ -1034,9 +1393,44 @@ async fn handle_video_stream(
             Ok(Some(path)) => path,
             Ok(None) => {
                 tracing::info!(item = item_id, "media source not found; proxying to Emby");
-                return proxy_to_emby_recorded(state, &config, method, &uri, &headers, body).await;
+                return proxy_to_emby_recorded(
+                    state,
+                    &config,
+                    method,
+                    &uri,
+                    &headers,
+                    body,
+                    Some(ProxyRequestTrace {
+                        started_at_ms: timing.started_at_ms,
+                        started: timing.started,
+                        path_type: "video_stream",
+                        playback_user,
+                        playback_ip,
+                    }),
+                )
+                .await;
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                record_proxy_request_detail(
+                    state,
+                    &config,
+                    ProxyRequestDetailInput {
+                        method: &method_label,
+                        uri: &uri,
+                        path_type: "video_stream",
+                        status_code: StatusCode::BAD_GATEWAY.as_u16(),
+                        outcome: "读取媒体失败",
+                        started_at_ms: timing.started_at_ms,
+                        duration_ms: timing.started.elapsed().as_millis(),
+                        playback_user: &playback_user,
+                        playback_ip: &playback_ip,
+                        cache_hit: false,
+                        blocked: false,
+                        detail: &err.to_string(),
+                    },
+                );
+                return Err(err);
+            }
         };
     let media_path = apply_strm_url_mappings(&config, &media_path);
 
@@ -1060,6 +1454,28 @@ async fn handle_video_stream(
             source = rewrite::source_label(media_source_id.as_deref()),
             "redirecting to direct media URL"
         );
+        record_proxy_request_detail(
+            state,
+            &config,
+            ProxyRequestDetailInput {
+                method: &method_label,
+                uri: &uri,
+                path_type: "video_stream",
+                status_code: StatusCode::FOUND.as_u16(),
+                outcome: if should_cache {
+                    "重定向"
+                } else {
+                    "重定向不缓存"
+                },
+                started_at_ms: timing.started_at_ms,
+                duration_ms: timing.started.elapsed().as_millis(),
+                playback_user: &playback_user,
+                playback_ip: &playback_ip,
+                cache_hit: false,
+                blocked: false,
+                detail: &redirect_url,
+            },
+        );
         return Ok(proxy::redirect_response(redirect_url));
     }
 
@@ -1069,7 +1485,22 @@ async fn handle_video_stream(
             path = media_path,
             "media path is not a direct URL or OpenList /d URL; proxying to Emby"
         );
-        return proxy_to_emby_recorded(state, &config, method, &uri, &headers, body).await;
+        return proxy_to_emby_recorded(
+            state,
+            &config,
+            method,
+            &uri,
+            &headers,
+            body,
+            Some(ProxyRequestTrace {
+                started_at_ms: timing.started_at_ms,
+                started: timing.started,
+                path_type: "video_stream",
+                playback_user,
+                playback_ip,
+            }),
+        )
+        .await;
     };
 
     let mut raw_url = openlist::ensure_raw_url(
@@ -1094,6 +1525,28 @@ async fn handle_video_stream(
         item = item_id,
         source = rewrite::source_label(media_source_id.as_deref()),
         "redirecting to OpenList raw_url"
+    );
+    record_proxy_request_detail(
+        state,
+        &config,
+        ProxyRequestDetailInput {
+            method: &method_label,
+            uri: &uri,
+            path_type: "video_stream",
+            status_code: StatusCode::FOUND.as_u16(),
+            outcome: if should_cache {
+                "重定向"
+            } else {
+                "重定向不缓存"
+            },
+            started_at_ms: timing.started_at_ms,
+            duration_ms: timing.started.elapsed().as_millis(),
+            playback_user: &playback_user,
+            playback_ip: &playback_ip,
+            cache_hit: false,
+            blocked: false,
+            detail: &raw_url,
+        },
     );
     Ok(proxy::redirect_response(raw_url))
 }
@@ -1578,6 +2031,10 @@ mod tests {
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            connectivity_check_enabled: true,
+            connectivity_check_interval_seconds: 60,
+            connectivity_check_timeout_seconds: 5,
+            connectivity_auto_restart_seconds: 180,
             strm_url_mapping_rules: Vec::new(),
         }
     }
@@ -1595,6 +2052,7 @@ mod tests {
             settings_store,
             crypto_keys: CryptoKeys::generate().unwrap(),
             activity_log: Arc::new(ActivityLogStore::new(100)),
+            connectivity: Arc::new(connectivity::ConnectivityMonitor::new()),
             proxy_manager: None,
             proxy_server_id: None,
             playback_users: Arc::new(Mutex::new(HashMap::new())),
@@ -2253,6 +2711,10 @@ mod tests {
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            connectivity_check_enabled: true,
+            connectivity_check_interval_seconds: 60,
+            connectivity_check_timeout_seconds: 5,
+            connectivity_auto_restart_seconds: 180,
             strm_url_mapping_rules: Vec::new(),
         };
         build_app(test_state(config, test_store()))
@@ -2274,6 +2736,10 @@ mod tests {
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            connectivity_check_enabled: true,
+            connectivity_check_interval_seconds: 60,
+            connectivity_check_timeout_seconds: 5,
+            connectivity_auto_restart_seconds: 180,
             strm_url_mapping_rules: Vec::new(),
         };
         build_app(test_state(config, test_store()))
@@ -2299,6 +2765,10 @@ mod tests {
             enable_internal_redirect,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            connectivity_check_enabled: true,
+            connectivity_check_interval_seconds: 60,
+            connectivity_check_timeout_seconds: 5,
+            connectivity_auto_restart_seconds: 180,
             strm_url_mapping_rules: Vec::new(),
         };
         build_app(test_state(config, test_store()))
@@ -2324,6 +2794,10 @@ mod tests {
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: mappings.to_string(),
+            connectivity_check_enabled: true,
+            connectivity_check_interval_seconds: 60,
+            connectivity_check_timeout_seconds: 5,
+            connectivity_auto_restart_seconds: 180,
             strm_url_mapping_rules: url_mapping::parse_rules(mappings).unwrap(),
         };
         build_app(test_state(config, test_store()))

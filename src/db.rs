@@ -404,6 +404,129 @@ impl SettingsStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn record_proxy_request_detail(
+        &self,
+        record: ProxyRequestDetailInsert<'_>,
+    ) -> AppResult<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            r#"
+            INSERT INTO proxy_request_logs
+                (timestamp_ms, server_id, server_name, port, method, path, path_type,
+                 status_code, outcome, duration_ms, playback_user, playback_ip,
+                 cache_hit, blocked, detail)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            "#,
+            params![
+                record.timestamp_ms as i64,
+                record.server_id,
+                record.server_name,
+                record.port,
+                record.method,
+                record.path,
+                record.path_type,
+                record.status_code,
+                record.outcome,
+                record.duration_ms as i64,
+                record.playback_user,
+                record.playback_ip,
+                record.cache_hit,
+                record.blocked,
+                record.detail,
+            ],
+        )?;
+        self.prune_proxy_request_logs(&conn, 7, 20000)?;
+        Ok(())
+    }
+
+    pub fn list_proxy_request_details(
+        &self,
+        filter: ProxyRequestDetailFilter<'_>,
+    ) -> AppResult<Vec<ProxyRequestDetail>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, timestamp_ms, server_id, server_name, port, method, path, path_type,
+                   status_code, outcome, duration_ms, playback_user, playback_ip,
+                   cache_hit, blocked, detail
+            FROM proxy_request_logs
+            ORDER BY timestamp_ms DESC, id DESC
+            LIMIT 2000
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ProxyRequestDetail {
+                id: row.get(0)?,
+                timestamp_ms: row.get::<_, i64>(1)? as u128,
+                server_id: row.get(2)?,
+                server_name: row.get(3)?,
+                port: row.get(4)?,
+                method: row.get(5)?,
+                path: row.get(6)?,
+                path_type: row.get(7)?,
+                status_code: row.get(8)?,
+                outcome: row.get(9)?,
+                duration_ms: row.get::<_, i64>(10)? as u128,
+                playback_user: row.get(11)?,
+                playback_ip: row.get(12)?,
+                cache_hit: row.get(13)?,
+                blocked: row.get(14)?,
+                detail: row.get(15)?,
+            })
+        })?;
+        let keyword = filter.keyword.map(str::to_ascii_lowercase);
+        let mut entries = Vec::new();
+        for row in rows {
+            let entry = row?;
+            if filter
+                .server_id
+                .is_some_and(|server_id| entry.server_id != server_id)
+            {
+                continue;
+            }
+            if filter
+                .path_type
+                .is_some_and(|path_type| entry.path_type != path_type)
+            {
+                continue;
+            }
+            if filter
+                .since_ms
+                .is_some_and(|since| entry.timestamp_ms < since)
+            {
+                continue;
+            }
+            if filter
+                .until_ms
+                .is_some_and(|until| entry.timestamp_ms > until)
+            {
+                continue;
+            }
+            if let Some(keyword) = keyword.as_ref() {
+                let haystack = format!(
+                    "{} {} {} {} {} {} {} {}",
+                    entry.server_name,
+                    entry.method,
+                    entry.path,
+                    entry.path_type,
+                    entry.outcome,
+                    entry.playback_user,
+                    entry.playback_ip,
+                    entry.detail
+                )
+                .to_ascii_lowercase();
+                if !haystack.contains(keyword) {
+                    continue;
+                }
+            }
+            entries.push(entry);
+            if entries.len() >= filter.limit.clamp(1, 500) {
+                break;
+            }
+        }
+        Ok(entries)
+    }
+
     fn prune_audit_logs(&self, conn: &Connection, keep_days: i64, max_rows: i64) -> AppResult<()> {
         let cutoff = now_ms() as i64 - keep_days * 24 * 3600 * 1000;
         conn.execute(
@@ -427,6 +550,29 @@ impl SettingsStore {
         conn.execute(
             "DELETE FROM request_stats_daily WHERE date < ?1",
             params![cutoff],
+        )?;
+        Ok(())
+    }
+
+    fn prune_proxy_request_logs(
+        &self,
+        conn: &Connection,
+        keep_days: i64,
+        max_rows: i64,
+    ) -> AppResult<()> {
+        let cutoff = now_ms() as i64 - keep_days * 24 * 3600 * 1000;
+        conn.execute(
+            "DELETE FROM proxy_request_logs WHERE timestamp_ms < ?1",
+            params![cutoff],
+        )?;
+        conn.execute(
+            r#"
+            DELETE FROM proxy_request_logs
+            WHERE id NOT IN (
+                SELECT id FROM proxy_request_logs ORDER BY timestamp_ms DESC, id DESC LIMIT ?1
+            )
+            "#,
+            params![max_rows],
         )?;
         Ok(())
     }
@@ -492,6 +638,29 @@ impl SettingsStore {
                 updated_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (date, server_id)
             );
+
+            CREATE TABLE IF NOT EXISTS proxy_request_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_ms INTEGER NOT NULL,
+                server_id TEXT NOT NULL,
+                server_name TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                method TEXT NOT NULL,
+                path TEXT NOT NULL,
+                path_type TEXT NOT NULL,
+                status_code INTEGER NOT NULL,
+                outcome TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                playback_user TEXT NOT NULL,
+                playback_ip TEXT NOT NULL,
+                cache_hit BOOLEAN NOT NULL DEFAULT FALSE,
+                blocked BOOLEAN NOT NULL DEFAULT FALSE,
+                detail TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_proxy_request_logs_timestamp_ms ON proxy_request_logs(timestamp_ms);
+            CREATE INDEX IF NOT EXISTS idx_proxy_request_logs_server_id ON proxy_request_logs(server_id);
+            CREATE INDEX IF NOT EXISTS idx_proxy_request_logs_path_type ON proxy_request_logs(path_type);
             "#,
         )?;
         Ok(())
@@ -543,6 +712,53 @@ pub struct RequestStatsDaily {
     pub blocks: i64,
     pub errors: i64,
     pub updated_at_ms: u128,
+}
+
+pub struct ProxyRequestDetailInsert<'a> {
+    pub timestamp_ms: u128,
+    pub server_id: &'a str,
+    pub server_name: &'a str,
+    pub port: u16,
+    pub method: &'a str,
+    pub path: &'a str,
+    pub path_type: &'a str,
+    pub status_code: u16,
+    pub outcome: &'a str,
+    pub duration_ms: u128,
+    pub playback_user: &'a str,
+    pub playback_ip: &'a str,
+    pub cache_hit: bool,
+    pub blocked: bool,
+    pub detail: &'a str,
+}
+
+pub struct ProxyRequestDetailFilter<'a> {
+    pub server_id: Option<&'a str>,
+    pub path_type: Option<&'a str>,
+    pub keyword: Option<&'a str>,
+    pub since_ms: Option<u128>,
+    pub until_ms: Option<u128>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProxyRequestDetail {
+    pub id: i64,
+    pub timestamp_ms: u128,
+    pub server_id: String,
+    pub server_name: String,
+    pub port: u16,
+    pub method: String,
+    pub path: String,
+    pub path_type: String,
+    pub status_code: u16,
+    pub outcome: String,
+    pub duration_ms: u128,
+    pub playback_user: String,
+    pub playback_ip: String,
+    pub cache_hit: bool,
+    pub blocked: bool,
+    pub detail: String,
 }
 
 #[derive(Debug, Serialize)]

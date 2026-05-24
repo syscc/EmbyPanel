@@ -311,6 +311,10 @@ mod tests {
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            connectivity_check_enabled: true,
+            connectivity_check_interval_seconds: 60,
+            connectivity_check_timeout_seconds: 5,
+            connectivity_auto_restart_seconds: 180,
             strm_url_mapping_rules: Vec::new(),
         }
     }

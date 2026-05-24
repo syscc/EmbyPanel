@@ -511,7 +511,7 @@ label span {
   font-weight: 800;
 }
 
-.proxy-status-list {
+.connectivity-list {
   display: grid;
   gap: 8px;
   border-top: 1px dashed var(--border);
@@ -519,21 +519,32 @@ label span {
   padding-top: 12px;
 }
 
-.proxy-status-row {
+.connectivity-row {
   display: grid;
-  grid-template-columns: minmax(120px, 1fr) auto auto minmax(180px, auto);
-  gap: 10px;
+  grid-template-columns: minmax(180px, 1fr) repeat(6, auto);
+  gap: 8px;
   align-items: center;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--panel-soft);
+  padding: 10px 12px;
   color: var(--muted-strong);
   font-size: 13px;
 }
 
-.proxy-status-row strong {
+.connectivity-row div {
   min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.connectivity-row strong {
   color: var(--text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+}
+
+.connectivity-row small {
+  color: var(--muted);
+  overflow-wrap: anywhere;
 }
 
 .rate-window-mini-list {
@@ -732,6 +743,15 @@ label span {
   grid-template-columns: repeat(4, minmax(150px, 1fr));
 }
 
+.health-check-grid {
+  margin-top: 16px;
+  grid-template-columns: minmax(190px, 1fr) repeat(3, minmax(140px, 1fr));
+}
+
+.setting-check {
+  align-content: center;
+}
+
 .cache-filter-grid {
   margin-top: 16px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -915,7 +935,7 @@ label span {
 .log-summary {
   display: grid;
   grid-column: 1 / -1;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
 }
 
@@ -1039,6 +1059,123 @@ label span {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   line-height: 1.45;
   word-break: break-all;
+}
+
+.request-detail-panel {
+  min-height: 260px;
+}
+
+.request-detail-list {
+  display: grid;
+  gap: 8px;
+  max-height: 560px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.request-detail-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 250px;
+  gap: 12px;
+  border: 1px solid var(--border-soft);
+  border-left: 4px solid var(--brand);
+  border-radius: 8px;
+  background: var(--panel-soft);
+  padding: 11px 12px;
+}
+
+.request-detail-row.redirect,
+.request-detail-row.cache {
+  border-left-color: var(--accent-green);
+}
+
+.request-detail-row.blocked,
+.request-detail-row.warn {
+  border-left-color: var(--accent-warn);
+}
+
+.request-detail-row.error {
+  border-left-color: var(--danger-text);
+}
+
+.request-main {
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+}
+
+.request-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.request-time {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.request-path {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.request-path strong,
+.request-path span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.request-path strong {
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+}
+
+.request-path span {
+  color: var(--muted);
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.request-state {
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.request-state span,
+.request-type,
+.request-outcome {
+  border-radius: 999px;
+  padding: 3px 7px;
+  background: var(--chip-bg);
+  color: var(--chip-text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.request-outcome.redirect,
+.request-outcome.cache,
+.request-outcome.ok {
+  background: var(--success-bg);
+  color: var(--success-text);
+}
+
+.request-outcome.blocked,
+.request-outcome.warn {
+  background: var(--warn-bg);
+  color: var(--warn-text);
+}
+
+.request-outcome.error {
+  background: var(--danger-bg);
+  color: var(--danger-text);
 }
 
 .server-pill,
@@ -1648,8 +1785,13 @@ textarea:focus {
 
   .server-grid,
   .real-ip-grid,
-  .common-grid {
+  .common-grid,
+  .health-check-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .connectivity-row {
+    grid-template-columns: 1fr 1fr;
   }
 
   .log-toolbar {
@@ -1658,6 +1800,14 @@ textarea:focus {
 
   .log-summary {
     grid-column: 1 / -1;
+  }
+
+  .request-detail-row {
+    grid-template-columns: 1fr;
+  }
+
+  .request-state {
+    justify-content: flex-start;
   }
 }
 
@@ -1695,6 +1845,7 @@ textarea:focus {
   .server-grid,
   .real-ip-grid,
   .common-grid,
+  .health-check-grid,
   .config-tools,
   .backup-layout,
   .backup-grid,
@@ -1718,6 +1869,10 @@ textarea:focus {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
+  .log-summary {
+    grid-template-columns: 1fr;
+  }
+
   .stat-card {
     min-height: 86px;
     padding: 12px;
@@ -1731,12 +1886,8 @@ textarea:focus {
     grid-template-columns: 1fr 1fr;
   }
 
-  .proxy-status-row {
-    grid-template-columns: 1fr 1fr;
-  }
-
-  .proxy-status-row strong,
-  .proxy-status-row small {
+  .connectivity-row div,
+  .connectivity-row small {
     grid-column: 1 / -1;
   }
 

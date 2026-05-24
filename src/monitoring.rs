@@ -49,6 +49,16 @@ pub struct AuditLogQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RequestDetailQuery {
+    server_id: Option<String>,
+    path_type: Option<String>,
+    keyword: Option<String>,
+    since_ms: Option<u128>,
+    until_ms: Option<u128>,
+    limit: Option<usize>,
+}
+
 pub async fn media_overview(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -228,6 +238,33 @@ pub async fn request_stats(
     }
     rows.sort_by(|left, right| left.server_name.cmp(&right.server_name));
     Ok(Json(rows))
+}
+
+pub async fn connectivity_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<Vec<crate::connectivity::ConnectivityCheckStatus>>> {
+    auth::require_auth(&state, &headers).await?;
+    let config = state.config.read().await.clone();
+    Ok(Json(state.connectivity.statuses(&config).await))
+}
+
+pub async fn request_details(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RequestDetailQuery>,
+) -> AppResult<Json<Vec<crate::db::ProxyRequestDetail>>> {
+    auth::require_auth(&state, &headers).await?;
+    Ok(Json(state.settings_store.list_proxy_request_details(
+        crate::db::ProxyRequestDetailFilter {
+            server_id: query.server_id.as_deref().filter(|value| *value != "all"),
+            path_type: query.path_type.as_deref().filter(|value| *value != "all"),
+            keyword: query.keyword.as_deref(),
+            since_ms: query.since_ms,
+            until_ms: query.until_ms,
+            limit: query.limit.unwrap_or(200),
+        },
+    )?))
 }
 
 pub async fn proxy_status(

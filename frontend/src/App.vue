@@ -16,6 +16,10 @@ type Settings = {
   enable_internal_redirect: boolean
   internal_redirect_timeout_seconds: number
   strm_url_mappings: string
+  connectivity_check_enabled: boolean
+  connectivity_check_interval_seconds: number
+  connectivity_check_timeout_seconds: number
+  connectivity_auto_restart_seconds: number
 }
 
 type RealIpMode = 'auto' | 'header' | 'header_list' | 'xff_last' | 'xff_second_last' | 'xff_third_last'
@@ -115,6 +119,22 @@ type ProxyStatus = {
   last_error: string | null
 }
 
+type ConnectivityCheckStatus = {
+  server_id: string
+  server_name: string
+  port: number
+  enabled: boolean
+  ok: boolean
+  emby_ok: boolean
+  openlist_ok: boolean | null
+  proxy_ok: boolean
+  checked_at_ms: number
+  duration_ms: number
+  failed_since_ms: number | null
+  auto_restarted_at_ms: number | null
+  last_error: string | null
+}
+
 type RequestStatsDaily = {
   date: string
   server_id: string
@@ -126,6 +146,25 @@ type RequestStatsDaily = {
   blocks: number
   errors: number
   updated_at_ms: number
+}
+
+type ProxyRequestDetail = {
+  id: number
+  timestamp_ms: number
+  server_id: string
+  server_name: string
+  port: number
+  method: string
+  path: string
+  path_type: string
+  status_code: number
+  outcome: string
+  duration_ms: number
+  playback_user: string
+  playback_ip: string
+  cache_hit: boolean
+  blocked: boolean
+  detail: string
 }
 
 type UpdateCheck = {
@@ -265,11 +304,13 @@ const playbackSessions = ref<PlaybackSession[]>([])
 const playbackLoading = ref(false)
 const playbackError = ref('')
 const activityLogs = ref<ActivityLogEntry[]>([])
+const proxyRequestDetails = ref<ProxyRequestDetail[]>([])
 const logsLoading = ref(false)
 const logsError = ref('')
 const selectedLogServer = ref('all')
 const selectedLogKind = ref<LogKindFilter>('all')
 const selectedLogLevel = ref('all')
+const selectedRequestPathType = ref('all')
 const logKeywordFilter = ref('')
 const logSince = ref('')
 const logUntil = ref('')
@@ -277,6 +318,7 @@ const mediaOverviews = ref<MediaOverview[]>([])
 const serverHealth = ref<ServerHealth | null>(null)
 const detailedHealth = ref<DetailedHealth | null>(null)
 const proxyStatuses = ref<ProxyStatus[]>([])
+const connectivityStatuses = ref<ConnectivityCheckStatus[]>([])
 const requestStats = ref<RequestStatsDaily[]>([])
 const updateCheck = ref<UpdateCheck | null>(null)
 const validationResults = ref<ValidationResult[]>([])
@@ -368,6 +410,10 @@ const settings = reactive<Settings>({
   enable_internal_redirect: false,
   internal_redirect_timeout_seconds: 15,
   strm_url_mappings: '',
+  connectivity_check_enabled: true,
+  connectivity_check_interval_seconds: 60,
+  connectivity_check_timeout_seconds: 5,
+  connectivity_auto_restart_seconds: 180,
 })
 
 const menu = [
@@ -427,6 +473,7 @@ const playbackLogRows = computed(() => filteredActivityLogs.value.filter((entry)
 const generalLogRows = computed(() =>
   filteredActivityLogs.value.filter((entry) => entry.kind === 'general' && entry.level === 'info'),
 )
+const requestDetailRows = computed(() => proxyRequestDetails.value)
 const clientRuleRows = computed(() =>
   [...clientControl.records]
     .filter((record) => {
@@ -473,6 +520,13 @@ const rateLimitOverview = computed(() => ({
 }))
 const proxyStatusById = computed(() =>
   Object.fromEntries(proxyStatuses.value.map((status) => [status.server_id, status])),
+)
+const operationalServerRows = computed(() =>
+  settings.servers.map((server) => ({
+    server,
+    proxy: proxyStatuses.value.find((status) => status.server_id === server.id),
+    connectivity: connectivityStatuses.value.find((status) => status.server_id === server.id),
+  })),
 )
 const auditActionOptions = computed(() => {
   const actions = new Set(auditLogs.value.map((entry) => entry.action))
@@ -593,16 +647,18 @@ async function loadAppData() {
 
 async function refreshOperationalData() {
   try {
-    const [health, statuses, stats, rateLimit] = await Promise.all([
+    const [health, statuses, stats, rateLimit, connectivity] = await Promise.all([
       api<DetailedHealth>('/api/monitoring/healthz'),
       api<ProxyStatus[]>('/api/monitoring/proxy-status'),
       api<RequestStatsDaily[]>('/api/monitoring/stats'),
       api<PlaybackRateWindowStatus[]>('/api/client-control/rate-limit/status'),
+      api<ConnectivityCheckStatus[]>('/api/monitoring/connectivity'),
     ])
     detailedHealth.value = health
     proxyStatuses.value = statuses
     requestStats.value = stats
     rateLimitWindows.value = rateLimit
+    connectivityStatuses.value = connectivity
   } catch (err) {
     healthError.value = err instanceof Error ? err.message : String(err)
   }
@@ -1277,17 +1333,23 @@ async function refreshActivityLogs() {
   logsLoading.value = true
   logsError.value = ''
   try {
+    let logsPromise: Promise<ActivityLogEntry[]>
     if (selectedLogKind.value === 'all') {
-      const [playback, info] = await Promise.all([
+      logsPromise = Promise.all([
         fetchActivityLogs('playback', 120),
         fetchActivityLogs('general', 80),
-      ])
-      activityLogs.value = [...playback, ...info].sort((left, right) => right.timestamp_ms - left.timestamp_ms)
+      ]).then(([playback, info]) =>
+        [...playback, ...info].sort((left, right) => right.timestamp_ms - left.timestamp_ms),
+      )
     } else {
-      activityLogs.value = await fetchActivityLogs(selectedLogKind.value, 160)
+      logsPromise = fetchActivityLogs(selectedLogKind.value, 160)
     }
+    const [logs, details] = await Promise.all([logsPromise, fetchProxyRequestDetails()])
+    activityLogs.value = logs
+    proxyRequestDetails.value = details
   } catch (err) {
     activityLogs.value = []
+    proxyRequestDetails.value = []
     logsError.value = err instanceof Error ? err.message : String(err)
   } finally {
     logsLoading.value = false
@@ -1309,6 +1371,16 @@ function logQueryParams(limit: number) {
   if (logSince.value) params.set('since_ms', String(new Date(logSince.value).getTime()))
   if (logUntil.value) params.set('until_ms', String(new Date(logUntil.value).getTime()))
   return params
+}
+
+async function fetchProxyRequestDetails() {
+  const params = new URLSearchParams({ limit: '200' })
+  if (selectedLogServer.value !== 'all') params.set('server_id', selectedLogServer.value)
+  if (selectedRequestPathType.value !== 'all') params.set('path_type', selectedRequestPathType.value)
+  if (logKeywordFilter.value.trim()) params.set('keyword', logKeywordFilter.value.trim())
+  if (logSince.value) params.set('since_ms', String(new Date(logSince.value).getTime()))
+  if (logUntil.value) params.set('until_ms', String(new Date(logUntil.value).getTime()))
+  return api<ProxyRequestDetail[]>(`/api/monitoring/request-details?${params.toString()}`)
 }
 
 function startDashboardPolling() {
@@ -1570,6 +1642,28 @@ function proxyStatusLabel(status: ProxyStatus | undefined) {
   return status.listening ? '监听中' : '未监听'
 }
 
+function connectivityStatusLabel(status: ConnectivityCheckStatus) {
+  if (!status.checked_at_ms) return '未巡检'
+  return status.ok ? '正常' : '异常'
+}
+
+function healthPartLabel(ok: boolean | null) {
+  if (ok === null) return '未配置'
+  return ok ? '正常' : '异常'
+}
+
+function failedDuration(status: ConnectivityCheckStatus) {
+  if (!status.failed_since_ms) return '无失败'
+  const seconds = Math.max(0, Math.floor((Date.now() - status.failed_since_ms) / 1000))
+  if (seconds >= 3600) return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`
+  if (seconds >= 60) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`
+  return `${seconds}s`
+}
+
+function proxyStatusClass(status: ProxyStatus | undefined) {
+  return status?.listening ? 'allowed' : 'blocked'
+}
+
 function validationClass(result: ValidationResult) {
   return result.ok ? 'success' : 'warn'
 }
@@ -1579,6 +1673,23 @@ function logLevelLabel(level: ActivityLogEntry['level']) {
   if (level === 'error') return '错误'
   if (level === 'warn') return '警告'
   return '信息'
+}
+
+function requestPathTypeLabel(type: string) {
+  if (type === 'video_stream') return '视频流'
+  if (type === 'playback_info') return '播放信息'
+  if (type === 'system_info') return '系统信息'
+  if (type === 'base_html_player') return '播放器脚本'
+  return '普通代理'
+}
+
+function requestOutcomeClass(row: ProxyRequestDetail) {
+  if (row.blocked) return 'blocked'
+  if (row.cache_hit) return 'cache'
+  if (row.status_code >= 500) return 'error'
+  if (row.status_code >= 400) return 'warn'
+  if (row.status_code >= 300) return 'redirect'
+  return 'ok'
 }
 
 function clientKeyword(record: ClientRuleRecord) {
@@ -1785,14 +1896,35 @@ onBeforeUnmount(stopDashboardPolling)
               发现新版本 {{ updateCheck.latest_version }}，当前 {{ updateCheck.current_version }}。
               <a :href="updateCheck.release_url" target="_blank" rel="noreferrer">查看 Release</a>
             </div>
-            <div class="proxy-status-list">
-              <div v-for="status in proxyStatuses" :key="status.server_id" class="proxy-status-row">
-                <strong>{{ status.server_name }}</strong>
-                <span>:{{ status.port }}</span>
-                <span :class="['client-badge', status.listening ? 'allowed' : 'blocked']">
-                  {{ proxyStatusLabel(status) }}
+            <div class="connectivity-list">
+              <div
+                v-for="row in operationalServerRows"
+                :key="`operation-${row.server.id}`"
+                class="connectivity-row"
+              >
+                <div>
+                  <strong>{{ row.server.name }}</strong>
+                  <small>
+                    端口 :{{ row.proxy?.port || row.server.port }} ·
+                    最近请求 {{ formatTimestampMs(row.proxy?.last_request_ms) }} ·
+                    最近巡检 {{ formatTimestampMs(row.connectivity?.checked_at_ms || 0) }}
+                    <template v-if="row.connectivity"> · 耗时 {{ row.connectivity.duration_ms }}ms</template>
+                  </small>
+                </div>
+                <span :class="['client-badge', proxyStatusClass(row.proxy)]">
+                  {{ proxyStatusLabel(row.proxy) }}
                 </span>
-                <small>最近请求 {{ formatTimestampMs(status.last_request_ms) }}</small>
+                <span :class="['client-badge', row.connectivity?.ok ? 'allowed' : 'blocked']">
+                  {{ row.connectivity ? connectivityStatusLabel(row.connectivity) : '未巡检' }}
+                </span>
+                <span>Emby {{ healthPartLabel(row.connectivity?.emby_ok ?? null) }}</span>
+                <span>OpenList {{ healthPartLabel(row.connectivity?.openlist_ok ?? null) }}</span>
+                <span>反代 {{ healthPartLabel(row.connectivity?.proxy_ok ?? null) }}</span>
+                <span>{{ row.connectivity ? failedDuration(row.connectivity) : '无失败' }}</span>
+                <small v-if="row.connectivity?.auto_restarted_at_ms">
+                  最近自动重启 {{ formatTimestampMs(row.connectivity.auto_restarted_at_ms) }}
+                </small>
+                <small v-if="row.connectivity?.last_error" class="server-status-error">{{ row.connectivity.last_error }}</small>
               </div>
             </div>
           </section>
@@ -1997,6 +2129,25 @@ onBeforeUnmount(stopDashboardPolling)
             <label>
               <span>OpenList Token</span>
               <input v-model="settings.openlist_token" type="password" placeholder="可选" />
+            </label>
+          </div>
+          <div class="grid health-check-grid">
+            <label class="check setting-check">
+              <input v-model="settings.connectivity_check_enabled" type="checkbox" />
+              <span>启用服务器连通性巡检</span>
+            </label>
+            <label>
+              <span>巡检间隔秒数</span>
+              <input v-model.number="settings.connectivity_check_interval_seconds" type="number" min="10" max="3600" />
+            </label>
+            <label>
+              <span>单项超时秒数</span>
+              <input v-model.number="settings.connectivity_check_timeout_seconds" type="number" min="1" max="60" />
+            </label>
+            <label>
+              <span>反代无响应自动重启秒数</span>
+              <input v-model.number="settings.connectivity_auto_restart_seconds" type="number" min="0" max="86400" />
+              <small class="field-help">填 0 表示不自动重启；只在反代端口连续无响应时触发。</small>
             </label>
           </div>
           <div class="grid cache-filter-grid">
@@ -2470,6 +2621,17 @@ onBeforeUnmount(stopDashboardPolling)
                 </select>
               </label>
               <label>
+                <span>请求类型</span>
+                <select v-model="selectedRequestPathType" @change="refreshActivityLogs">
+                  <option value="all">全部请求</option>
+                  <option value="video_stream">视频流</option>
+                  <option value="playback_info">播放信息</option>
+                  <option value="system_info">系统信息</option>
+                  <option value="base_html_player">播放器脚本</option>
+                  <option value="proxy">普通代理</option>
+                </select>
+              </label>
+              <label>
                 <span>关键词</span>
                 <input v-model="logKeywordFilter" placeholder="搜索用户名 / IP / URL / 信息" @keyup.enter="refreshActivityLogs" />
               </label>
@@ -2494,8 +2656,50 @@ onBeforeUnmount(stopDashboardPolling)
                   <span>信息</span>
                   <strong>{{ generalLogRows.length }}</strong>
                 </div>
+                <div>
+                  <span>请求明细</span>
+                  <strong>{{ requestDetailRows.length }}</strong>
+                </div>
               </div>
             </div>
+          </section>
+
+          <section class="panel request-detail-panel">
+            <div class="panel-head">
+              <div>
+                <h2>反代请求明细</h2>
+                <p class="muted">显示最近反代请求的用户、IP、路径类型、状态、耗时、缓存命中和拦截结果。</p>
+              </div>
+            </div>
+            <div v-if="requestDetailRows.length" class="request-detail-list">
+              <article
+                v-for="row in requestDetailRows"
+                :key="row.id"
+                :class="['request-detail-row', requestOutcomeClass(row)]"
+              >
+                <div class="request-main">
+                  <div class="request-meta">
+                    <span class="server-pill">{{ row.server_name }}</span>
+                    <span class="user-pill">{{ row.playback_user || '--' }}</span>
+                    <span class="ip-pill">{{ row.playback_ip || '--' }}</span>
+                    <span class="request-time">{{ formatLogTime(row.timestamp_ms) }}</span>
+                  </div>
+                  <div class="request-path">
+                    <strong>{{ row.method }} {{ row.path }}</strong>
+                    <span>{{ row.detail }}</span>
+                  </div>
+                </div>
+                <div class="request-state">
+                  <span class="request-type">{{ requestPathTypeLabel(row.path_type) }}</span>
+                  <span :class="['request-outcome', requestOutcomeClass(row)]">{{ row.outcome }}</span>
+                  <span>HTTP {{ row.status_code }}</span>
+                  <span>{{ row.duration_ms }}ms</span>
+                  <span>{{ row.cache_hit ? '缓存命中' : '未命中' }}</span>
+                  <span>{{ row.blocked ? '已拦截' : '未拦截' }}</span>
+                </div>
+              </article>
+            </div>
+            <div v-else class="empty-state">暂无反代请求明细，请求经过反代端口后会自动出现。</div>
           </section>
 
           <section class="panel">
