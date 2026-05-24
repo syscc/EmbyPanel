@@ -17,7 +17,7 @@ mod url_mapping;
 
 use std::{
     collections::{HashMap, VecDeque},
-    env,
+    env, fmt,
     net::SocketAddr,
     sync::Arc,
     time::Duration,
@@ -40,12 +40,76 @@ use tokio::{
     task::JoinHandle,
 };
 use tower_http::services::{ServeDir, ServeFile};
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{
+    EnvFilter,
+    fmt::{format::Writer, time::FormatTime},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+};
 
 use crate::cache::DirectLinkCache;
 use activity_log::{ActivityKind, ActivityLevel, ActivityLogStore, PlaybackLogRecord};
 
 const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone)]
+struct TzTimer {
+    offset_seconds: i32,
+}
+
+impl TzTimer {
+    fn from_env() -> Self {
+        Self {
+            offset_seconds: tz_offset_seconds(&env::var("TZ").unwrap_or_default()),
+        }
+    }
+}
+
+impl FormatTime for TzTimer {
+    fn format_time(&self, writer: &mut Writer<'_>) -> fmt::Result {
+        let now = chrono::Utc::now() + chrono::Duration::seconds(self.offset_seconds.into());
+        write!(writer, "{}", now.format("%Y-%m-%d %H:%M:%S%.3f"))
+    }
+}
+
+fn tz_offset_seconds(tz: &str) -> i32 {
+    let tz = tz.trim();
+    if tz.eq_ignore_ascii_case("Asia/Shanghai")
+        || tz.eq_ignore_ascii_case("Asia/Chongqing")
+        || tz.eq_ignore_ascii_case("Asia/Harbin")
+        || tz.eq_ignore_ascii_case("Asia/Urumqi")
+        || tz.eq_ignore_ascii_case("PRC")
+    {
+        return 8 * 3600;
+    }
+    if tz.eq_ignore_ascii_case("UTC") || tz.eq_ignore_ascii_case("Etc/UTC") || tz == "Z" {
+        return 0;
+    }
+    parse_utc_offset(tz).unwrap_or(0)
+}
+
+fn parse_utc_offset(value: &str) -> Option<i32> {
+    let value = value
+        .strip_prefix("UTC")
+        .or_else(|| value.strip_prefix("GMT"))
+        .unwrap_or(value)
+        .trim();
+    let sign = match value.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let value = &value[1..];
+    let (hours, minutes) = if let Some((hours, minutes)) = value.split_once(':') {
+        (hours.parse::<i32>().ok()?, minutes.parse::<i32>().ok()?)
+    } else {
+        (value.parse::<i32>().ok()?, 0)
+    };
+    if !(0..=23).contains(&hours) || !(0..=59).contains(&minutes) {
+        return None;
+    }
+    Some(sign * (hours * 3600 + minutes * 60))
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -211,7 +275,7 @@ impl ProxyManager {
 async fn main() -> AppResult<()> {
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "emby302gateway_rs=info".into()))
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_timer(TzTimer::from_env()))
         .init();
 
     let settings_store = SettingsStore::open_default()?;
@@ -2050,6 +2114,13 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
+    }
+
+    #[test]
+    fn log_timer_respects_common_tz_values() {
+        assert_eq!(tz_offset_seconds("Asia/Shanghai"), 8 * 3600);
+        assert_eq!(tz_offset_seconds("UTC+08:00"), 8 * 3600);
+        assert_eq!(tz_offset_seconds("UTC"), 0);
     }
 
     async fn spawn_mock_server<F, Fut>(handler: F) -> String

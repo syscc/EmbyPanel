@@ -832,12 +832,11 @@ pub fn matched_block_rule(
     if user_agent.is_empty() {
         return Ok(None);
     }
-    let client_name = extract_client_name(headers, &user_agent);
 
     Ok(config
         .records
         .iter()
-        .find(|record| record.enabled && rule_matches(record, &user_agent, &client_name))
+        .find(|record| record.enabled && rule_matches(record, &user_agent))
         .cloned())
 }
 
@@ -1115,14 +1114,45 @@ fn normalize_value(value: &str) -> String {
     }
 }
 
-fn rule_matches(record: &ClientRuleRecord, user_agent: &str, client_name: &str) -> bool {
+fn rule_matches(record: &ClientRuleRecord, user_agent: &str) -> bool {
     let rule_ua = record.user_agent.trim().to_ascii_lowercase();
     if rule_ua.is_empty() {
         return false;
     }
     let request_ua = user_agent.trim().to_ascii_lowercase();
-    let client = client_name.trim().to_ascii_lowercase();
-    request_ua.contains(&rule_ua)
-        || rule_ua.contains(&request_ua)
-        || (!client.is_empty() && client == record.client_name.trim().to_ascii_lowercase())
+    !request_ua.is_empty() && request_ua.contains(&rule_ua)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(user_agent: &str, client_name: &str) -> ClientRuleRecord {
+        ClientRuleRecord {
+            id: "rule-1".to_string(),
+            client_name: client_name.to_string(),
+            device_name: "--".to_string(),
+            user_name: "--".to_string(),
+            user_agent: user_agent.to_string(),
+            source: ClientRuleSource::Manual,
+            enabled: true,
+            created_at: "0".to_string(),
+            updated_at: "0".to_string(),
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn ua_rule_matches_case_insensitive_keyword() {
+        let record = rule("infuse-library", "Infuse-Direct");
+
+        assert!(rule_matches(&record, "Mozilla/5.0 Infuse-Library/8.0"));
+    }
+
+    #[test]
+    fn ua_rule_does_not_match_client_name_only() {
+        let record = rule("infuse-library", "Infuse-Direct");
+
+        assert!(!rule_matches(&record, "Infuse-Direct/8.0"));
+    }
 }
