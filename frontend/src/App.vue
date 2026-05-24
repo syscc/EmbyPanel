@@ -321,6 +321,8 @@ const proxyStatuses = ref<ProxyStatus[]>([])
 const connectivityStatuses = ref<ConnectivityCheckStatus[]>([])
 const requestStats = ref<RequestStatsDaily[]>([])
 const updateCheck = ref<UpdateCheck | null>(null)
+const updateChecking = ref(false)
+const updateCheckError = ref('')
 const validationResults = ref<ValidationResult[]>([])
 const rateLimitWindows = ref<PlaybackRateWindowStatus[]>([])
 const auditLogs = ref<AuditLogEntry[]>([])
@@ -665,10 +667,15 @@ async function refreshOperationalData() {
 }
 
 async function refreshUpdateCheck() {
+  updateChecking.value = true
+  updateCheckError.value = ''
   try {
     updateCheck.value = await api<UpdateCheck>('/api/app-info/update-check')
-  } catch {
+  } catch (err) {
     updateCheck.value = null
+    updateCheckError.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    updateChecking.value = false
   }
 }
 
@@ -1738,10 +1745,28 @@ onBeforeUnmount(stopDashboardPolling)
     <aside class="sidebar">
       <div class="brand-row compact">
         <div class="logo-mark">E</div>
-        <div>
+        <button
+          class="brand-version"
+          :class="{ update: updateCheck?.has_update, error: Boolean(updateCheckError) }"
+          :title="
+            updateChecking
+              ? '正在检查更新'
+              : updateCheck?.has_update
+                ? `有新版本：${updateCheck.latest_version}`
+                : updateCheckError
+                  ? `检查失败：${updateCheckError}`
+                  : '点击检查更新'
+          "
+          @click="refreshUpdateCheck"
+        >
           <strong>{{ appInfo.name }}</strong>
-          <small>{{ appInfo.version || '版本读取中' }}</small>
-        </div>
+          <small>
+            {{ appInfo.version || '版本读取中' }}
+            <span v-if="updateChecking" class="brand-version-badge">检查中</span>
+            <span v-else-if="updateCheck?.has_update" class="brand-version-badge update">有更新</span>
+            <span v-else-if="updateCheckError" class="brand-version-badge error">失败</span>
+          </small>
+        </button>
       </div>
 
       <nav>
@@ -1891,10 +1916,6 @@ onBeforeUnmount(stopDashboardPolling)
                 <strong>{{ requestStatsTotals.blocks.toLocaleString() }} / {{ requestStatsTotals.errors.toLocaleString() }}</strong>
                 <small>今日累计</small>
               </div>
-            </div>
-            <div v-if="updateCheck?.has_update" class="notice warn update-notice">
-              发现新版本 {{ updateCheck.latest_version }}，当前 {{ updateCheck.current_version }}。
-              <a :href="updateCheck.release_url" target="_blank" rel="noreferrer">查看 Release</a>
             </div>
             <div class="connectivity-list">
               <div

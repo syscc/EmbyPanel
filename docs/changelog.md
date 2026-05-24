@@ -1,5 +1,23 @@
 # 版本更新日志
 
+## v0.0.8
+
+发布时间：2026-05-24
+
+### 调整
+
+- 版本检查入口调整为左侧品牌区版本号点击触发。
+- 移除本地更新检查测试开关，恢复正常 GitHub Release 检查流程。
+- 右上角不再显示版本检查按钮，避免重复展示。
+
+### 验证
+
+- `cargo fmt --check`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test`
+- `cd frontend && npm run build`
+- `cargo build --release --offline`
+
 ## v0.0.7
 
 发布时间：2026-05-24
