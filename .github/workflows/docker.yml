@@ -2,12 +2,8 @@ name: Docker
 
 on:
   push:
-    branches:
-      - main
     tags:
       - "v*"
-  pull_request:
-  workflow_dispatch:
 
 env:
   IMAGE_NAME: syscc/embypanel
@@ -16,7 +12,7 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,7 +29,7 @@ jobs:
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest
             type=ref,event=tag
 
       - name: Check Docker Hub credentials
@@ -67,3 +63,36 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Extract release notes
+        id: release_notes
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME}"
+          notes_file="docs/changelog.md"
+          output_file="${RUNNER_TEMP}/release-notes.md"
+          awk -v version="$version" '
+            $0 == "## " version { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' "$notes_file" | sed '/./,$!d' > "$output_file"
+          if [[ ! -s "$output_file" ]]; then
+            {
+              echo "## ${version}"
+              echo
+              echo "Docker images:"
+              echo
+              echo "- syscc/embypanel:${version}"
+              echo "- syscc/embypanel:latest"
+            } > "$output_file"
+          fi
+          echo "file=$output_file" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 && mode=edit || mode=create
+          gh release "$mode" "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file "${{ steps.release_notes.outputs.file }}"
