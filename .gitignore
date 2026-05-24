@@ -1,0 +1,27 @@
+# OS/editor noise
+.DS_Store
+**/.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local environment
+.env
+.env.*
+
+# Rust
+target/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+
+# Runtime data
+data/*
+!data/
+!data/config.toml.example
+
+# Local workflow/spec tooling
+.spec-workflow/

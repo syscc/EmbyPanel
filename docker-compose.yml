@@ -1,0 +1,14 @@
+services:
+  embypanel:
+    image: syscc/embypanel:latest
+    environment:
+      - TZ=Asia/Shanghai
+      - EMBYPANEL_API_ADDR=0.0.0.0:8090
+    container_name: embypanel
+    restart: always
+    volumes:
+      - ./data:/data
+    ports:
+      - "8090:8090"
+      - "8091-8095:8091-8095"
+    network_mode: bridge
