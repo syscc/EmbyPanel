@@ -11,7 +11,7 @@ FROM --platform=$BUILDPLATFORM rust:1-bookworm AS backend-builder
 WORKDIR /app
 ARG TARGETARCH
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu \
+    && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
     && rm -rf /var/lib/apt/lists/*
 RUN if [ "$TARGETARCH" = "arm64" ]; then rustup target add aarch64-unknown-linux-gnu; fi
 COPY Cargo.toml Cargo.lock ./
