@@ -32,6 +32,16 @@ pub enum ActivityLevel {
     Error,
 }
 
+pub struct ActivityLogFilter<'a> {
+    pub server_id: Option<&'a str>,
+    pub kind: Option<ActivityKind>,
+    pub level: Option<&'a str>,
+    pub keyword: Option<&'a str>,
+    pub since_ms: Option<u128>,
+    pub until_ms: Option<u128>,
+    pub limit: usize,
+}
+
 impl ActivityLevel {
     fn as_str(self) -> &'static str {
         match self {
@@ -128,6 +138,7 @@ impl ActivityLogStore {
         });
     }
 
+    #[cfg(test)]
     pub fn list(
         &self,
         server_id: Option<&str>,
@@ -143,6 +154,44 @@ impl ActivityLogStore {
                     && kind.is_none_or(|kind| entry.kind == kind.as_str())
             })
             .take(limit.clamp(1, self.limit))
+            .cloned()
+            .collect()
+    }
+
+    pub fn list_filtered(&self, filter: ActivityLogFilter<'_>) -> Vec<ActivityLogEntry> {
+        let keyword = filter.keyword.map(str::to_ascii_lowercase);
+        let level = filter.level.filter(|value| *value != "all");
+        let entries = self.entries.lock().expect("activity log mutex poisoned");
+        entries
+            .iter()
+            .rev()
+            .filter(|entry| {
+                filter
+                    .server_id
+                    .is_none_or(|server_id| entry.server_id.as_deref() == Some(server_id))
+                    && filter.kind.is_none_or(|kind| entry.kind == kind.as_str())
+                    && level.is_none_or(|level| entry.level == level)
+                    && filter
+                        .since_ms
+                        .is_none_or(|since| entry.timestamp_ms >= since)
+                    && filter
+                        .until_ms
+                        .is_none_or(|until| entry.timestamp_ms <= until)
+                    && keyword.as_ref().is_none_or(|keyword| {
+                        let haystack = format!(
+                            "{} {} {} {} {} {}",
+                            entry.server_name,
+                            entry.playback_user.as_deref().unwrap_or(""),
+                            entry.playback_ip.as_deref().unwrap_or(""),
+                            entry.level,
+                            entry.message,
+                            entry.detail
+                        )
+                        .to_ascii_lowercase();
+                        haystack.contains(keyword)
+                    })
+            })
+            .take(filter.limit.clamp(1, self.limit))
             .cloned()
             .collect()
     }

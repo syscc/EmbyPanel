@@ -96,6 +96,46 @@ type ServerHealth = {
   disk_percent: number
 }
 
+type DetailedHealth = {
+  status: string
+  name: string
+  version: string
+  database: string
+  proxy_count: number
+}
+
+type ProxyStatus = {
+  server_id: string
+  server_name: string
+  enabled: boolean
+  port: number
+  listening: boolean
+  started_at_ms: number | null
+  last_request_ms: number | null
+  last_error: string | null
+}
+
+type RequestStatsDaily = {
+  date: string
+  server_id: string
+  server_name: string
+  port: number
+  requests: number
+  redirects: number
+  cache_hits: number
+  blocks: number
+  errors: number
+  updated_at_ms: number
+}
+
+type UpdateCheck = {
+  current_version: string
+  latest_version: string
+  release_url: string
+  has_update: boolean
+  checked_at_ms: number
+}
+
 type ClientRuleRecord = {
   id: string
   client_name: string
@@ -120,6 +160,17 @@ type PlaybackRateBlockRecord = {
   created_at: string
   enabled: boolean
   note: string
+}
+
+type PlaybackRateWindowStatus = {
+  server_id: string
+  ip: string
+  current_count: number
+  threshold: number
+  remaining: number
+  window_seconds: number
+  reset_at: string
+  blocked: boolean
 }
 
 type WebhookNotifyConfig = {
@@ -157,8 +208,38 @@ type ActivityLogEntry = {
   detail: string
 }
 
+type AuditLogEntry = {
+  id: number
+  timestamp_ms: number
+  admin_user_id: number | null
+  admin_username: string
+  action: string
+  summary: string
+  result: string
+}
+
+type ValidationResult = {
+  scope: string
+  ok: boolean
+  message: string
+  detail: string
+}
+
+type ValidationResponse = {
+  ok: boolean
+  results: ValidationResult[]
+}
+
+type SystemLogConfig = {
+  debug_mode: boolean
+  level: 'debug' | 'info' | 'warning' | 'error' | 'critical'
+  max_size_mb: number
+  max_backups: number
+  format: string
+}
+
 type AuthMode = 'loading' | 'setup' | 'login' | 'app'
-type Page = 'home' | 'server' | 'clients' | 'notifications' | 'logs' | 'account'
+type Page = 'home' | 'server' | 'clients' | 'notifications' | 'backup' | 'logs' | 'account'
 type ClientStatusFilter = 'all' | 'blocked' | 'allowed'
 type LogKindFilter = 'all' | 'playback' | 'general'
 type EncryptionPublicKey =
@@ -168,7 +249,7 @@ type EncryptionPublicKey =
 const tokenKey = 'embypanel_token'
 const pageKey = 'embypanel_page'
 const themeKey = 'embypanel_theme'
-const validPages: Page[] = ['home', 'server', 'clients', 'logs', 'notifications', 'account']
+const validPages: Page[] = ['home', 'server', 'clients', 'logs', 'notifications', 'backup', 'account']
 const mode = ref<AuthMode>('loading')
 const page = ref<Page>(storedPage())
 const token = ref(storedToken())
@@ -188,8 +269,21 @@ const logsLoading = ref(false)
 const logsError = ref('')
 const selectedLogServer = ref('all')
 const selectedLogKind = ref<LogKindFilter>('all')
+const selectedLogLevel = ref('all')
+const logKeywordFilter = ref('')
+const logSince = ref('')
+const logUntil = ref('')
 const mediaOverviews = ref<MediaOverview[]>([])
 const serverHealth = ref<ServerHealth | null>(null)
+const detailedHealth = ref<DetailedHealth | null>(null)
+const proxyStatuses = ref<ProxyStatus[]>([])
+const requestStats = ref<RequestStatsDaily[]>([])
+const updateCheck = ref<UpdateCheck | null>(null)
+const validationResults = ref<ValidationResult[]>([])
+const rateLimitWindows = ref<PlaybackRateWindowStatus[]>([])
+const auditLogs = ref<AuditLogEntry[]>([])
+const auditKeywordFilter = ref('')
+const selectedAuditAction = ref('all')
 const overviewError = ref('')
 const healthError = ref('')
 const clientControl = reactive<ClientControlConfig>({
@@ -217,6 +311,15 @@ const clientControlError = ref('')
 const clientStatusFilter = ref<ClientStatusFilter>('all')
 const clientKeywordFilter = ref('')
 const visibleApiKeyServers = ref<Record<string, boolean>>({})
+const backupError = ref('')
+const backupFileInput = ref<HTMLInputElement | null>(null)
+const logConfig = reactive<SystemLogConfig>({
+  debug_mode: false,
+  level: 'info',
+  max_size_mb: 5,
+  max_backups: 10,
+  format: '[%(levelname)s] %(asctime)s - %(message)s',
+})
 let dashboardTimer: number | undefined
 let logsTimer: number | undefined
 
@@ -273,6 +376,7 @@ const menu = [
   { id: 'clients' as const, label: '客户端', icon: '◫' },
   { id: 'logs' as const, label: '日志', icon: '≡' },
   { id: 'notifications' as const, label: '通知', icon: '◇' },
+  { id: 'backup' as const, label: '备份', icon: '▤' },
   { id: 'account' as const, label: '账户', icon: '◎' },
 ]
 
@@ -350,6 +454,30 @@ const activeRateLimitBlocks = computed(() =>
     .filter((record) => record.enabled)
     .sort((left, right) => Number(right.created_at) - Number(left.created_at)),
 )
+const requestStatsTotals = computed(() =>
+  requestStats.value.reduce(
+    (totals, row) => ({
+      requests: totals.requests + row.requests,
+      redirects: totals.redirects + row.redirects,
+      cache_hits: totals.cache_hits + row.cache_hits,
+      blocks: totals.blocks + row.blocks,
+      errors: totals.errors + row.errors,
+    }),
+    { requests: 0, redirects: 0, cache_hits: 0, blocks: 0, errors: 0 },
+  ),
+)
+const rateLimitOverview = computed(() => ({
+  active_windows: rateLimitWindows.value.length,
+  blocked_windows: rateLimitWindows.value.filter((row) => row.blocked).length,
+  highest_count: rateLimitWindows.value.reduce((max, row) => Math.max(max, row.current_count), 0),
+}))
+const proxyStatusById = computed(() =>
+  Object.fromEntries(proxyStatuses.value.map((status) => [status.server_id, status])),
+)
+const auditActionOptions = computed(() => {
+  const actions = new Set(auditLogs.value.map((entry) => entry.action))
+  return ['all', ...actions]
+})
 const mediaOverviewTotals = computed<MediaOverviewTotals>(() =>
   mediaOverviews.value.reduce(
     (totals, overview) => ({
@@ -453,9 +581,47 @@ async function loadAppData() {
   applyClientControlConfig(clientControlResponse)
   profileForm.username = profile.username
   mode.value = 'app'
+  void refreshUpdateCheck()
+  await refreshOperationalData()
+  await refreshLogConfig()
+  await refreshRateLimitStatus()
+  await refreshAuditLogs()
   await refreshDashboard()
   await refreshActivityLogs()
   startDashboardPolling()
+}
+
+async function refreshOperationalData() {
+  try {
+    const [health, statuses, stats, rateLimit] = await Promise.all([
+      api<DetailedHealth>('/api/monitoring/healthz'),
+      api<ProxyStatus[]>('/api/monitoring/proxy-status'),
+      api<RequestStatsDaily[]>('/api/monitoring/stats'),
+      api<PlaybackRateWindowStatus[]>('/api/client-control/rate-limit/status'),
+    ])
+    detailedHealth.value = health
+    proxyStatuses.value = statuses
+    requestStats.value = stats
+    rateLimitWindows.value = rateLimit
+  } catch (err) {
+    healthError.value = err instanceof Error ? err.message : String(err)
+  }
+}
+
+async function refreshUpdateCheck() {
+  try {
+    updateCheck.value = await api<UpdateCheck>('/api/app-info/update-check')
+  } catch {
+    updateCheck.value = null
+  }
+}
+
+async function refreshLogConfig() {
+  try {
+    Object.assign(logConfig, await api<SystemLogConfig>('/api/settings/log-config'))
+  } catch {
+    // Log config remains on defaults when the backend is not ready.
+  }
 }
 
 async function refreshClientControl() {
@@ -465,6 +631,25 @@ async function refreshClientControl() {
     applyClientControlConfig(response)
   } catch (err) {
     clientControlError.value = err instanceof Error ? err.message : String(err)
+  }
+}
+
+async function refreshRateLimitStatus() {
+  try {
+    rateLimitWindows.value = await api<PlaybackRateWindowStatus[]>('/api/client-control/rate-limit/status')
+  } catch {
+    rateLimitWindows.value = []
+  }
+}
+
+async function refreshAuditLogs() {
+  try {
+    const params = new URLSearchParams({ limit: '120' })
+    if (selectedAuditAction.value !== 'all') params.set('action', selectedAuditAction.value)
+    if (auditKeywordFilter.value.trim()) params.set('keyword', auditKeywordFilter.value.trim())
+    auditLogs.value = await api<AuditLogEntry[]>(`/api/monitoring/audit-logs?${params.toString()}`)
+  } catch {
+    auditLogs.value = []
   }
 }
 
@@ -481,12 +666,146 @@ async function saveSettings() {
     Object.assign(settings, response)
     normalizeSettingsServers()
     notice.value = '服务器配置已保存，反代服务已重启'
+    await refreshOperationalData()
     await refreshDashboard()
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
   } finally {
     saving.value = false
   }
+}
+
+async function validateSettings() {
+  saving.value = true
+  error.value = ''
+  notice.value = ''
+  validationResults.value = []
+  try {
+    const payload = buildSettingsPayload()
+    const response = await api<ValidationResponse>('/api/settings/validate', {
+      method: 'POST',
+      body: JSON.stringify(await encryptPayload('settings', payload)),
+    })
+    validationResults.value = response.results
+    notice.value = response.ok ? '配置测试通过' : '配置测试完成，请查看警告项'
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    saving.value = false
+  }
+}
+
+async function exportBackup() {
+  backupError.value = ''
+  notice.value = ''
+  try {
+    const response = await api<{ backup: string }>('/api/settings/backup/export', {
+      method: 'POST',
+    })
+    downloadTextFile(response.backup, backupFileName())
+    notice.value = '配置文件已生成，请在浏览器下载记录中查看'
+  } catch (err) {
+    backupError.value = err instanceof Error ? err.message : String(err)
+  }
+}
+
+async function importBackup() {
+  backupError.value = ''
+  notice.value = ''
+  backupFileInput.value?.click()
+}
+
+async function handleBackupFileSelected(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  backupError.value = ''
+  notice.value = ''
+  try {
+    const backup = await file.text()
+    await importBackupText(backup)
+  } catch (err) {
+    backupError.value = err instanceof Error ? err.message : String(err)
+  }
+}
+
+async function importBackupText(backupText: string) {
+  backupError.value = ''
+  notice.value = ''
+  const backup = backupText.trim()
+  if (!backup) {
+    backupError.value = '配置文件内容为空'
+    return
+  }
+  const confirmed = window.confirm('还原配置文件会覆盖当前配置并重启反代服务，确定继续吗？')
+  if (!confirmed) return
+  try {
+    const response = await api<Settings>('/api/settings/backup/import', {
+      method: 'POST',
+      body: JSON.stringify(await encryptPayload('backup', { backup })),
+    })
+    Object.assign(settings, response)
+    normalizeSettingsServers()
+    await refreshOperationalData()
+    notice.value = '配置文件已还原，反代服务已重启'
+  } catch (err) {
+    backupError.value = err instanceof Error ? err.message : String(err)
+  }
+}
+
+function downloadTextFile(content: string, filename: string) {
+  const blob = new Blob([content], { type: 'application/json;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  URL.revokeObjectURL(url)
+}
+
+function backupFileName() {
+  const timestamp = new Date()
+    .toISOString()
+    .replace(/\.\d{3}Z$/, '')
+    .replace(/[-:T]/g, '')
+  return `embypanel-config-${timestamp}.json`
+}
+
+async function saveLogConfig() {
+  logsError.value = ''
+  notice.value = ''
+  try {
+    Object.assign(logConfig, await api<SystemLogConfig>('/api/settings/log-config', {
+      method: 'PUT',
+      body: JSON.stringify(await encryptPayload('log_config', { ...logConfig })),
+    }))
+    notice.value = '日志配置已保存'
+  } catch (err) {
+    logsError.value = err instanceof Error ? err.message : String(err)
+  }
+}
+
+async function exportLogs() {
+  const params = logQueryParams(500)
+  const headers = new Headers()
+  if (token.value) headers.set('Authorization', `Bearer ${token.value}`)
+  const response = await fetch(`/api/monitoring/logs/export?${params.toString()}`, { headers })
+  if (!response.ok) {
+    logsError.value = await response.text()
+    return
+  }
+  const blob = await response.blob()
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = 'embypanel-logs.csv'
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  URL.revokeObjectURL(url)
 }
 
 async function restartProxyServer(server: EmbyServerConfig) {
@@ -913,7 +1232,7 @@ function removeStorage(storage: Storage, key: string) {
 }
 
 async function refreshDashboard() {
-  await Promise.all([refreshOverview(), refreshHealth(), refreshPlaybackSessions()])
+  await Promise.all([refreshOverview(), refreshHealth(), refreshPlaybackSessions(), refreshOperationalData()])
 }
 
 async function refreshOverview() {
@@ -976,10 +1295,20 @@ async function refreshActivityLogs() {
 }
 
 async function fetchActivityLogs(kind: LogKindFilter, limit: number) {
-  const params = new URLSearchParams({ limit: String(limit) })
-  if (selectedLogServer.value !== 'all') params.set('server_id', selectedLogServer.value)
+  const params = logQueryParams(limit)
   if (kind !== 'all') params.set('kind', kind)
   return api<ActivityLogEntry[]>(`/api/monitoring/logs?${params.toString()}`)
+}
+
+function logQueryParams(limit: number) {
+  const params = new URLSearchParams({ limit: String(limit) })
+  if (selectedLogServer.value !== 'all') params.set('server_id', selectedLogServer.value)
+  if (selectedLogKind.value !== 'all') params.set('kind', selectedLogKind.value)
+  if (selectedLogLevel.value !== 'all') params.set('level', selectedLogLevel.value)
+  if (logKeywordFilter.value.trim()) params.set('keyword', logKeywordFilter.value.trim())
+  if (logSince.value) params.set('since_ms', String(new Date(logSince.value).getTime()))
+  if (logUntil.value) params.set('until_ms', String(new Date(logUntil.value).getTime()))
+  return params
 }
 
 function startDashboardPolling() {
@@ -1226,6 +1555,25 @@ function formatLogTime(value: number) {
   return new Date(value).toLocaleString()
 }
 
+function formatTimestampMs(value: number | null | undefined) {
+  if (!value || !Number.isFinite(value)) return '--'
+  return new Date(value).toLocaleString()
+}
+
+function formatServerName(serverId: string) {
+  return settings.servers.find((server) => server.id === serverId)?.name || serverId || '--'
+}
+
+function proxyStatusLabel(status: ProxyStatus | undefined) {
+  if (!status) return '未启动'
+  if (!status.enabled) return '未启用'
+  return status.listening ? '监听中' : '未监听'
+}
+
+function validationClass(result: ValidationResult) {
+  return result.ok ? 'success' : 'warn'
+}
+
 function logLevelLabel(level: ActivityLogEntry['level']) {
   if (level === 'success') return '成功'
   if (level === 'error') return '错误'
@@ -1403,6 +1751,91 @@ onBeforeUnmount(stopDashboardPolling)
             <div v-else class="empty-state">{{ healthError || '正在读取服务器状态' }}</div>
           </section>
 
+          <section class="panel operations-panel">
+            <div class="panel-head">
+              <div>
+                <h2>运维概览</h2>
+                <p class="muted">健康检查、反代监听和今日请求统计。</p>
+              </div>
+              <button class="secondary" @click="refreshOperationalData">刷新</button>
+            </div>
+            <div class="stat-grid four">
+              <div class="stat-card">
+                <span>今日请求</span>
+                <strong>{{ requestStatsTotals.requests.toLocaleString() }}</strong>
+                <small>{{ detailedHealth?.status === 'ok' ? '健康' : '待检查' }}</small>
+              </div>
+              <div class="stat-card">
+                <span>重定向</span>
+                <strong>{{ requestStatsTotals.redirects.toLocaleString() }}</strong>
+                <small>STRM 直链</small>
+              </div>
+              <div class="stat-card">
+                <span>缓存命中</span>
+                <strong>{{ requestStatsTotals.cache_hits.toLocaleString() }}</strong>
+                <small>内存直链缓存</small>
+              </div>
+              <div class="stat-card">
+                <span>拦截 / 错误</span>
+                <strong>{{ requestStatsTotals.blocks.toLocaleString() }} / {{ requestStatsTotals.errors.toLocaleString() }}</strong>
+                <small>今日累计</small>
+              </div>
+            </div>
+            <div v-if="updateCheck?.has_update" class="notice warn update-notice">
+              发现新版本 {{ updateCheck.latest_version }}，当前 {{ updateCheck.current_version }}。
+              <a :href="updateCheck.release_url" target="_blank" rel="noreferrer">查看 Release</a>
+            </div>
+            <div class="proxy-status-list">
+              <div v-for="status in proxyStatuses" :key="status.server_id" class="proxy-status-row">
+                <strong>{{ status.server_name }}</strong>
+                <span>:{{ status.port }}</span>
+                <span :class="['client-badge', status.listening ? 'allowed' : 'blocked']">
+                  {{ proxyStatusLabel(status) }}
+                </span>
+                <small>最近请求 {{ formatTimestampMs(status.last_request_ms) }}</small>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel rate-limit-overview">
+            <div class="panel-head">
+              <div>
+                <h2>播放频率限制</h2>
+                <p class="muted">首页直接查看当前窗口命中和封禁情况。</p>
+              </div>
+              <button class="secondary" @click="refreshRateLimitStatus">刷新</button>
+            </div>
+            <div class="stat-grid three">
+              <div class="stat-card">
+                <span>活跃窗口</span>
+                <strong>{{ rateLimitOverview.active_windows.toLocaleString() }}</strong>
+                <small>当前监控中的 IP</small>
+              </div>
+              <div class="stat-card">
+                <span>已封禁</span>
+                <strong>{{ rateLimitOverview.blocked_windows.toLocaleString() }}</strong>
+                <small>屏蔽 IP / 禁用用户</small>
+              </div>
+              <div class="stat-card">
+                <span>最高命中</span>
+                <strong>{{ rateLimitOverview.highest_count.toLocaleString() }}</strong>
+                <small>当前窗口最大次数</small>
+              </div>
+            </div>
+            <div v-if="rateLimitWindows.length" class="rate-window-mini-list">
+              <div v-for="row in rateLimitWindows.slice(0, 5)" :key="`home-${row.server_id}-${row.ip}`" class="rate-window-mini-row">
+                <strong>{{ formatServerName(row.server_id) }}</strong>
+                <span>{{ row.ip }}</span>
+                <span>{{ row.current_count }}/{{ row.threshold }}</span>
+                <span>{{ row.window_seconds }}s</span>
+                <span :class="['client-badge', row.blocked ? 'blocked' : 'allowed']">
+                  {{ row.blocked ? '已封禁' : '观察中' }}
+                </span>
+              </div>
+            </div>
+            <div v-else class="empty-state compact">当前没有播放频率窗口数据。</div>
+          </section>
+
           <section class="panel playing-panel">
             <div class="panel-head">
               <h2>实时播放</h2>
@@ -1445,6 +1878,7 @@ onBeforeUnmount(stopDashboardPolling)
             </div>
             <div class="panel-actions">
               <button class="secondary" @click="addServer">添加服务器</button>
+              <button class="secondary" :disabled="saving" @click="validateSettings">测试配置</button>
               <button class="primary" :disabled="saving" @click="saveSettings">
                 {{ saving ? '保存中' : '保存配置' }}
               </button>
@@ -1471,6 +1905,17 @@ onBeforeUnmount(stopDashboardPolling)
                     删除
                   </button>
                 </div>
+              </div>
+              <div class="server-status-strip">
+                <span :class="['client-badge', proxyStatusById[server.id]?.listening ? 'allowed' : 'blocked']">
+                  {{ proxyStatusLabel(proxyStatusById[server.id]) }}
+                </span>
+                <span>端口 :{{ proxyStatusById[server.id]?.port || server.port }}</span>
+                <span>启动 {{ formatTimestampMs(proxyStatusById[server.id]?.started_at_ms) }}</span>
+                <span>最近请求 {{ formatTimestampMs(proxyStatusById[server.id]?.last_request_ms) }}</span>
+                <span v-if="proxyStatusById[server.id]?.last_error" class="server-status-error">
+                  {{ proxyStatusById[server.id]?.last_error }}
+                </span>
               </div>
               <div class="grid server-grid">
                 <label>
@@ -1593,6 +2038,27 @@ onBeforeUnmount(stopDashboardPolling)
               placeholder="每行一个映射：原地址 => 新地址&#10;https://source.example.com => http://media-gateway.local:5244&#10;高级正则：regex:https://source\\.(example|test)\\.com => http://media-gateway.local:5244"
             />
           </label>
+
+          <section class="config-tools single">
+            <div class="tool-block">
+              <div class="panel-head compact">
+                <h3>配置测试结果</h3>
+                <button class="secondary" :disabled="saving" @click="validateSettings">重新测试</button>
+              </div>
+              <div v-if="validationResults.length" class="validation-list">
+                <div
+                  v-for="result in validationResults"
+                  :key="`${result.scope}-${result.message}-${result.detail}`"
+                  :class="['validation-row', validationClass(result)]"
+                >
+                  <strong>{{ result.scope }}</strong>
+                  <span>{{ result.message }}</span>
+                  <small>{{ result.detail || '--' }}</small>
+                </div>
+              </div>
+              <div v-else class="empty-state compact">还没有运行配置测试。</div>
+            </div>
+          </section>
         </section>
 
         <section v-else-if="page === 'clients'" class="client-page">
@@ -1721,6 +2187,49 @@ onBeforeUnmount(stopDashboardPolling)
                 清空筛选
               </button>
             </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>播放频率窗口</h2>
+                <p class="muted">显示当前检测窗口内各 IP 的播放请求计数。</p>
+              </div>
+              <button class="secondary" @click="refreshRateLimitStatus">刷新</button>
+            </div>
+            <div v-if="rateLimitWindows.length" class="rate-window-table-wrap">
+              <table class="rate-window-table">
+                <thead>
+                  <tr>
+                    <th>服务器</th>
+                    <th>IP</th>
+                    <th>当前次数</th>
+                    <th>阈值</th>
+                    <th>剩余</th>
+                    <th>窗口</th>
+                    <th>重置时间</th>
+                    <th>状态</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in rateLimitWindows" :key="`${row.server_id}-${row.ip}`">
+                    <td>{{ formatServerName(row.server_id) }}</td>
+                    <td>{{ row.ip }}</td>
+                    <td>{{ row.current_count }}</td>
+                    <td>{{ row.threshold }}</td>
+                    <td>{{ row.remaining }}</td>
+                    <td>{{ row.window_seconds }}s</td>
+                    <td>{{ formatTimestamp(row.reset_at) }}</td>
+                    <td>
+                      <span :class="['client-badge', row.blocked ? 'blocked' : 'allowed']">
+                        {{ row.blocked ? '已封禁' : '观察中' }}
+                      </span>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div v-else class="empty-state compact">当前没有播放频率窗口数据。</div>
           </section>
 
           <section class="panel">
@@ -1858,6 +2367,65 @@ onBeforeUnmount(stopDashboardPolling)
           </section>
         </section>
 
+        <section v-else-if="page === 'backup'" class="backup-page">
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>配置备份</h2>
+                <p class="muted">导出配置文件，或从电脑选择配置文件还原运行配置。</p>
+              </div>
+            </div>
+            <input
+              ref="backupFileInput"
+              class="visually-hidden"
+              type="file"
+              accept=".json,application/json,text/plain"
+              @change="handleBackupFileSelected"
+            />
+            <div v-if="backupError" class="notice error">{{ backupError }}</div>
+            <div class="backup-layout">
+              <section class="backup-card">
+                <h3>备份范围</h3>
+                <div class="backup-scope-grid">
+                  <div>
+                    <strong>服务器配置</strong>
+                    <span>Emby 地址、API Key、反代端口、真实 IP、缓存和映射规则</span>
+                  </div>
+                  <div>
+                    <strong>客户端管控</strong>
+                    <span>UA 拦截、播放频率限制、封禁列表和客户端规则</span>
+                  </div>
+                  <div>
+                    <strong>通知配置</strong>
+                    <span>Webhook 地址、启用状态和密钥</span>
+                  </div>
+                  <div>
+                    <strong>日志配置</strong>
+                    <span>日志级别、文件大小、保留数量和格式</span>
+                  </div>
+                </div>
+                <p class="muted backup-note">
+                  不包含面板管理员用户名、密码、登录会话、运行日志文件和请求统计数据。
+                </p>
+              </section>
+
+              <section class="backup-card">
+                <h3>配置文件备份 / 还原</h3>
+                <div class="backup-actions text-actions">
+                  <button class="secondary" @click="exportBackup">备份</button>
+                  <button class="primary" @click="importBackup">还原</button>
+                </div>
+                <div class="backup-drop-hint">
+                  <strong>备份</strong>
+                  <span>点击后会自动生成 `embypanel-config-时间.json` 并弹出浏览器下载。</span>
+                  <strong>还原</strong>
+                  <span>点击后选择本机配置文件，读取成功后自动还原并重启反代服务。</span>
+                </div>
+              </section>
+            </div>
+          </section>
+        </section>
+
         <section v-else-if="page === 'logs'" class="logs-page">
           <section class="panel">
             <div class="panel-head">
@@ -1891,6 +2459,32 @@ onBeforeUnmount(stopDashboardPolling)
                   <option value="general">信息</option>
                 </select>
               </label>
+              <label>
+                <span>日志级别</span>
+                <select v-model="selectedLogLevel" @change="refreshActivityLogs">
+                  <option value="all">全部级别</option>
+                  <option value="success">SUCCESS - 成功</option>
+                  <option value="info">INFO - 信息</option>
+                  <option value="warn">WARNING - 警告</option>
+                  <option value="error">ERROR - 错误</option>
+                </select>
+              </label>
+              <label>
+                <span>关键词</span>
+                <input v-model="logKeywordFilter" placeholder="搜索用户名 / IP / URL / 信息" @keyup.enter="refreshActivityLogs" />
+              </label>
+              <label>
+                <span>开始时间</span>
+                <input v-model="logSince" type="datetime-local" @change="refreshActivityLogs" />
+              </label>
+              <label>
+                <span>结束时间</span>
+                <input v-model="logUntil" type="datetime-local" @change="refreshActivityLogs" />
+              </label>
+              <div class="log-filter-actions">
+                <button class="secondary" @click="refreshActivityLogs">筛选</button>
+                <button class="secondary" @click="exportLogs">导出 CSV</button>
+              </div>
               <div class="log-summary">
                 <div>
                   <span>播放日志</span>
@@ -1901,6 +2495,40 @@ onBeforeUnmount(stopDashboardPolling)
                   <strong>{{ generalLogRows.length }}</strong>
                 </div>
               </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>日志文件配置</h2>
+                <p class="muted">日志写入 data/logs/embypanel.log，默认 INFO 级别。</p>
+              </div>
+              <button class="primary" @click="saveLogConfig">保存日志配置</button>
+            </div>
+            <div class="grid log-config-grid">
+              <label>
+                <span>日志级别</span>
+                <select v-model="logConfig.level">
+                  <option value="debug">DEBUG - 调试</option>
+                  <option value="info">INFO - 信息</option>
+                  <option value="warning">WARNING - 警告</option>
+                  <option value="error">ERROR - 错误</option>
+                  <option value="critical">CRITICAL - 严重</option>
+                </select>
+              </label>
+              <label>
+                <span>单文件最大 MB</span>
+                <input v-model.number="logConfig.max_size_mb" type="number" min="1" max="1024" />
+              </label>
+              <label>
+                <span>保留文件数</span>
+                <input v-model.number="logConfig.max_backups" type="number" min="1" max="99" />
+              </label>
+              <label class="log-format-field">
+                <span>日志格式</span>
+                <input v-model="logConfig.format" />
+              </label>
             </div>
           </section>
 
@@ -1994,6 +2622,40 @@ onBeforeUnmount(stopDashboardPolling)
                 {{ changingPassword ? '修改中' : '修改密码' }}
               </button>
             </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>配置审计</h2>
+                <p class="muted">记录配置、账户、通知、备份恢复等管理操作，不保存敏感明文。</p>
+              </div>
+              <button class="secondary" @click="refreshAuditLogs">刷新</button>
+            </div>
+            <div class="audit-toolbar">
+              <label>
+                <span>操作类型</span>
+                <select v-model="selectedAuditAction" @change="refreshAuditLogs">
+                  <option v-for="action in auditActionOptions" :key="action" :value="action">
+                    {{ action === 'all' ? '全部操作' : action }}
+                  </option>
+                </select>
+              </label>
+              <label>
+                <span>关键词</span>
+                <input v-model="auditKeywordFilter" placeholder="搜索管理员 / 操作 / 摘要" @keyup.enter="refreshAuditLogs" />
+              </label>
+            </div>
+            <div v-if="auditLogs.length" class="audit-list">
+              <article v-for="entry in auditLogs" :key="entry.id" class="audit-row">
+                <div>
+                  <strong>{{ entry.action }}</strong>
+                  <span>{{ entry.summary }}</span>
+                </div>
+                <small>{{ entry.admin_username || '--' }} · {{ entry.result }} · {{ formatTimestampMs(entry.timestamp_ms) }}</small>
+              </article>
+            </div>
+            <div v-else class="empty-state compact">暂无审计记录。</div>
           </section>
         </section>
       </div>

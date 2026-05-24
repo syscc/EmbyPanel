@@ -1,16 +1,69 @@
+use aes_gcm::{
+    Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit},
+};
+use argon2::Argon2;
 use axum::{Json, extract::State, http::HeaderMap};
-use serde::Deserialize;
+use base64::{Engine, engine::general_purpose::STANDARD};
+#[cfg(test)]
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     AppState, DirectLinkCache, auth,
+    client_control::ClientControlConfig,
     config::Config,
     crypto_api::EncryptedRequest,
     error::{AppError, AppResult},
+    file_log::{SystemLogConfig, normalize_config},
 };
 
 #[derive(Debug, Deserialize)]
 pub struct RestartProxyRequest {
     server_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BackupImportRequest {
+    #[serde(default)]
+    password: Option<String>,
+    backup: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackupExportResponse {
+    backup: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BackupEnvelope {
+    version: u32,
+    kdf: String,
+    cipher: String,
+    salt: String,
+    nonce: String,
+    data: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BackupPayload {
+    runtime_config: Config,
+    client_control: Option<serde_json::Value>,
+    system_log_config: Option<SystemLogConfig>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationResponse {
+    ok: bool,
+    results: Vec<ValidationResult>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationResult {
+    scope: String,
+    ok: bool,
+    message: String,
+    detail: String,
 }
 
 pub async fn get_settings(
@@ -28,7 +81,7 @@ pub async fn update_settings(
     headers: HeaderMap,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<Config>> {
-    auth::require_auth(&state, &headers).await?;
+    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
     let mut payload: Config = state.crypto_keys.decrypt_named(&request, "settings")?;
     let existing = state.config.read().await.clone();
     if payload.servers.is_empty() && !existing.servers.is_empty() {
@@ -62,6 +115,12 @@ pub async fn update_settings(
         .validate_for_storage()
         .map_err(|err| AppError::Config(err.to_string()))?;
     state.settings_store.save_config(&payload)?;
+    state.settings_store.record_audit(
+        Some(admin_user_id),
+        "settings.update",
+        "保存服务器配置",
+        "success",
+    )?;
     *state.config.write().await = payload.clone();
     *state.cache.write().await =
         DirectLinkCache::new(payload.cache_ttl_seconds, payload.cache_max_capacity);
@@ -76,7 +135,7 @@ pub async fn restart_proxy_server(
     headers: HeaderMap,
     Json(payload): Json<RestartProxyRequest>,
 ) -> AppResult<Json<Config>> {
-    auth::require_auth(&state, &headers).await?;
+    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
     let server_id = payload.server_id.trim();
     if server_id.is_empty() {
         return Err(AppError::Validation("server_id is required".to_string()));
@@ -86,12 +145,455 @@ pub async fn restart_proxy_server(
             .restart_server(state.clone(), server_id)
             .await?;
     }
+    state.settings_store.record_audit(
+        Some(admin_user_id),
+        "settings.restart_proxy",
+        &format!("重启反代服务器 {server_id}"),
+        "success",
+    )?;
     Ok(Json(redact_config_secrets(
         state.config.read().await.clone(),
     )))
 }
 
+pub async fn validate_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EncryptedRequest>,
+) -> AppResult<Json<ValidationResponse>> {
+    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let mut payload: Config = state.crypto_keys.decrypt_named(&request, "settings")?;
+    let existing = state.config.read().await.clone();
+    for server in &mut payload.servers {
+        if server.emby_api_key.trim().is_empty()
+            && let Some(existing_server) = existing
+                .servers
+                .iter()
+                .find(|existing_server| existing_server.id == server.id)
+        {
+            server.emby_api_key = existing_server.emby_api_key.clone();
+        }
+    }
+    let mut results = Vec::new();
+    match payload.validate_for_storage() {
+        Ok(()) => results.push(ok_result("配置", "本地配置校验通过", "")),
+        Err(err) => results.push(err_result("配置", "本地配置校验失败", &err.to_string())),
+    }
+    let current_statuses = if let Some(proxy_manager) = state.proxy_manager.as_ref() {
+        proxy_manager.statuses(&existing).await
+    } else {
+        Vec::new()
+    };
+    let mut ports = std::collections::HashSet::new();
+    for server in &payload.servers {
+        if !ports.insert(server.port) {
+            results.push(err_result(
+                &server.name,
+                "反代端口重复",
+                &format!("端口 {}", server.port),
+            ));
+            continue;
+        }
+        let bind_addr = format!("0.0.0.0:{}", server.port);
+        let current_proxy_owns_port = current_statuses.iter().any(|status| {
+            status.server_id == server.id && status.port == server.port && status.listening
+        });
+        let bind_ok = current_proxy_owns_port || std::net::TcpListener::bind(&bind_addr).is_ok();
+        results.push(if current_proxy_owns_port {
+            ok_result(&server.name, "反代端口正在由当前服务监听", &bind_addr)
+        } else if bind_ok {
+            ok_result(&server.name, "反代端口可用", &bind_addr)
+        } else {
+            err_result(&server.name, "反代端口已被占用", &bind_addr)
+        });
+        match crate::emby::get_media_overview(
+            &state.client,
+            &payload.for_server_for_validation(server),
+        )
+        .await
+        {
+            Ok(_) => results.push(ok_result(
+                &server.name,
+                "Emby API Key 可用",
+                &server.emby_host,
+            )),
+            Err(err) => results.push(err_result(&server.name, "Emby 连接失败", &err.to_string())),
+        }
+    }
+
+    if payload.openlist_addr.is_some() {
+        match crate::openlist::validate_connection(&state.client, &payload).await {
+            Ok(()) => results.push(ok_result("OpenList", "OpenList 连接可用", "")),
+            Err(err) => results.push(err_result(
+                "OpenList",
+                "OpenList 连接失败",
+                &err.to_string(),
+            )),
+        }
+    } else {
+        results.push(ok_result("OpenList", "未配置，已跳过", ""));
+    }
+
+    let ok = results.iter().all(|result| result.ok);
+    state.settings_store.record_audit(
+        Some(admin_user_id),
+        "settings.validate",
+        "测试服务器配置",
+        if ok { "success" } else { "warn" },
+    )?;
+    Ok(Json(ValidationResponse { ok, results }))
+}
+
+pub async fn get_log_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<SystemLogConfig>> {
+    auth::require_auth(&state, &headers).await?;
+    Ok(Json(state.file_log.config()))
+}
+
+pub async fn update_log_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EncryptedRequest>,
+) -> AppResult<Json<SystemLogConfig>> {
+    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let payload: SystemLogConfig = state.crypto_keys.decrypt_named(&request, "log_config")?;
+    let config = state
+        .file_log
+        .update_config(&state.settings_store, payload)?;
+    state.settings_store.record_audit(
+        Some(admin_user_id),
+        "log_config.update",
+        "保存日志配置",
+        "success",
+    )?;
+    Ok(Json(config))
+}
+
+pub async fn export_backup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<BackupExportResponse>> {
+    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let backup = BackupPayload {
+        runtime_config: state.config.read().await.clone(),
+        client_control: backup_client_control_config(&state)?,
+        system_log_config: Some(state.file_log.config()),
+    };
+    let backup = serde_json::to_string_pretty(&backup)?;
+    state.settings_store.record_audit(
+        Some(admin_user_id),
+        "backup.export",
+        "导出配置文本",
+        "success",
+    )?;
+    Ok(Json(BackupExportResponse { backup }))
+}
+
+pub async fn import_backup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EncryptedRequest>,
+) -> AppResult<Json<Config>> {
+    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let payload: BackupImportRequest = state.crypto_keys.decrypt_named(&request, "backup")?;
+    let mut backup = parse_backup_text(payload.password.as_deref(), &payload.backup)?;
+    backup
+        .runtime_config
+        .validate_for_storage()
+        .map_err(|err| AppError::Config(err.to_string()))?;
+    state.settings_store.save_config(&backup.runtime_config)?;
+    if let Some(client_control) = backup.client_control {
+        state
+            .settings_store
+            .save_setting_json("client_control", &client_control)?;
+    }
+    if let Some(log_config) = backup.system_log_config.take() {
+        let _ = state
+            .file_log
+            .update_config(&state.settings_store, normalize_config(log_config))?;
+    }
+    *state.config.write().await = backup.runtime_config.clone();
+    *state.cache.write().await = DirectLinkCache::new(
+        backup.runtime_config.cache_ttl_seconds,
+        backup.runtime_config.cache_max_capacity,
+    );
+    if let Some(proxy_manager) = state.proxy_manager.as_ref() {
+        proxy_manager.restart_all(state.clone()).await?;
+    }
+    state.settings_store.record_audit(
+        Some(admin_user_id),
+        "backup.import",
+        "还原配置文件",
+        "success",
+    )?;
+    Ok(Json(redact_config_secrets(backup.runtime_config)))
+}
+
 fn redact_config_secrets(mut config: Config) -> Config {
     config.openlist_token = None;
     config
+}
+
+fn ok_result(scope: &str, message: &str, detail: &str) -> ValidationResult {
+    ValidationResult {
+        scope: scope.to_string(),
+        ok: true,
+        message: message.to_string(),
+        detail: detail.to_string(),
+    }
+}
+
+fn err_result(scope: &str, message: &str, detail: &str) -> ValidationResult {
+    ValidationResult {
+        scope: scope.to_string(),
+        ok: false,
+        message: message.to_string(),
+        detail: detail.to_string(),
+    }
+}
+
+fn backup_client_control_config(state: &AppState) -> AppResult<Option<serde_json::Value>> {
+    let config = state
+        .settings_store
+        .load_setting_json::<ClientControlConfig>("client_control")?;
+    backup_client_control_value(config)
+}
+
+fn backup_client_control_value(
+    config: Option<ClientControlConfig>,
+) -> AppResult<Option<serde_json::Value>> {
+    let Some(mut config) = config else {
+        return Ok(None);
+    };
+    let now = now_seconds();
+    config.records.retain(|record| record.enabled);
+    config.rate_limit_blocks.retain(|record| {
+        record.enabled && record.blocked_until.parse::<u64>().unwrap_or_default() > now
+    });
+    serde_json::to_value(config).map(Some).map_err(Into::into)
+}
+
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn parse_backup_text(password: Option<&str>, value: &str) -> AppResult<BackupPayload> {
+    match serde_json::from_str::<BackupPayload>(value) {
+        Ok(payload) => Ok(payload),
+        Err(plain_err) => {
+            if let Some(password) = password.filter(|value| !value.trim().is_empty()) {
+                decrypt_backup(password, value)
+            } else {
+                Err(AppError::Validation(format!(
+                    "invalid backup config text: {plain_err}"
+                )))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn encrypt_backup(password: &str, payload: &BackupPayload) -> AppResult<String> {
+    let mut salt = [0_u8; 16];
+    let mut nonce = [0_u8; 12];
+    rand::rng().fill_bytes(&mut salt);
+    rand::rng().fill_bytes(&mut nonce);
+    let key = backup_key(password, &salt)?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|err| AppError::Internal(format!("backup cipher error: {err}")))?;
+    let plaintext = serde_json::to_vec(payload)?;
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
+        .map_err(|_| AppError::Internal("backup encryption failed".to_string()))?;
+    let envelope = BackupEnvelope {
+        version: 1,
+        kdf: "argon2id".to_string(),
+        cipher: "aes-256-gcm".to_string(),
+        salt: STANDARD.encode(salt),
+        nonce: STANDARD.encode(nonce),
+        data: STANDARD.encode(ciphertext),
+    };
+    serde_json::to_string_pretty(&envelope).map_err(Into::into)
+}
+
+fn decrypt_backup(password: &str, value: &str) -> AppResult<BackupPayload> {
+    let envelope: BackupEnvelope = serde_json::from_str(value)?;
+    if envelope.version != 1 || envelope.cipher != "aes-256-gcm" {
+        return Err(AppError::Validation(
+            "unsupported backup format".to_string(),
+        ));
+    }
+    let salt = STANDARD
+        .decode(envelope.salt)
+        .map_err(|err| AppError::Validation(format!("invalid backup salt: {err}")))?;
+    let nonce = STANDARD
+        .decode(envelope.nonce)
+        .map_err(|err| AppError::Validation(format!("invalid backup nonce: {err}")))?;
+    let data = STANDARD
+        .decode(envelope.data)
+        .map_err(|err| AppError::Validation(format!("invalid backup data: {err}")))?;
+    let key = backup_key(password, &salt)?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|err| AppError::Internal(format!("backup cipher error: {err}")))?;
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(&nonce), data.as_ref())
+        .map_err(|_| AppError::Validation("backup password is invalid".to_string()))?;
+    serde_json::from_slice(&plaintext).map_err(Into::into)
+}
+
+fn backup_key(password: &str, salt: &[u8]) -> AppResult<[u8; 32]> {
+    let mut key = [0_u8; 32];
+    Argon2::default()
+        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .map_err(|err| AppError::Internal(format!("backup key derivation failed: {err}")))?;
+    Ok(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client_control::{ClientRuleRecord, ClientRuleSource, WebhookNotifyConfig};
+
+    #[test]
+    fn backup_round_trip_restores_payload() {
+        let payload = BackupPayload {
+            runtime_config: Config::default_runtime(),
+            client_control: Some(serde_json::json!({ "enabled": true })),
+            system_log_config: Some(SystemLogConfig::default()),
+        };
+
+        let backup = encrypt_backup("strong-password", &payload).unwrap();
+        let restored = decrypt_backup("strong-password", &backup).unwrap();
+
+        assert_eq!(
+            restored.runtime_config.cache_ttl_seconds,
+            payload.runtime_config.cache_ttl_seconds
+        );
+        assert_eq!(restored.client_control, payload.client_control);
+        assert!(restored.system_log_config.is_some());
+    }
+
+    #[test]
+    fn backup_rejects_wrong_password() {
+        let payload = BackupPayload {
+            runtime_config: Config::default_runtime(),
+            client_control: None,
+            system_log_config: None,
+        };
+
+        let backup = encrypt_backup("correct-password", &payload).unwrap();
+        let err = decrypt_backup("wrong-password", &backup).unwrap_err();
+
+        assert!(err.to_string().contains("backup password is invalid"));
+    }
+
+    #[test]
+    fn backup_client_control_keeps_only_active_rules_and_blocks() {
+        let mut config = ClientControlConfig {
+            enabled: true,
+            notify_enabled: false,
+            playback_rate_limit_enabled: false,
+            playback_rate_limit_window_seconds: 60,
+            playback_rate_limit_max_requests: 20,
+            playback_rate_limit_block_seconds: 1800,
+            playback_rate_limit_action: "block_ip".to_string(),
+            rate_limit_blocks: Vec::new(),
+            webhook: WebhookNotifyConfig::default(),
+            webhooks: Vec::new(),
+            records: Vec::new(),
+        };
+        config.records.push(ClientRuleRecord {
+            id: "blocked".to_string(),
+            client_name: "Infuse".to_string(),
+            device_name: "--".to_string(),
+            user_name: "--".to_string(),
+            user_agent: "Infuse-Library".to_string(),
+            source: ClientRuleSource::Manual,
+            enabled: true,
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+            note: "禁用".to_string(),
+        });
+        config.records.push(ClientRuleRecord {
+            id: "allowed-auto".to_string(),
+            client_name: "Auto".to_string(),
+            device_name: "--".to_string(),
+            user_name: "--".to_string(),
+            user_agent: "Allowed-UA".to_string(),
+            source: ClientRuleSource::Auto,
+            enabled: false,
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+            note: "自动记录播放设备".to_string(),
+        });
+        let active_until = now_seconds() + 60;
+        config
+            .rate_limit_blocks
+            .push(crate::client_control::PlaybackRateBlockRecord {
+                id: "active-block".to_string(),
+                server_id: "server-a".to_string(),
+                server_name: "a".to_string(),
+                action: "block_ip".to_string(),
+                ip: "10.0.0.1".to_string(),
+                user_name: "user-a".to_string(),
+                blocked_until: active_until.to_string(),
+                created_at: "1".to_string(),
+                enabled: true,
+                note: "active".to_string(),
+            });
+        config
+            .rate_limit_blocks
+            .push(crate::client_control::PlaybackRateBlockRecord {
+                id: "expired-block".to_string(),
+                server_id: "server-a".to_string(),
+                server_name: "a".to_string(),
+                action: "block_ip".to_string(),
+                ip: "10.0.0.2".to_string(),
+                user_name: "user-b".to_string(),
+                blocked_until: "1".to_string(),
+                created_at: "1".to_string(),
+                enabled: true,
+                note: "expired".to_string(),
+            });
+        config
+            .rate_limit_blocks
+            .push(crate::client_control::PlaybackRateBlockRecord {
+                id: "disabled-block".to_string(),
+                server_id: "server-a".to_string(),
+                server_name: "a".to_string(),
+                action: "disable_user".to_string(),
+                ip: "10.0.0.3".to_string(),
+                user_name: "user-c".to_string(),
+                blocked_until: active_until.to_string(),
+                created_at: "1".to_string(),
+                enabled: false,
+                note: "disabled".to_string(),
+            });
+
+        let value = backup_client_control_value(Some(config)).unwrap().unwrap();
+        let records = value
+            .get("records")
+            .and_then(|records| records.as_array())
+            .unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].get("id").and_then(|id| id.as_str()),
+            Some("blocked")
+        );
+        let blocks = value
+            .get("rate_limit_blocks")
+            .and_then(|blocks| blocks.as_array())
+            .unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].get("id").and_then(|id| id.as_str()),
+            Some("active-block")
+        );
+    }
 }

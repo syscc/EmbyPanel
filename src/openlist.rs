@@ -23,6 +23,12 @@ struct FsGetData {
     raw_url: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct FsListResponse {
+    code: Option<i64>,
+    message: Option<String>,
+}
+
 pub async fn fs_get(
     client: &reqwest::Client,
     config: &Config,
@@ -59,6 +65,42 @@ pub async fn fs_get(
     }
 
     Ok(data.data.and_then(|data| data.raw_url))
+}
+
+pub async fn validate_connection(client: &reqwest::Client, config: &Config) -> AppResult<()> {
+    let url = config.openlist_url("/api/fs/list")?;
+    let response = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(
+            reqwest::header::AUTHORIZATION,
+            config.openlist_token.as_deref().unwrap_or_default(),
+        )
+        .json(&serde_json::json!({
+            "path": "/",
+            "password": "",
+            "refresh": false,
+            "page": 1,
+            "per_page": 1,
+        }))
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(AppError::BadGateway(format!(
+            "OpenList HTTP request failed with status {}",
+            response.status()
+        )));
+    }
+
+    let data = response.json::<FsListResponse>().await?;
+    if data.code != Some(200) {
+        return Err(AppError::BadGateway(format!(
+            "OpenList API returned failure: {}",
+            data.message.unwrap_or_else(|| "unknown error".to_string())
+        )));
+    }
+    Ok(())
 }
 
 pub fn extract_openlist_path(http_url: &str) -> Option<String> {

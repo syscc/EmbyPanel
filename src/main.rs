@@ -7,6 +7,7 @@ mod crypto_api;
 mod db;
 mod emby;
 mod error;
+mod file_log;
 mod internal_redirect;
 mod monitoring;
 mod openlist;
@@ -20,7 +21,7 @@ use std::{
     env, fmt,
     net::SocketAddr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -33,7 +34,7 @@ use axum::{
 use bytes::Bytes;
 use config::Config;
 use crypto_api::CryptoKeys;
-use db::SettingsStore;
+use db::{RequestStatKind, SettingsStore};
 use error::{AppError, AppResult};
 use serde::Serialize;
 use tokio::{
@@ -50,9 +51,10 @@ use tracing_subscriber::{
 
 use crate::cache::DirectLinkCache;
 use activity_log::{ActivityKind, ActivityLevel, ActivityLogStore, PlaybackLogRecord};
+use file_log::FileLogStore;
 
 const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
-const PROJECT_NAME: &str = "EmbyPanel";
+pub(crate) const PROJECT_NAME: &str = "EmbyPanel";
 const PROJECT_URL: &str = "https://github.com/syscc/EmbyPanel";
 
 #[derive(Serialize)]
@@ -61,6 +63,15 @@ struct AppInfo {
     version: String,
     project_url: &'static str,
     ui_path: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UpdateCheckResponse {
+    current_version: String,
+    latest_version: String,
+    release_url: String,
+    has_update: bool,
+    checked_at_ms: u128,
 }
 
 async fn app_info() -> Json<AppInfo> {
@@ -72,7 +83,7 @@ async fn app_info() -> Json<AppInfo> {
     })
 }
 
-fn app_version() -> String {
+pub(crate) fn app_version() -> String {
     env::var("EMBYPANEL_VERSION")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -104,7 +115,7 @@ impl FormatTime for TzTimer {
     }
 }
 
-fn tz_offset_seconds(tz: &str) -> i32 {
+pub(crate) fn tz_offset_seconds(tz: &str) -> i32 {
     let tz = tz.trim();
     if tz.eq_ignore_ascii_case("Asia/Shanghai")
         || tz.eq_ignore_ascii_case("Asia/Chongqing")
@@ -151,6 +162,7 @@ struct AppState {
     settings_store: SettingsStore,
     crypto_keys: CryptoKeys,
     activity_log: Arc<ActivityLogStore>,
+    file_log: Arc<FileLogStore>,
     proxy_manager: Option<Arc<ProxyManager>>,
     proxy_server_id: Option<String>,
     playback_users: Arc<Mutex<HashMap<String, String>>>,
@@ -158,16 +170,33 @@ struct AppState {
     playback_rate_recent_events: Arc<Mutex<HashMap<String, u64>>>,
     playback_rate_bans: Arc<Mutex<HashMap<String, u64>>>,
     playback_rate_ip_bans: Arc<Mutex<HashMap<String, u64>>>,
+    update_check: Arc<Mutex<Option<(u128, UpdateCheckResponse)>>>,
 }
 
-struct ProxyManager {
+pub(crate) struct ProxyManager {
     running: Mutex<HashMap<String, ProxyTask>>,
 }
 
 struct ProxyTask {
     port: u16,
+    server_name: String,
+    started_at_ms: u128,
+    last_request_ms: Option<u128>,
+    last_error: Option<String>,
     shutdown: oneshot::Sender<()>,
     handle: JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ProxyStatusEntry {
+    pub(crate) server_id: String,
+    pub(crate) server_name: String,
+    pub(crate) enabled: bool,
+    pub(crate) port: u16,
+    pub(crate) listening: bool,
+    pub(crate) started_at_ms: Option<u128>,
+    pub(crate) last_request_ms: Option<u128>,
+    pub(crate) last_error: Option<String>,
 }
 
 impl ProxyManager {
@@ -227,6 +256,10 @@ impl ProxyManager {
                 server_id,
                 ProxyTask {
                     port,
+                    server_name: server.name.clone(),
+                    started_at_ms: now_ms(),
+                    last_request_ms: None,
+                    last_error: None,
                     shutdown,
                     handle,
                 },
@@ -288,11 +321,50 @@ impl ProxyManager {
             server.id.clone(),
             ProxyTask {
                 port,
+                server_name: server.name.clone(),
+                started_at_ms: now_ms(),
+                last_request_ms: None,
+                last_error: None,
                 shutdown,
                 handle,
             },
         );
         Ok(())
+    }
+
+    async fn record_request(&self, server_id: &str) {
+        if let Some(task) = self.running.lock().await.get_mut(server_id) {
+            task.last_request_ms = Some(now_ms());
+        }
+    }
+
+    async fn record_error(&self, server_id: &str, error: String) {
+        if let Some(task) = self.running.lock().await.get_mut(server_id) {
+            task.last_error = Some(error);
+        }
+    }
+
+    pub(crate) async fn statuses(&self, config: &Config) -> Vec<ProxyStatusEntry> {
+        let running = self.running.lock().await;
+        config
+            .servers
+            .iter()
+            .map(|server| {
+                let task = running.get(&server.id);
+                ProxyStatusEntry {
+                    server_id: server.id.clone(),
+                    server_name: task
+                        .map(|task| task.server_name.clone())
+                        .unwrap_or_else(|| server.name.clone()),
+                    enabled: server.enabled,
+                    port: server.port,
+                    listening: task.is_some_and(|task| task.port == server.port),
+                    started_at_ms: task.map(|task| task.started_at_ms),
+                    last_request_ms: task.and_then(|task| task.last_request_ms),
+                    last_error: task.and_then(|task| task.last_error.clone()),
+                }
+            })
+            .collect()
     }
 
     async fn shutdown(&self) {
@@ -310,8 +382,13 @@ async fn main() -> AppResult<()> {
         .with(tracing_subscriber::fmt::layer().with_timer(TzTimer::from_env()))
         .init();
 
+    if env::args().any(|arg| arg == "--healthcheck") {
+        return healthcheck_command().await;
+    }
+
     let settings_store = SettingsStore::open_default()?;
     let config = settings_store.load_or_default_config()?;
+    let file_log = Arc::new(FileLogStore::new(&settings_store));
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
@@ -324,6 +401,7 @@ async fn main() -> AppResult<()> {
         settings_store,
         crypto_keys: CryptoKeys::generate()?,
         activity_log: Arc::new(ActivityLogStore::new(800)),
+        file_log,
         proxy_manager: Some(proxy_manager.clone()),
         proxy_server_id: None,
         playback_users: Arc::new(Mutex::new(HashMap::new())),
@@ -331,6 +409,7 @@ async fn main() -> AppResult<()> {
         playback_rate_recent_events: Arc::new(Mutex::new(HashMap::new())),
         playback_rate_bans: Arc::new(Mutex::new(HashMap::new())),
         playback_rate_ip_bans: Arc::new(Mutex::new(HashMap::new())),
+        update_check: Arc::new(Mutex::new(None)),
     };
     state.activity_log.record(
         ActivityKind::General,
@@ -343,6 +422,9 @@ async fn main() -> AppResult<()> {
     tracing::info!("项目名称: {}", PROJECT_NAME);
     tracing::info!("项目版本: {}", app_version());
     tracing::info!("项目地址: {}", PROJECT_URL);
+    state.file_log.write("info", "项目名称", PROJECT_NAME);
+    state.file_log.write("info", "项目版本", &app_version());
+    state.file_log.write("info", "项目地址", PROJECT_URL);
 
     if state.settings_store.has_admin()? && !state.config.read().await.proxy_configs().is_empty() {
         proxy_manager.ensure_running(state.clone()).await?;
@@ -360,6 +442,11 @@ async fn main() -> AppResult<()> {
         format!("http://{}", listener.local_addr()?),
     );
     tracing::info!("管理 UI: http://{}/ui/", listener.local_addr()?);
+    state.file_log.write(
+        "info",
+        "管理 UI",
+        &format!("http://{}/ui/", listener.local_addr()?),
+    );
 
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -367,6 +454,20 @@ async fn main() -> AppResult<()> {
         .map_err(|err| AppError::Internal(format!("server error: {err}")));
     proxy_manager.shutdown().await;
     result
+}
+
+async fn healthcheck_command() -> AppResult<()> {
+    let addr = management_listen_addr()?;
+    let url = format!("http://127.0.0.1:{}/healthz", addr.port());
+    let response = reqwest::get(url).await?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(AppError::Internal(format!(
+            "healthcheck failed with status {}",
+            response.status()
+        )))
+    }
 }
 
 async fn run_proxy_server(
@@ -387,6 +488,9 @@ async fn run_proxy_server(
     )
     .await;
     tracing::info!("Emby reverse proxy listening on http://{}", addr);
+    state
+        .file_log
+        .write("info", "反代服务运行中", &format!("http://{addr}"));
     if let Err(err) = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -463,6 +567,7 @@ async fn handle_request(
                 format!("{} {} 命中 UA 拦截规则", method, path),
             )
             .await;
+            record_stat(&state, &config, RequestStatKind::Block).await;
             return Ok((StatusCode::FORBIDDEN, "client disabled by EmbyPanel").into_response());
         }
     }
@@ -500,7 +605,7 @@ async fn handle_request(
     }
 
     let config = proxy_config(&state).await;
-    proxy::proxy_to_emby(&state.client, &config, method, &uri, &headers, body).await
+    proxy_to_emby_recorded(&state, &config, method, &uri, &headers, body).await
 }
 
 fn build_management_app(state: AppState) -> Router {
@@ -511,6 +616,8 @@ fn build_management_app(state: AppState) -> Router {
         )
         .route("/api/setup-status", get(auth::setup_status))
         .route("/api/app-info", get(app_info))
+        .route("/api/app-info/update-check", get(update_check))
+        .route("/healthz", get(public_healthz))
         .route("/api/public-key", get(crypto_api::public_key))
         .route("/api/setup", axum::routing::post(auth::setup))
         .route("/api/login", axum::routing::post(auth::login))
@@ -528,7 +635,18 @@ fn build_management_app(state: AppState) -> Router {
         )
         .route("/api/monitoring/overview", get(monitoring::media_overview))
         .route("/api/monitoring/health", get(monitoring::server_health))
+        .route("/api/monitoring/healthz", get(monitoring::detailed_healthz))
+        .route(
+            "/api/monitoring/proxy-status",
+            get(monitoring::proxy_status),
+        )
+        .route("/api/monitoring/stats", get(monitoring::request_stats))
+        .route("/api/monitoring/audit-logs", get(monitoring::audit_logs))
         .route("/api/monitoring/logs", get(monitoring::list_activity_logs))
+        .route(
+            "/api/monitoring/logs/export",
+            get(monitoring::export_activity_logs),
+        )
         .route(
             "/api/client-control",
             get(client_control::get_client_control).put(client_control::update_client_control),
@@ -547,6 +665,10 @@ fn build_management_app(state: AppState) -> Router {
             axum::routing::post(client_control::unblock_rate_limit),
         )
         .route(
+            "/api/client-control/rate-limit/status",
+            get(client_control::rate_limit_status),
+        )
+        .route(
             "/api/client-control/webhook/test",
             axum::routing::post(client_control::test_webhook),
         )
@@ -557,6 +679,22 @@ fn build_management_app(state: AppState) -> Router {
         .route(
             "/api/settings/restart-proxy",
             axum::routing::post(settings_api::restart_proxy_server),
+        )
+        .route(
+            "/api/settings/validate",
+            axum::routing::post(settings_api::validate_settings),
+        )
+        .route(
+            "/api/settings/log-config",
+            get(settings_api::get_log_config).put(settings_api::update_log_config),
+        )
+        .route(
+            "/api/settings/backup/export",
+            axum::routing::post(settings_api::export_backup),
+        )
+        .route(
+            "/api/settings/backup/import",
+            axum::routing::post(settings_api::import_backup),
         )
         .nest_service(
             "/ui",
@@ -596,14 +734,131 @@ async fn record_proxy_request(
 ) {
     let config = proxy_config(state).await;
     let (server_id, server_name) = config_server_label(&config);
+    let message = message.into();
+    let detail = detail.into();
     state.activity_log.record(
         ActivityKind::General,
         level,
         Some(&server_id),
         &server_name,
-        message,
-        detail,
+        &message,
+        &detail,
     );
+    if let Some(proxy_manager) = state.proxy_manager.as_ref() {
+        proxy_manager.record_request(&server_id).await;
+    }
+    state.file_log.write(
+        match level {
+            ActivityLevel::Success | ActivityLevel::Info => "info",
+            ActivityLevel::Warn => "warning",
+            ActivityLevel::Error => "error",
+        },
+        &message,
+        &detail,
+    );
+    record_stat(state, &config, RequestStatKind::Request).await;
+}
+
+async fn record_stat(state: &AppState, config: &Config, kind: RequestStatKind) {
+    let (server_id, server_name) = config_server_label(config);
+    let _ =
+        state
+            .settings_store
+            .increment_request_stats(&server_id, &server_name, config.port, kind);
+}
+
+async fn proxy_to_emby_recorded(
+    state: &AppState,
+    config: &Config,
+    method: Method,
+    uri: &Uri,
+    headers: &axum::http::HeaderMap,
+    body: Bytes,
+) -> AppResult<Response> {
+    let result = proxy::proxy_to_emby(&state.client, config, method, uri, headers, body).await;
+    if let Err(err) = &result {
+        let (server_id, server_name) = config_server_label(config);
+        record_stat(state, config, RequestStatKind::Error).await;
+        if let Some(proxy_manager) = state.proxy_manager.as_ref() {
+            proxy_manager
+                .record_error(&server_id, err.to_string())
+                .await;
+        }
+        state.activity_log.record(
+            ActivityKind::General,
+            ActivityLevel::Error,
+            Some(&server_id),
+            &server_name,
+            "代理请求失败",
+            err.to_string(),
+        );
+        state
+            .file_log
+            .write("error", "代理请求失败", &err.to_string());
+    }
+    result
+}
+
+async fn public_healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let database_ok = state.settings_store.has_admin().is_ok();
+    Json(serde_json::json!({
+        "status": if database_ok { "ok" } else { "degraded" },
+        "name": PROJECT_NAME,
+        "version": app_version(),
+        "database": if database_ok { "ok" } else { "error" },
+        "management": "ok",
+    }))
+}
+
+async fn update_check(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> AppResult<Json<UpdateCheckResponse>> {
+    auth::require_auth(&state, &headers).await?;
+    let now = now_ms();
+    if let Some((checked_at, cached)) = state.update_check.lock().await.as_ref()
+        && now.saturating_sub(*checked_at) < 6 * 3600 * 1000
+    {
+        return Ok(Json(cached.clone()));
+    }
+    #[derive(serde::Deserialize)]
+    struct GithubRelease {
+        tag_name: String,
+        html_url: String,
+    }
+    let current = app_version();
+    let release = state
+        .client
+        .get("https://api.github.com/repos/syscc/EmbyPanel/releases/latest")
+        .header(header::USER_AGENT, "EmbyPanel")
+        .send()
+        .await?
+        .json::<GithubRelease>()
+        .await?;
+    let response = UpdateCheckResponse {
+        current_version: current.clone(),
+        latest_version: release.tag_name.clone(),
+        release_url: release.html_url,
+        has_update: normalize_version(&release.tag_name) > normalize_version(&current),
+        checked_at_ms: now,
+    };
+    *state.update_check.lock().await = Some((now, response.clone()));
+    Ok(Json(response))
+}
+
+fn normalize_version(value: &str) -> Vec<u64> {
+    value
+        .trim_start_matches('v')
+        .split('.')
+        .map(|part| part.parse::<u64>().unwrap_or_default())
+        .collect()
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
 }
 
 fn config_server_label(config: &Config) -> (String, String) {
@@ -739,6 +994,7 @@ async fn handle_video_stream(
     )
     .await?
     {
+        record_stat(state, &config, RequestStatKind::Block).await;
         return Ok((
             StatusCode::TOO_MANY_REQUESTS,
             "playback rate limit exceeded",
@@ -778,8 +1034,7 @@ async fn handle_video_stream(
             Ok(Some(path)) => path,
             Ok(None) => {
                 tracing::info!(item = item_id, "media source not found; proxying to Emby");
-                return proxy::proxy_to_emby(&state.client, &config, method, &uri, &headers, body)
-                    .await;
+                return proxy_to_emby_recorded(state, &config, method, &uri, &headers, body).await;
             }
             Err(err) => return Err(err),
         };
@@ -814,7 +1069,7 @@ async fn handle_video_stream(
             path = media_path,
             "media path is not a direct URL or OpenList /d URL; proxying to Emby"
         );
-        return proxy::proxy_to_emby(&state.client, &config, method, &uri, &headers, body).await;
+        return proxy_to_emby_recorded(state, &config, method, &uri, &headers, body).await;
     };
 
     let mut raw_url = openlist::ensure_raw_url(
@@ -885,15 +1140,28 @@ fn record_playback_redirect(
     redirect_url: &str,
 ) {
     let (server_id, server_name) = config_server_label(config);
+    let message = message.into();
     state.activity_log.record_playback(PlaybackLogRecord {
         level: ActivityLevel::Success,
         server_id: Some(&server_id),
         server_name: &server_name,
         playback_user,
         playback_ip,
-        message: message.into(),
+        message: message.clone(),
         detail: redirect_url.to_string(),
     });
+    state
+        .file_log
+        .write("info", &message, &format!("{playback_user} {redirect_url}"));
+    let kind = if message.contains("缓存命中") {
+        RequestStatKind::CacheHit
+    } else {
+        RequestStatKind::Redirect
+    };
+    let _ =
+        state
+            .settings_store
+            .increment_request_stats(&server_id, &server_name, config.port, kind);
 }
 
 fn cache_ttl_label(seconds: u64) -> String {
@@ -1323,6 +1591,7 @@ mod tests {
             config: Arc::new(RwLock::new(config)),
             client,
             cache: Arc::new(RwLock::new(DirectLinkCache::new(180, 10_000))),
+            file_log: Arc::new(FileLogStore::new(&settings_store)),
             settings_store,
             crypto_keys: CryptoKeys::generate().unwrap(),
             activity_log: Arc::new(ActivityLogStore::new(100)),
@@ -1333,6 +1602,7 @@ mod tests {
             playback_rate_recent_events: Arc::new(Mutex::new(HashMap::new())),
             playback_rate_bans: Arc::new(Mutex::new(HashMap::new())),
             playback_rate_ip_bans: Arc::new(Mutex::new(HashMap::new())),
+            update_check: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1985,25 +2255,7 @@ mod tests {
             strm_url_mappings: String::new(),
             strm_url_mapping_rules: Vec::new(),
         };
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
-        build_app(AppState {
-            config: Arc::new(RwLock::new(config)),
-            client,
-            cache: Arc::new(RwLock::new(DirectLinkCache::new(180, 10_000))),
-            settings_store: test_store(),
-            crypto_keys: CryptoKeys::generate().unwrap(),
-            activity_log: Arc::new(ActivityLogStore::new(100)),
-            proxy_manager: None,
-            proxy_server_id: None,
-            playback_users: Arc::new(Mutex::new(HashMap::new())),
-            playback_rate_hits: Arc::new(Mutex::new(HashMap::new())),
-            playback_rate_recent_events: Arc::new(Mutex::new(HashMap::new())),
-            playback_rate_bans: Arc::new(Mutex::new(HashMap::new())),
-            playback_rate_ip_bans: Arc::new(Mutex::new(HashMap::new())),
-        })
+        build_app(test_state(config, test_store()))
     }
 
     fn test_app_without_openlist(emby_host: &str, port: u16) -> Router {
@@ -2024,25 +2276,7 @@ mod tests {
             strm_url_mappings: String::new(),
             strm_url_mapping_rules: Vec::new(),
         };
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
-        build_app(AppState {
-            config: Arc::new(RwLock::new(config)),
-            client,
-            cache: Arc::new(RwLock::new(DirectLinkCache::new(180, 10_000))),
-            settings_store: test_store(),
-            crypto_keys: CryptoKeys::generate().unwrap(),
-            activity_log: Arc::new(ActivityLogStore::new(100)),
-            proxy_manager: None,
-            proxy_server_id: None,
-            playback_users: Arc::new(Mutex::new(HashMap::new())),
-            playback_rate_hits: Arc::new(Mutex::new(HashMap::new())),
-            playback_rate_recent_events: Arc::new(Mutex::new(HashMap::new())),
-            playback_rate_bans: Arc::new(Mutex::new(HashMap::new())),
-            playback_rate_ip_bans: Arc::new(Mutex::new(HashMap::new())),
-        })
+        build_app(test_state(config, test_store()))
     }
 
     fn test_app_without_openlist_with_internal_redirect(
@@ -2067,25 +2301,7 @@ mod tests {
             strm_url_mappings: String::new(),
             strm_url_mapping_rules: Vec::new(),
         };
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
-        build_app(AppState {
-            config: Arc::new(RwLock::new(config)),
-            client,
-            cache: Arc::new(RwLock::new(DirectLinkCache::new(180, 10_000))),
-            settings_store: test_store(),
-            crypto_keys: CryptoKeys::generate().unwrap(),
-            activity_log: Arc::new(ActivityLogStore::new(100)),
-            proxy_manager: None,
-            proxy_server_id: None,
-            playback_users: Arc::new(Mutex::new(HashMap::new())),
-            playback_rate_hits: Arc::new(Mutex::new(HashMap::new())),
-            playback_rate_recent_events: Arc::new(Mutex::new(HashMap::new())),
-            playback_rate_bans: Arc::new(Mutex::new(HashMap::new())),
-            playback_rate_ip_bans: Arc::new(Mutex::new(HashMap::new())),
-        })
+        build_app(test_state(config, test_store()))
     }
 
     fn test_app_without_openlist_with_mappings(
@@ -2110,25 +2326,7 @@ mod tests {
             strm_url_mappings: mappings.to_string(),
             strm_url_mapping_rules: url_mapping::parse_rules(mappings).unwrap(),
         };
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
-        build_app(AppState {
-            config: Arc::new(RwLock::new(config)),
-            client,
-            cache: Arc::new(RwLock::new(DirectLinkCache::new(180, 10_000))),
-            settings_store: test_store(),
-            crypto_keys: CryptoKeys::generate().unwrap(),
-            activity_log: Arc::new(ActivityLogStore::new(100)),
-            proxy_manager: None,
-            proxy_server_id: None,
-            playback_users: Arc::new(Mutex::new(HashMap::new())),
-            playback_rate_hits: Arc::new(Mutex::new(HashMap::new())),
-            playback_rate_recent_events: Arc::new(Mutex::new(HashMap::new())),
-            playback_rate_bans: Arc::new(Mutex::new(HashMap::new())),
-            playback_rate_ip_bans: Arc::new(Mutex::new(HashMap::new())),
-        })
+        build_app(test_state(config, test_store()))
     }
 
     fn test_store() -> SettingsStore {

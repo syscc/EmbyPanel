@@ -1,18 +1,20 @@
 use axum::{
     Json,
     extract::{Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, header},
+    response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 use sysinfo::{Disks, System};
 
 use crate::{
-    AppState,
-    activity_log::{ActivityKind, ActivityLevel, ActivityLogEntry},
-    auth,
+    AppState, PROJECT_NAME,
+    activity_log::{ActivityKind, ActivityLevel, ActivityLogEntry, ActivityLogFilter},
+    app_version, auth,
     config::Config,
     emby::{MediaOverview, PlaybackSession},
     error::AppResult,
+    management_listen_addr, tz_offset_seconds,
 };
 
 #[derive(Debug, Serialize)]
@@ -33,6 +35,17 @@ pub struct ServerHealth {
 pub struct ActivityLogQuery {
     server_id: Option<String>,
     kind: Option<String>,
+    level: Option<String>,
+    keyword: Option<String>,
+    since_ms: Option<u128>,
+    until_ms: Option<u128>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuditLogQuery {
+    action: Option<String>,
+    keyword: Option<String>,
     limit: Option<usize>,
 }
 
@@ -124,21 +137,152 @@ pub async fn list_activity_logs(
         _ => None,
     };
     let server_id = query.server_id.as_deref().filter(|value| *value != "all");
-    Ok(Json(state.activity_log.list(
+    Ok(Json(state.activity_log.list_filtered(ActivityLogFilter {
         server_id,
         kind,
+        level: query.level.as_deref(),
+        keyword: query.keyword.as_deref(),
+        since_ms: query.since_ms,
+        until_ms: query.until_ms,
+        limit: query.limit.unwrap_or(120),
+    })))
+}
+
+pub async fn export_activity_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ActivityLogQuery>,
+) -> AppResult<Response> {
+    auth::require_auth(&state, &headers).await?;
+    let kind = match query.kind.as_deref() {
+        Some("playback") => Some(ActivityKind::Playback),
+        Some("general") => Some(ActivityKind::General),
+        _ => None,
+    };
+    let server_id = query.server_id.as_deref().filter(|value| *value != "all");
+    let logs = state.activity_log.list_filtered(ActivityLogFilter {
+        server_id,
+        kind,
+        level: query.level.as_deref(),
+        keyword: query.keyword.as_deref(),
+        since_ms: query.since_ms,
+        until_ms: query.until_ms,
+        limit: query.limit.unwrap_or(500),
+    });
+    let mut csv = String::from("id,time,kind,level,server,user,ip,message,detail\n");
+    for entry in logs {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{}\n",
+            entry.id,
+            entry.timestamp_ms,
+            csv_escape(&entry.kind),
+            csv_escape(&entry.level),
+            csv_escape(&entry.server_name),
+            csv_escape(entry.playback_user.as_deref().unwrap_or("")),
+            csv_escape(entry.playback_ip.as_deref().unwrap_or("")),
+            csv_escape(&entry.message),
+            csv_escape(&entry.detail),
+        ));
+    }
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"embypanel-logs.csv\"",
+            ),
+        ],
+        csv,
+    )
+        .into_response())
+}
+
+pub async fn request_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<Vec<crate::db::RequestStatsDaily>>> {
+    auth::require_auth(&state, &headers).await?;
+    let mut rows = state.settings_store.today_request_stats()?;
+    let config = state.config.read().await.clone();
+    let existing = rows
+        .iter()
+        .map(|row| row.server_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let today = local_date();
+    for server in &config.servers {
+        if existing.contains(&server.id) {
+            continue;
+        }
+        rows.push(crate::db::RequestStatsDaily {
+            date: today.clone(),
+            server_id: server.id.clone(),
+            server_name: server.name.clone(),
+            port: server.port,
+            requests: 0,
+            redirects: 0,
+            cache_hits: 0,
+            blocks: 0,
+            errors: 0,
+            updated_at_ms: 0,
+        });
+    }
+    rows.sort_by(|left, right| left.server_name.cmp(&right.server_name));
+    Ok(Json(rows))
+}
+
+pub async fn proxy_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<Vec<crate::ProxyStatusEntry>>> {
+    auth::require_auth(&state, &headers).await?;
+    let config = state.config.read().await.clone();
+    let statuses = if let Some(manager) = state.proxy_manager.as_ref() {
+        manager.statuses(&config).await
+    } else {
+        Vec::new()
+    };
+    Ok(Json(statuses))
+}
+
+pub async fn detailed_healthz(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<serde_json::Value>> {
+    auth::require_auth(&state, &headers).await?;
+    let database_ok = state.settings_store.has_admin().is_ok();
+    Ok(Json(serde_json::json!({
+        "status": if database_ok { "ok" } else { "degraded" },
+        "name": PROJECT_NAME,
+        "version": app_version(),
+        "database": if database_ok { "ok" } else { "error" },
+        "proxy_count": state.config.read().await.proxy_configs().len(),
+    })))
+}
+
+pub async fn audit_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuditLogQuery>,
+) -> AppResult<Json<Vec<crate::db::AuditLogEntry>>> {
+    auth::require_auth(&state, &headers).await?;
+    Ok(Json(state.settings_store.list_audit_logs(
+        query.action.as_deref(),
+        query.keyword.as_deref(),
         query.limit.unwrap_or(120),
-    )))
+    )?))
 }
 
 async fn record_runtime_info(state: &AppState) {
+    let management = management_listen_addr()
+        .map(|addr| format!("管理 API 监听 {addr}"))
+        .unwrap_or_else(|_| "管理 API 监听地址读取失败".to_string());
     state.activity_log.record(
         ActivityKind::General,
         ActivityLevel::Info,
         None,
         "EmbyPanel",
         "服务正常运行",
-        "管理 API 监听 0.0.0.0:8090",
+        management,
     );
 
     let config = state.config.read().await.clone();
@@ -215,4 +359,16 @@ fn percent(used: u64, total: u64) -> u8 {
     ((used as f64 / total as f64) * 100.0)
         .round()
         .clamp(0.0, 100.0) as u8
+}
+
+fn csv_escape(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn local_date() -> String {
+    let offset = std::env::var("TZ")
+        .map(|tz| tz_offset_seconds(&tz))
+        .unwrap_or(8 * 3600);
+    let now = chrono::Utc::now() + chrono::Duration::seconds(offset.into());
+    now.format("%Y-%m-%d").to_string()
 }

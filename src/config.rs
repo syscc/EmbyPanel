@@ -216,6 +216,10 @@ impl Config {
         config.servers = vec![server.clone()];
         config
     }
+
+    pub fn for_server_for_validation(&self, server: &EmbyServerConfig) -> Self {
+        self.for_server(server)
+    }
 }
 
 fn default_port() -> u16 {

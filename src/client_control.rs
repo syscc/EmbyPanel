@@ -108,6 +108,18 @@ pub struct PlaybackRateBlockRecord {
     pub note: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct PlaybackRateWindowStatus {
+    pub server_id: String,
+    pub ip: String,
+    pub current_count: u64,
+    pub threshold: u64,
+    pub remaining: u64,
+    pub window_seconds: u64,
+    pub reset_at: String,
+    pub blocked: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ClientRuleRecord {
     pub id: String,
@@ -168,7 +180,7 @@ pub async fn update_client_control(
     headers: HeaderMap,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<ClientControlConfig>> {
-    auth::require_auth(&state, &headers).await?;
+    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
     let payload: UpdateClientControlRequest = state
         .crypto_keys
         .decrypt_named(&request, "client_control")?;
@@ -199,6 +211,12 @@ pub async fn update_client_control(
     state
         .settings_store
         .save_setting_json(SETTING_KEY, &config)?;
+    state.settings_store.record_audit(
+        Some(admin_user_id),
+        "client_control.update",
+        "保存客户端管控和通知配置",
+        "success",
+    )?;
     Ok(Json(redact_webhook_secrets(config)))
 }
 
@@ -207,7 +225,7 @@ pub async fn add_user_agent_rule(
     headers: HeaderMap,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<ClientControlConfig>> {
-    auth::require_auth(&state, &headers).await?;
+    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
     let payload: AddUserAgentRuleRequest =
         state.crypto_keys.decrypt_named(&request, "client_rule")?;
     let mut config = load_or_default(&state)?;
@@ -251,6 +269,12 @@ pub async fn add_user_agent_rule(
     state
         .settings_store
         .save_setting_json(SETTING_KEY, &config)?;
+    state.settings_store.record_audit(
+        Some(admin_user_id),
+        "client_rule.add",
+        "添加 UA 拦截规则",
+        "success",
+    )?;
     Ok(Json(redact_webhook_secrets(config)))
 }
 
@@ -259,7 +283,7 @@ pub async fn toggle_client_rule(
     headers: HeaderMap,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<ClientControlConfig>> {
-    auth::require_auth(&state, &headers).await?;
+    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
     let payload: ToggleClientRuleRequest =
         state.crypto_keys.decrypt_named(&request, "client_rule")?;
     let mut config = load_or_default(&state)?;
@@ -276,6 +300,12 @@ pub async fn toggle_client_rule(
     state
         .settings_store
         .save_setting_json(SETTING_KEY, &config)?;
+    state.settings_store.record_audit(
+        Some(admin_user_id),
+        "client_rule.toggle",
+        "切换 UA 拦截规则状态",
+        "success",
+    )?;
     Ok(Json(redact_webhook_secrets(config)))
 }
 
@@ -284,7 +314,7 @@ pub async fn delete_client_rule(
     headers: HeaderMap,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<ClientControlConfig>> {
-    auth::require_auth(&state, &headers).await?;
+    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
     let payload: DeleteClientRuleRequest =
         state.crypto_keys.decrypt_named(&request, "client_rule")?;
     let mut config = load_or_default(&state)?;
@@ -296,6 +326,12 @@ pub async fn delete_client_rule(
     state
         .settings_store
         .save_setting_json(SETTING_KEY, &config)?;
+    state.settings_store.record_audit(
+        Some(admin_user_id),
+        "client_rule.delete",
+        "删除 UA 拦截规则",
+        "success",
+    )?;
     Ok(Json(redact_webhook_secrets(config)))
 }
 
@@ -304,22 +340,22 @@ pub async fn unblock_rate_limit(
     headers: HeaderMap,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<ClientControlConfig>> {
-    auth::require_auth(&state, &headers).await?;
+    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
     let payload: UnblockRateLimitRequest = state
         .crypto_keys
         .decrypt_named(&request, "rate_limit_block")?;
     let mut config = load_or_default(&state)?;
-    let Some(record) = config
+    let Some(index) = config
         .rate_limit_blocks
-        .iter_mut()
-        .find(|record| record.id == payload.id)
+        .iter()
+        .position(|record| record.id == payload.id)
     else {
         return Err(AppError::Validation(
             "rate limit block not found".to_string(),
         ));
     };
 
-    record.enabled = false;
+    let record = config.rate_limit_blocks.remove(index);
     let server_id = record.server_id.clone();
     let action = normalize_playback_rate_limit_action(&record.action);
     let ip = record.ip.clone();
@@ -343,7 +379,61 @@ pub async fn unblock_rate_limit(
     state
         .settings_store
         .save_setting_json(SETTING_KEY, &config)?;
+    state.settings_store.record_audit(
+        Some(admin_user_id),
+        "rate_limit.unblock",
+        "解除播放频率封禁",
+        "success",
+    )?;
     Ok(Json(redact_webhook_secrets(config)))
+}
+
+pub async fn rate_limit_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<Vec<PlaybackRateWindowStatus>>> {
+    auth::require_auth(&state, &headers).await?;
+    let config = load_or_default(&state)?;
+    let now = now_seconds();
+    let window = config.playback_rate_limit_window_seconds.max(1);
+    let threshold = config.playback_rate_limit_max_requests.max(1);
+    let blocks = config.rate_limit_blocks;
+    let hits = state.playback_rate_hits.lock().await;
+    let mut rows = Vec::new();
+    for (key, timestamps) in hits.iter() {
+        let Some((server_id, ip)) = key.split_once(':') else {
+            continue;
+        };
+        let active = timestamps
+            .iter()
+            .copied()
+            .filter(|timestamp| now.saturating_sub(*timestamp) < window)
+            .collect::<Vec<_>>();
+        if active.is_empty() {
+            continue;
+        }
+        let oldest = active.first().copied().unwrap_or(now);
+        let current_count = active.len() as u64;
+        let reset_at = oldest + window;
+        let blocked = blocks.iter().any(|record| {
+            record.enabled
+                && record.server_id == server_id
+                && record.ip == ip
+                && record.blocked_until.parse::<u64>().unwrap_or_default() > now
+        });
+        rows.push(PlaybackRateWindowStatus {
+            server_id: server_id.to_string(),
+            ip: ip.to_string(),
+            current_count,
+            threshold,
+            remaining: threshold.saturating_sub(current_count),
+            window_seconds: window,
+            reset_at: reset_at.to_string(),
+            blocked,
+        });
+    }
+    rows.sort_by_key(|row| std::cmp::Reverse(row.current_count));
+    Ok(Json(rows))
 }
 
 pub async fn test_webhook(
@@ -351,7 +441,7 @@ pub async fn test_webhook(
     headers: HeaderMap,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<WebhookTestResponse>> {
-    auth::require_auth(&state, &headers).await?;
+    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
     let payload: WebhookTestRequest = state.crypto_keys.decrypt_named(&request, "webhook_test")?;
     let title = normalize_webhook_test_text(&payload.title, "EmbyPanel 通知测试");
     let text = normalize_webhook_test_text(&payload.text, "Webhook POST 测试成功");
@@ -363,6 +453,12 @@ pub async fn test_webhook(
         &text,
     )
     .await?;
+    state.settings_store.record_audit(
+        Some(admin_user_id),
+        "webhook.test",
+        "测试 Webhook 通知",
+        "success",
+    )?;
     Ok(Json(WebhookTestResponse { ok: true }))
 }
 
@@ -458,6 +554,11 @@ fn load_or_default(state: &AppState) -> AppResult<ClientControlConfig> {
         .load_setting_json(SETTING_KEY)?
         .unwrap_or_else(default_config);
     migrate_webhook_config(&mut config);
+    if prune_inactive_rate_limit_blocks(&mut config, now_seconds()) {
+        state
+            .settings_store
+            .save_setting_json(SETTING_KEY, &config)?;
+    }
     Ok(config)
 }
 
@@ -701,15 +802,12 @@ async fn disable_emby_user_by_name(
     Ok(())
 }
 
-fn prune_expired_rate_limit_blocks(config: &mut ClientControlConfig, now: u64) -> bool {
-    let mut changed = false;
-    for record in &mut config.rate_limit_blocks {
-        if record.enabled && record.blocked_until.parse::<u64>().unwrap_or_default() <= now {
-            record.enabled = false;
-            changed = true;
-        }
-    }
-    changed
+fn prune_inactive_rate_limit_blocks(config: &mut ClientControlConfig, now: u64) -> bool {
+    let before_len = config.rate_limit_blocks.len();
+    config.rate_limit_blocks.retain(|record| {
+        record.enabled && record.blocked_until.parse::<u64>().unwrap_or_default() > now
+    });
+    config.rate_limit_blocks.len() != before_len
 }
 
 fn upsert_rate_limit_block(
@@ -907,7 +1005,7 @@ pub async fn enforce_playback_rate_limit(
     }
 
     let now = now_seconds();
-    let mut changed = prune_expired_rate_limit_blocks(&mut config, now);
+    let mut changed = prune_inactive_rate_limit_blocks(&mut config, now);
     if config.rate_limit_blocks.iter().any(|record| {
         record.enabled
             && record.server_id == input.server_id

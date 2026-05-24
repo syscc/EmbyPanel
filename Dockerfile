@@ -42,4 +42,5 @@ COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
 COPY data/config.toml.example /data/config.toml.example
 VOLUME ["/data"]
 EXPOSE 8090 8091 8092 8093 8094 8095
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD ["/app/emby302gateway-rs", "--healthcheck"]
 ENTRYPOINT ["/app/emby302gateway-rs"]

@@ -81,6 +81,12 @@ pub async fn setup(
     let admin_user_id = state
         .settings_store
         .create_admin(payload.username.trim(), &password_hash)?;
+    state.settings_store.record_audit(
+        Some(admin_user_id),
+        "account.setup",
+        "初始化管理员账户",
+        "success",
+    )?;
     create_session_response(&state, admin_user_id).await
 }
 
@@ -126,6 +132,12 @@ pub async fn change_password(
     state
         .settings_store
         .update_admin_password(admin_user_id, &password_hash)?;
+    state.settings_store.record_audit(
+        Some(admin_user_id),
+        "account.password",
+        "修改管理员密码",
+        "success",
+    )?;
     Ok(Json(PasswordChangedResponse { changed: true }))
 }
 
@@ -155,6 +167,12 @@ pub async fn update_profile(
     state
         .settings_store
         .update_admin_username(admin_user_id, username)?;
+    state.settings_store.record_audit(
+        Some(admin_user_id),
+        "account.profile",
+        "修改账户资料",
+        "success",
+    )?;
     Ok(Json(ProfileResponse {
         username: username.to_string(),
     }))

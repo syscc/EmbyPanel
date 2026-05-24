@@ -1,4 +1,8 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Serialize, de::DeserializeOwned};
@@ -14,6 +18,13 @@ pub fn database_path() -> PathBuf {
     } else {
         PathBuf::from(DEFAULT_DATABASE_PATH)
     }
+}
+
+pub fn data_dir() -> PathBuf {
+    database_path()
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("data"))
 }
 
 #[derive(Clone)]
@@ -250,26 +261,180 @@ impl SettingsStore {
         Ok(value)
     }
 
-    fn ensure_schema(&self) -> AppResult<()> {
-        let conn = Connection::open(&self.path)?;
-        if self.schema_missing(&conn)? {
-            self.migrate(&conn)?;
-        }
+    pub fn record_audit(
+        &self,
+        admin_user_id: Option<i64>,
+        action: &str,
+        summary: &str,
+        result: &str,
+    ) -> AppResult<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            r#"
+            INSERT INTO audit_logs (timestamp_ms, admin_user_id, action, summary, result)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![now_ms() as i64, admin_user_id, action, summary, result],
+        )?;
+        self.prune_audit_logs(&conn, 90, 20000)?;
         Ok(())
     }
 
-    fn schema_missing(&self, conn: &Connection) -> AppResult<bool> {
-        let count: i64 = conn.query_row(
+    pub fn list_audit_logs(
+        &self,
+        action: Option<&str>,
+        keyword: Option<&str>,
+        limit: usize,
+    ) -> AppResult<Vec<AuditLogEntry>> {
+        let conn = self.connection()?;
+        let mut entries = Vec::new();
+        let keyword = keyword.map(str::to_ascii_lowercase);
+        let mut stmt = conn.prepare(
             r#"
-            SELECT COUNT(*)
-            FROM sqlite_master
-            WHERE type = 'table'
-              AND name IN ('settings', 'admin_users', 'admin_sessions')
+            SELECT audit_logs.id, audit_logs.timestamp_ms, audit_logs.admin_user_id,
+                   COALESCE(admin_users.username, ''), audit_logs.action,
+                   audit_logs.summary, audit_logs.result
+            FROM audit_logs
+            LEFT JOIN admin_users ON admin_users.id = audit_logs.admin_user_id
+            ORDER BY audit_logs.timestamp_ms DESC
+            LIMIT 1000
             "#,
-            [],
-            |row| row.get(0),
         )?;
-        Ok(count < 3)
+        let rows = stmt.query_map([], |row| {
+            Ok(AuditLogEntry {
+                id: row.get(0)?,
+                timestamp_ms: row.get::<_, i64>(1)? as u128,
+                admin_user_id: row.get(2)?,
+                admin_username: row.get(3)?,
+                action: row.get(4)?,
+                summary: row.get(5)?,
+                result: row.get(6)?,
+            })
+        })?;
+        for row in rows {
+            let entry = row?;
+            if action.is_some_and(|value| value != "all" && value != entry.action) {
+                continue;
+            }
+            if let Some(keyword) = keyword.as_ref() {
+                let haystack = format!(
+                    "{} {} {} {}",
+                    entry.admin_username, entry.action, entry.summary, entry.result
+                )
+                .to_ascii_lowercase();
+                if !haystack.contains(keyword) {
+                    continue;
+                }
+            }
+            entries.push(entry);
+            if entries.len() >= limit.clamp(1, 500) {
+                break;
+            }
+        }
+        Ok(entries)
+    }
+
+    pub fn increment_request_stats(
+        &self,
+        server_id: &str,
+        server_name: &str,
+        port: u16,
+        kind: RequestStatKind,
+    ) -> AppResult<()> {
+        let conn = self.connection()?;
+        let date = local_date();
+        let (requests, redirects, cache_hits, blocks, errors) = kind.delta();
+        conn.execute(
+            r#"
+            INSERT INTO request_stats_daily
+                (date, server_id, server_name, port, requests, redirects, cache_hits, blocks, errors, updated_at_ms)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ON CONFLICT(date, server_id) DO UPDATE SET
+                server_name = excluded.server_name,
+                port = excluded.port,
+                requests = requests + excluded.requests,
+                redirects = redirects + excluded.redirects,
+                cache_hits = cache_hits + excluded.cache_hits,
+                blocks = blocks + excluded.blocks,
+                errors = errors + excluded.errors,
+                updated_at_ms = excluded.updated_at_ms
+            "#,
+            params![
+                date,
+                server_id,
+                server_name,
+                port,
+                requests,
+                redirects,
+                cache_hits,
+                blocks,
+                errors,
+                now_ms() as i64
+            ],
+        )?;
+        self.prune_request_stats(&conn, 90)?;
+        Ok(())
+    }
+
+    pub fn today_request_stats(&self) -> AppResult<Vec<RequestStatsDaily>> {
+        let conn = self.connection()?;
+        let date = local_date();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT date, server_id, server_name, port, requests, redirects, cache_hits, blocks, errors, updated_at_ms
+            FROM request_stats_daily
+            WHERE date = ?1
+            ORDER BY server_name ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![date], |row| {
+            Ok(RequestStatsDaily {
+                date: row.get(0)?,
+                server_id: row.get(1)?,
+                server_name: row.get(2)?,
+                port: row.get(3)?,
+                requests: row.get(4)?,
+                redirects: row.get(5)?,
+                cache_hits: row.get(6)?,
+                blocks: row.get(7)?,
+                errors: row.get(8)?,
+                updated_at_ms: row.get::<_, i64>(9)? as u128,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    fn prune_audit_logs(&self, conn: &Connection, keep_days: i64, max_rows: i64) -> AppResult<()> {
+        let cutoff = now_ms() as i64 - keep_days * 24 * 3600 * 1000;
+        conn.execute(
+            "DELETE FROM audit_logs WHERE timestamp_ms < ?1",
+            params![cutoff],
+        )?;
+        conn.execute(
+            r#"
+            DELETE FROM audit_logs
+            WHERE id NOT IN (
+                SELECT id FROM audit_logs ORDER BY timestamp_ms DESC LIMIT ?1
+            )
+            "#,
+            params![max_rows],
+        )?;
+        Ok(())
+    }
+
+    fn prune_request_stats(&self, conn: &Connection, keep_days: i64) -> AppResult<()> {
+        let cutoff = local_date_offset(-keep_days);
+        conn.execute(
+            "DELETE FROM request_stats_daily WHERE date < ?1",
+            params![cutoff],
+        )?;
+        Ok(())
+    }
+
+    fn ensure_schema(&self) -> AppResult<()> {
+        let conn = Connection::open(&self.path)?;
+        self.migrate(&conn)?;
+        Ok(())
     }
 
     fn migrate(&self, conn: &Connection) -> AppResult<()> {
@@ -300,6 +465,33 @@ impl SettingsStore {
 
             CREATE INDEX IF NOT EXISTS idx_admin_sessions_token_hash ON admin_sessions(token_hash);
             CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at);
+
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_ms INTEGER NOT NULL,
+                admin_user_id INTEGER,
+                action TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                result TEXT NOT NULL,
+                FOREIGN KEY (admin_user_id) REFERENCES admin_users(id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp_ms ON audit_logs(timestamp_ms);
+            CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action);
+
+            CREATE TABLE IF NOT EXISTS request_stats_daily (
+                date TEXT NOT NULL,
+                server_id TEXT NOT NULL,
+                server_name TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                requests INTEGER NOT NULL DEFAULT 0,
+                redirects INTEGER NOT NULL DEFAULT 0,
+                cache_hits INTEGER NOT NULL DEFAULT 0,
+                blocks INTEGER NOT NULL DEFAULT 0,
+                errors INTEGER NOT NULL DEFAULT 0,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (date, server_id)
+            );
             "#,
         )?;
         Ok(())
@@ -307,9 +499,7 @@ impl SettingsStore {
 
     fn connection(&self) -> Result<Connection, rusqlite::Error> {
         let conn = Connection::open(&self.path)?;
-        if let Ok(true) = self.schema_missing(&conn) {
-            let _ = self.migrate(&conn);
-        }
+        let _ = self.migrate(&conn);
         Ok(conn)
     }
 }
@@ -319,7 +509,70 @@ pub struct AdminPasswordHash {
     pub password_hash: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub enum RequestStatKind {
+    Request,
+    Redirect,
+    CacheHit,
+    Block,
+    Error,
+}
+
+impl RequestStatKind {
+    fn delta(self) -> (i64, i64, i64, i64, i64) {
+        match self {
+            Self::Request => (1, 0, 0, 0, 0),
+            Self::Redirect => (0, 1, 0, 0, 0),
+            Self::CacheHit => (0, 0, 1, 0, 0),
+            Self::Block => (0, 0, 0, 1, 0),
+            Self::Error => (0, 0, 0, 0, 1),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct RequestStatsDaily {
+    pub date: String,
+    pub server_id: String,
+    pub server_name: String,
+    pub port: u16,
+    pub requests: i64,
+    pub redirects: i64,
+    pub cache_hits: i64,
+    pub blocks: i64,
+    pub errors: i64,
+    pub updated_at_ms: u128,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuditLogEntry {
+    pub id: i64,
+    pub timestamp_ms: u128,
+    pub admin_user_id: Option<i64>,
+    pub admin_username: String,
+    pub action: String,
+    pub summary: String,
+    pub result: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct SetupStatus {
     pub initialized: bool,
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+fn local_date() -> String {
+    local_date_offset(0)
+}
+
+fn local_date_offset(offset_days: i64) -> String {
+    let now = chrono::Utc::now() + chrono::Duration::hours(8) + chrono::Duration::days(offset_days);
+    now.format("%Y-%m-%d").to_string()
 }
