@@ -37,8 +37,22 @@ jobs:
             type=sha,prefix=sha-,format=short
             type=ref,event=tag
 
+      - name: Check Docker Hub credentials
+        id: dockerhub
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" != "pull_request" && -n "${DOCKERHUB_USERNAME}" && -n "${DOCKERHUB_TOKEN}" ]]; then
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "push=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Docker Hub secrets are not configured; building without pushing an image."
+          fi
+
       - name: Login to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: steps.dockerhub.outputs.push == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -49,7 +63,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ steps.dockerhub.outputs.push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
