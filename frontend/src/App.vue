@@ -974,8 +974,26 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   headers.set('Content-Type', 'application/json')
   if (token.value) headers.set('Authorization', `Bearer ${token.value}`)
   const response = await fetch(path, { ...init, headers })
-  if (!response.ok) throw new Error(await response.text())
+  if (!response.ok) {
+    const message = await response.text()
+    if (response.status === 401 && token.value && !isAuthBootstrapPath(path)) {
+      handleAuthExpired()
+    }
+    throw new Error(message)
+  }
   return response.json() as Promise<T>
+}
+
+function isAuthBootstrapPath(path: string) {
+  return path === '/api/login' || path === '/api/setup' || path === '/api/setup-status'
+}
+
+function handleAuthExpired() {
+  token.value = ''
+  clearStoredToken()
+  stopDashboardPolling()
+  mode.value = 'login'
+  error.value = '登录已过期，请重新登录'
 }
 
 async function fetchPublicKey() {
@@ -999,7 +1017,7 @@ async function fetchPublicKey() {
 }
 
 async function encryptPayload(name: string, value: unknown) {
-  if (!publicKey.value) publicKey.value = await fetchPublicKey()
+  publicKey.value = await fetchPublicKey()
   const aesKey = randomBytes(32)
   const fieldName = randomFieldName()
   const iv = randomBytes(12)

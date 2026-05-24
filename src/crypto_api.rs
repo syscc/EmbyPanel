@@ -4,7 +4,12 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit},
 };
-use axum::{Json, extract::State};
+use axum::{
+    Json,
+    extract::State,
+    http::header,
+    response::{IntoResponse, Response},
+};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rsa::{
     Oaep, RsaPrivateKey, RsaPublicKey,
@@ -112,11 +117,15 @@ struct PlainField {
     value: Value,
 }
 
-pub async fn public_key(State(state): State<AppState>) -> Json<PublicKeyResponse> {
-    Json(PublicKeyResponse {
-        algorithm: "RSA-OAEP-256/AES-256-GCM",
-        public_key_pem: (*state.crypto_keys.public_key_pem).clone(),
-    })
+pub async fn public_key(State(state): State<AppState>) -> Response {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(PublicKeyResponse {
+            algorithm: "RSA-OAEP-256/AES-256-GCM",
+            public_key_pem: (*state.crypto_keys.public_key_pem).clone(),
+        }),
+    )
+        .into_response()
 }
 
 fn decode_b64(value: &str) -> AppResult<Vec<u8>> {

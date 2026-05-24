@@ -1,5 +1,28 @@
 # 版本更新日志
 
+## v0.0.3
+
+发布时间：2026-05-24
+
+### 修复
+
+- 修复 Docker 容器重启后旧页面继续轮询导致 `invalid or expired session` 反复刷错误日志的问题。
+  - 面板接口返回登录过期后，前端会自动清理本地登录状态、停止轮询并回到登录页。
+  - 后端将登录过期类请求从 `ERROR` 降为 `INFO`，避免正常会话失效刷屏污染错误日志。
+
+- 修复容器重启后旧页面可能使用旧 RSA 公钥提交登录或配置请求，导致 `failed to decrypt request key: decryption error` 的问题。
+  - 前端每次提交加密请求前都会重新获取当前后端公钥。
+  - `/api/public-key` 返回 `Cache-Control: no-store`，避免浏览器或中间代理缓存旧公钥。
+  - 解密失败这类请求格式问题调整为 `WARN` 日志。
+
+### 验证
+
+- `cargo fmt --check`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test`
+- `cd frontend && npm run build`
+- `cargo build --release --locked`
+
 ## v0.0.2
 
 发布时间：2026-05-24
