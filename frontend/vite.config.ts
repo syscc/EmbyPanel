@@ -6,11 +6,11 @@ export default defineConfig({
   plugins: [vue()],
   server: {
     host: '0.0.0.0',
-    port: 5173,
+    port: Number(process.env.VITE_PORT || 8090),
     strictPort: true,
     allowedHosts: true,
     proxy: {
-      '/api': 'http://127.0.0.1:8090',
+      '/api': process.env.VITE_API_PROXY_TARGET || 'http://127.0.0.1:18090',
     },
   },
 })

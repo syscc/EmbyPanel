@@ -281,6 +281,7 @@ type AuthMode = 'loading' | 'setup' | 'login' | 'app'
 type Page = 'home' | 'server' | 'clients' | 'notifications' | 'backup' | 'logs' | 'account'
 type ClientStatusFilter = 'all' | 'blocked' | 'allowed'
 type LogKindFilter = 'all' | 'playback' | 'general'
+type LogViewFilter = 'playback' | 'proxy' | 'general'
 type EncryptionPublicKey =
   | { kind: 'webcrypto'; key: CryptoKey }
   | { kind: 'forge'; key: forge.pki.rsa.PublicKey }
@@ -308,12 +309,15 @@ const proxyRequestDetails = ref<ProxyRequestDetail[]>([])
 const logsLoading = ref(false)
 const logsError = ref('')
 const selectedLogServer = ref('all')
-const selectedLogKind = ref<LogKindFilter>('all')
+const selectedLogView = ref<LogViewFilter>('playback')
 const selectedLogLevel = ref('all')
 const selectedRequestPathType = ref('all')
 const logKeywordFilter = ref('')
 const logSince = ref('')
 const logUntil = ref('')
+const playbackLogLimit = ref(120)
+const generalLogLimit = ref(80)
+const requestDetailLimit = ref(200)
 const mediaOverviews = ref<MediaOverview[]>([])
 const serverHealth = ref<ServerHealth | null>(null)
 const detailedHealth = ref<DetailedHealth | null>(null)
@@ -428,6 +432,21 @@ const menu = [
   { id: 'account' as const, label: '账户', icon: '◎' },
 ]
 
+const activityLogMaxLimit = 800
+const requestDetailDisplayMax = 500
+const requestDetailPersistDays = 7
+const requestDetailPersistMax = 20000
+const playbackLogInitialLimit = 120
+const generalLogInitialLimit = 80
+const requestDetailInitialLimit = 200
+const activityLogLoadStep = 80
+const requestDetailLoadStep = 100
+const logViewLabels: Record<LogViewFilter, string> = {
+  playback: '播放日志',
+  proxy: '反代请求明细',
+  general: '信息',
+}
+
 const realIpModeOptions: Array<{ value: RealIpMode; label: string }> = [
   { value: 'auto', label: '系统识别' },
   { value: 'header', label: '从 HTTP Header 中获取' },
@@ -468,14 +487,75 @@ const logServers = computed(() =>
     enabled: server.enabled,
   })),
 )
-const filteredActivityLogs = computed(() =>
-  activityLogs.value.filter((entry) => selectedLogKind.value === 'all' || entry.kind === selectedLogKind.value),
-)
-const playbackLogRows = computed(() => filteredActivityLogs.value.filter((entry) => entry.kind === 'playback'))
+const playbackLogRows = computed(() => activityLogs.value.filter((entry) => entry.kind === 'playback'))
 const generalLogRows = computed(() =>
-  filteredActivityLogs.value.filter((entry) => entry.kind === 'general' && entry.level === 'info'),
+  activityLogs.value.filter((entry) => entry.kind === 'general'),
 )
 const requestDetailRows = computed(() => proxyRequestDetails.value)
+const selectedLogViewLabel = computed(() => logViewLabels[selectedLogView.value])
+const visibleActivityLogRows = computed(() =>
+  activityLogs.value.filter((entry) => selectedLogLevel.value === 'all' || entry.level === selectedLogLevel.value),
+)
+const canLoadMorePlaybackLogs = computed(() =>
+  selectedLogView.value === 'playback'
+    && playbackLogRows.value.length >= playbackLogLimit.value
+    && playbackLogLimit.value < activityLogMaxLimit,
+)
+const canLoadMoreGeneralLogs = computed(() =>
+  selectedLogView.value === 'general'
+    && generalLogRows.value.length >= generalLogLimit.value
+    && generalLogLimit.value < activityLogMaxLimit,
+)
+const canLoadMoreRequestDetails = computed(() =>
+  selectedLogView.value === 'proxy'
+    && requestDetailRows.value.length >= requestDetailLimit.value
+    && requestDetailLimit.value < requestDetailDisplayMax,
+)
+const logLevelOptions = computed(() => {
+  if (selectedLogView.value === 'proxy') {
+    return [
+      { value: 'all', label: '全部级别' },
+      { value: 'success', label: 'SUCCESS - 成功' },
+      { value: 'redirect', label: 'REDIRECT - 直链/跳转' },
+      { value: 'cache', label: 'CACHE - 缓存命中' },
+      { value: 'warn', label: 'WARNING - 警告' },
+      { value: 'error', label: 'ERROR - 错误' },
+      { value: 'blocked', label: 'BLOCKED - 已拦截' },
+    ]
+  }
+  if (selectedLogView.value === 'general') {
+    return [
+      { value: 'all', label: '全部级别' },
+      { value: 'debug', label: 'DEBUG - 调试' },
+      { value: 'info', label: 'INFO - 信息' },
+      { value: 'warn', label: 'WARNING - 警告' },
+      { value: 'error', label: 'ERROR - 错误' },
+      { value: 'critical', label: 'CRITICAL - 严重' },
+    ]
+  }
+  return [
+    { value: 'all', label: '全部级别' },
+    { value: 'success', label: 'SUCCESS - 成功' },
+    { value: 'info', label: 'INFO - 信息' },
+    { value: 'warn', label: 'WARNING - 警告' },
+    { value: 'error', label: 'ERROR - 错误' },
+  ]
+})
+const filteredRequestDetailRows = computed(() =>
+  requestDetailRows.value.filter((row) => {
+    if (selectedLogLevel.value === 'all') return true
+    return requestSeverity(row) === selectedLogLevel.value
+  }),
+)
+const visibleLogCount = computed(() => {
+  if (selectedLogView.value === 'proxy') return filteredRequestDetailRows.value.length
+  return visibleActivityLogRows.value.length
+})
+const canLoadMoreSelectedLogs = computed(() => {
+  if (selectedLogView.value === 'proxy') return canLoadMoreRequestDetails.value
+  if (selectedLogView.value === 'general') return canLoadMoreGeneralLogs.value
+  return canLoadMorePlaybackLogs.value
+})
 const clientRuleRows = computed(() =>
   [...clientControl.records]
     .filter((record) => {
@@ -556,6 +636,12 @@ function setPage(nextPage: Page) {
   page.value = nextPage
   writeStorage(localStorage, pageKey, nextPage)
   if (nextPage === 'logs') void refreshActivityLogs()
+}
+
+function resetLogLimits() {
+  playbackLogLimit.value = playbackLogInitialLimit
+  generalLogLimit.value = generalLogInitialLimit
+  requestDetailLimit.value = requestDetailInitialLimit
 }
 
 function storedTheme() {
@@ -869,6 +955,17 @@ async function exportLogs() {
   link.click()
   link.remove()
   URL.revokeObjectURL(url)
+}
+
+function refreshLogsWithReset() {
+  resetLogLimits()
+  void refreshActivityLogs()
+}
+
+function handleLogViewChange() {
+  selectedLogLevel.value = 'all'
+  selectedRequestPathType.value = 'all'
+  refreshLogsWithReset()
 }
 
 async function restartProxyServer(server: EmbyServerConfig) {
@@ -1340,20 +1437,16 @@ async function refreshActivityLogs() {
   logsLoading.value = true
   logsError.value = ''
   try {
-    let logsPromise: Promise<ActivityLogEntry[]>
-    if (selectedLogKind.value === 'all') {
-      logsPromise = Promise.all([
-        fetchActivityLogs('playback', 120),
-        fetchActivityLogs('general', 80),
-      ]).then(([playback, info]) =>
-        [...playback, ...info].sort((left, right) => right.timestamp_ms - left.timestamp_ms),
-      )
+    if (selectedLogView.value === 'playback') {
+      activityLogs.value = await fetchActivityLogs('playback', playbackLogLimit.value)
+      proxyRequestDetails.value = []
+    } else if (selectedLogView.value === 'general') {
+      activityLogs.value = await fetchActivityLogs('general', generalLogLimit.value)
+      proxyRequestDetails.value = []
     } else {
-      logsPromise = fetchActivityLogs(selectedLogKind.value, 160)
+      proxyRequestDetails.value = await fetchProxyRequestDetails()
+      activityLogs.value = []
     }
-    const [logs, details] = await Promise.all([logsPromise, fetchProxyRequestDetails()])
-    activityLogs.value = logs
-    proxyRequestDetails.value = details
   } catch (err) {
     activityLogs.value = []
     proxyRequestDetails.value = []
@@ -1372,7 +1465,8 @@ async function fetchActivityLogs(kind: LogKindFilter, limit: number) {
 function logQueryParams(limit: number) {
   const params = new URLSearchParams({ limit: String(limit) })
   if (selectedLogServer.value !== 'all') params.set('server_id', selectedLogServer.value)
-  if (selectedLogKind.value !== 'all') params.set('kind', selectedLogKind.value)
+  if (selectedLogView.value === 'playback') params.set('kind', 'playback')
+  if (selectedLogView.value === 'general') params.set('kind', 'general')
   if (selectedLogLevel.value !== 'all') params.set('level', selectedLogLevel.value)
   if (logKeywordFilter.value.trim()) params.set('keyword', logKeywordFilter.value.trim())
   if (logSince.value) params.set('since_ms', String(new Date(logSince.value).getTime()))
@@ -1381,13 +1475,63 @@ function logQueryParams(limit: number) {
 }
 
 async function fetchProxyRequestDetails() {
-  const params = new URLSearchParams({ limit: '200' })
+  const params = new URLSearchParams({ limit: String(requestDetailLimit.value) })
   if (selectedLogServer.value !== 'all') params.set('server_id', selectedLogServer.value)
   if (selectedRequestPathType.value !== 'all') params.set('path_type', selectedRequestPathType.value)
   if (logKeywordFilter.value.trim()) params.set('keyword', logKeywordFilter.value.trim())
   if (logSince.value) params.set('since_ms', String(new Date(logSince.value).getTime()))
   if (logUntil.value) params.set('until_ms', String(new Date(logUntil.value).getTime()))
   return api<ProxyRequestDetail[]>(`/api/monitoring/request-details?${params.toString()}`)
+}
+
+function loadMorePlaybackLogs() {
+  if (!canLoadMorePlaybackLogs.value || logsLoading.value) return
+  playbackLogLimit.value = Math.min(playbackLogLimit.value + activityLogLoadStep, activityLogMaxLimit)
+  void refreshActivityLogs()
+}
+
+function loadMoreGeneralLogs() {
+  if (!canLoadMoreGeneralLogs.value || logsLoading.value) return
+  generalLogLimit.value = Math.min(generalLogLimit.value + activityLogLoadStep, activityLogMaxLimit)
+  void refreshActivityLogs()
+}
+
+function loadMoreRequestDetails() {
+  if (!canLoadMoreRequestDetails.value || logsLoading.value) return
+  requestDetailLimit.value = Math.min(requestDetailLimit.value + requestDetailLoadStep, requestDetailDisplayMax)
+  void refreshActivityLogs()
+}
+
+function loadMoreSelectedLogs() {
+  if (selectedLogView.value === 'proxy') return loadMoreRequestDetails()
+  if (selectedLogView.value === 'general') return loadMoreGeneralLogs()
+  return loadMorePlaybackLogs()
+}
+
+function handleScrollableLogListScroll(event: Event, loadMore: () => void) {
+  const element = event.currentTarget as HTMLElement | null
+  if (!element) return
+  const distanceToBottom = element.scrollHeight - element.scrollTop - element.clientHeight
+  if (distanceToBottom <= 80) loadMore()
+}
+
+function requestSeverity(row: ProxyRequestDetail) {
+  if (row.blocked) return 'blocked'
+  if (row.cache_hit) return 'cache'
+  if (row.status_code >= 500) return 'error'
+  if (row.status_code >= 400) return 'warn'
+  if (row.status_code >= 300) return 'redirect'
+  return 'success'
+}
+
+function requestSeverityLabel(row: ProxyRequestDetail) {
+  const severity = requestSeverity(row)
+  if (severity === 'blocked') return '已拦截'
+  if (severity === 'cache') return '缓存'
+  if (severity === 'redirect') return '跳转'
+  if (severity === 'warn') return '警告'
+  if (severity === 'error') return '错误'
+  return '成功'
 }
 
 function startDashboardPolling() {
@@ -2599,51 +2743,52 @@ onBeforeUnmount(stopDashboardPolling)
         </section>
 
         <section v-else-if="page === 'logs'" class="logs-page">
-          <section class="panel">
+          <section class="panel log-console-panel">
             <div class="panel-head">
               <div>
-                <h2>可视化日志</h2>
-                <p class="muted">按服务器查看播放日志和 info 级别运行信息，页面打开时每 3 秒自动刷新。</p>
+                <h2>日志</h2>
+                <p class="muted">
+                  单列表查看播放日志、反代请求明细和运行信息，页面打开时每 3 秒自动刷新。
+                </p>
               </div>
               <div class="panel-actions">
                 <span class="status-dot">{{ logsLoading ? '刷新中' : '实时刷新' }}</span>
                 <button class="secondary" :disabled="logsLoading" @click="refreshActivityLogs">
                   {{ logsLoading ? '刷新中' : '刷新' }}
                 </button>
+                <button v-if="selectedLogView !== 'proxy'" class="secondary" @click="exportLogs">导出 CSV</button>
               </div>
             </div>
             <div v-if="logsError" class="notice error">{{ logsError }}</div>
-            <div class="log-toolbar">
-              <label>
-                <span>服务器</span>
-                <select v-model="selectedLogServer" @change="refreshActivityLogs">
-                  <option value="all">全部服务器</option>
-                  <option v-for="server in logServers" :key="server.id" :value="server.id">
-                    {{ server.name }} · {{ server.enabled ? '启用' : '停用' }} · :{{ server.port }}
-                  </option>
-                </select>
-              </label>
+            <div class="log-toolbar compact">
               <label>
                 <span>日志类型</span>
-                <select v-model="selectedLogKind" @change="refreshActivityLogs">
-                  <option value="all">播放 + 信息</option>
+                <select v-model="selectedLogView" @change="handleLogViewChange">
                   <option value="playback">播放日志</option>
+                  <option value="proxy">反代请求明细</option>
                   <option value="general">信息</option>
                 </select>
               </label>
               <label>
-                <span>日志级别</span>
-                <select v-model="selectedLogLevel" @change="refreshActivityLogs">
-                  <option value="all">全部级别</option>
-                  <option value="success">SUCCESS - 成功</option>
-                  <option value="info">INFO - 信息</option>
-                  <option value="warn">WARNING - 警告</option>
-                  <option value="error">ERROR - 错误</option>
+                <span>级别</span>
+                <select v-model="selectedLogLevel" @change="refreshLogsWithReset">
+                  <option v-for="option in logLevelOptions" :key="option.value" :value="option.value">
+                    {{ option.label }}
+                  </option>
                 </select>
               </label>
               <label>
+                <span>服务器</span>
+                <select v-model="selectedLogServer" @change="refreshLogsWithReset">
+                  <option value="all">全部服务器</option>
+                  <option v-for="server in logServers" :key="server.id" :value="server.id">
+                    {{ server.name }} · :{{ server.port }}
+                  </option>
+                </select>
+              </label>
+              <label v-if="selectedLogView === 'proxy'">
                 <span>请求类型</span>
-                <select v-model="selectedRequestPathType" @change="refreshActivityLogs">
+                <select v-model="selectedRequestPathType" @change="refreshLogsWithReset">
                   <option value="all">全部请求</option>
                   <option value="video_stream">视频流</option>
                   <option value="playback_info">播放信息</option>
@@ -2652,75 +2797,97 @@ onBeforeUnmount(stopDashboardPolling)
                   <option value="proxy">普通代理</option>
                 </select>
               </label>
-              <label>
+              <label class="log-search-field">
                 <span>关键词</span>
-                <input v-model="logKeywordFilter" placeholder="搜索用户名 / IP / URL / 信息" @keyup.enter="refreshActivityLogs" />
+                <input v-model="logKeywordFilter" placeholder="搜索用户 / IP / URL / 信息" @keyup.enter="refreshLogsWithReset" />
               </label>
               <label>
                 <span>开始时间</span>
-                <input v-model="logSince" type="datetime-local" @change="refreshActivityLogs" />
+                <input v-model="logSince" type="datetime-local" @change="refreshLogsWithReset" />
               </label>
               <label>
                 <span>结束时间</span>
-                <input v-model="logUntil" type="datetime-local" @change="refreshActivityLogs" />
+                <input v-model="logUntil" type="datetime-local" @change="refreshLogsWithReset" />
               </label>
               <div class="log-filter-actions">
-                <button class="secondary" @click="refreshActivityLogs">筛选</button>
-                <button class="secondary" @click="exportLogs">导出 CSV</button>
-              </div>
-              <div class="log-summary">
-                <div>
-                  <span>播放日志</span>
-                  <strong>{{ playbackLogRows.length }}</strong>
-                </div>
-                <div>
-                  <span>信息</span>
-                  <strong>{{ generalLogRows.length }}</strong>
-                </div>
-                <div>
-                  <span>请求明细</span>
-                  <strong>{{ requestDetailRows.length }}</strong>
-                </div>
+                <button class="primary" @click="refreshLogsWithReset">筛选</button>
               </div>
             </div>
-          </section>
 
-          <section class="panel request-detail-panel">
-            <div class="panel-head">
-              <div>
-                <h2>反代请求明细</h2>
-                <p class="muted">显示最近反代请求的用户、IP、路径类型、状态、耗时、缓存命中和拦截结果。</p>
-              </div>
+            <div class="log-console-meta">
+              <span>{{ selectedLogViewLabel }}</span>
+              <strong>{{ visibleLogCount }}</strong>
+              <span v-if="selectedLogView === 'proxy'">
+                单次最多 {{ requestDetailDisplayMax }} 条，保留 {{ requestDetailPersistDays }} 天或最近 {{ requestDetailPersistMax }} 条
+              </span>
+              <span v-else>内存最多保留最近 {{ activityLogMaxLimit }} 条可视化日志</span>
             </div>
-            <div v-if="requestDetailRows.length" class="request-detail-list">
-              <article
-                v-for="row in requestDetailRows"
-                :key="row.id"
-                :class="['request-detail-row', requestOutcomeClass(row)]"
+
+            <div
+              v-if="visibleLogCount"
+              class="log-console-list"
+              @scroll="handleScrollableLogListScroll($event, loadMoreSelectedLogs)"
+            >
+              <template v-if="selectedLogView !== 'proxy'">
+                <article
+                  v-for="entry in visibleActivityLogRows"
+                  :key="`activity-${entry.id}`"
+                  :class="['log-entry', entry.kind, entry.level]"
+                >
+                  <div class="log-time">{{ formatLogTime(entry.timestamp_ms) }}</div>
+                  <div class="log-body">
+                    <div class="log-title">
+                      <strong>{{ entry.message }}</strong>
+                      <span :class="['level-pill', entry.level]">{{ logLevelLabel(entry.level) }}</span>
+                      <span class="server-pill">{{ entry.server_name }}</span>
+                      <span v-if="entry.playback_user" class="user-pill">{{ entry.playback_user }}</span>
+                      <span v-if="entry.playback_ip" class="ip-pill">{{ entry.playback_ip }}</span>
+                    </div>
+                    <p :class="{ 'log-detail': entry.kind === 'playback' }">{{ entry.detail || '暂无详情' }}</p>
+                  </div>
+                </article>
+              </template>
+              <template v-else>
+                <article
+                  v-for="row in filteredRequestDetailRows"
+                  :key="`proxy-${row.id}`"
+                  :class="['request-detail-row', requestOutcomeClass(row)]"
+                >
+                  <div class="request-main">
+                    <div class="request-meta">
+                      <span :class="['level-pill', requestSeverity(row)]">{{ requestSeverityLabel(row) }}</span>
+                      <span class="server-pill">{{ row.server_name }}</span>
+                      <span class="user-pill">{{ row.playback_user || '--' }}</span>
+                      <span class="ip-pill">{{ row.playback_ip || '--' }}</span>
+                      <span class="request-time">{{ formatLogTime(row.timestamp_ms) }}</span>
+                    </div>
+                    <div class="request-path">
+                      <strong>{{ row.method }} {{ row.path }}</strong>
+                      <span>{{ row.detail }}</span>
+                    </div>
+                  </div>
+                  <div class="request-state">
+                    <span>{{ row.outcome }}</span>
+                    <span>{{ row.path_type }}</span>
+                    <span>HTTP {{ row.status_code }}</span>
+                    <span>{{ row.duration_ms }}ms</span>
+                    <span>{{ row.cache_hit ? '缓存命中' : '未命中' }}</span>
+                    <span>{{ row.blocked ? '已拦截' : '未拦截' }}</span>
+                  </div>
+                </article>
+              </template>
+
+              <button
+                v-if="canLoadMoreSelectedLogs"
+                class="load-more-row"
+                :disabled="logsLoading"
+                @click="loadMoreSelectedLogs"
               >
-                <div class="request-main">
-                  <div class="request-meta">
-                    <span class="server-pill">{{ row.server_name }}</span>
-                    <span class="user-pill">{{ row.playback_user || '--' }}</span>
-                    <span class="ip-pill">{{ row.playback_ip || '--' }}</span>
-                    <span class="request-time">{{ formatLogTime(row.timestamp_ms) }}</span>
-                  </div>
-                  <div class="request-path">
-                    <strong>{{ row.method }} {{ row.path }}</strong>
-                    <span>{{ row.detail }}</span>
-                  </div>
-                </div>
-                <div class="request-state">
-                  <span class="request-type">{{ requestPathTypeLabel(row.path_type) }}</span>
-                  <span :class="['request-outcome', requestOutcomeClass(row)]">{{ row.outcome }}</span>
-                  <span>HTTP {{ row.status_code }}</span>
-                  <span>{{ row.duration_ms }}ms</span>
-                  <span>{{ row.cache_hit ? '缓存命中' : '未命中' }}</span>
-                  <span>{{ row.blocked ? '已拦截' : '未拦截' }}</span>
-                </div>
-              </article>
+                {{ logsLoading ? '加载中' : `加载更多${selectedLogViewLabel}` }}
+              </button>
+              <div v-else class="log-limit-note">已显示 {{ visibleLogCount }} 条{{ selectedLogViewLabel }}</div>
             </div>
-            <div v-else class="empty-state">暂无反代请求明细，请求经过反代端口后会自动出现。</div>
+            <div v-else class="empty-state">暂无{{ selectedLogViewLabel }}。</div>
           </section>
 
           <section class="panel">
@@ -2755,53 +2922,6 @@ onBeforeUnmount(stopDashboardPolling)
                 <input v-model="logConfig.format" />
               </label>
             </div>
-          </section>
-
-          <section v-if="selectedLogKind !== 'general'" class="panel log-panel">
-            <div class="panel-head">
-              <h2>播放日志</h2>
-              <span class="muted">{{ selectedLogServer === 'all' ? '全部服务器' : '单服务器' }}</span>
-            </div>
-            <div v-if="playbackLogRows.length" class="log-list">
-              <article v-for="entry in playbackLogRows" :key="entry.id" :class="['log-entry', 'playback', entry.level, 'playback-detail']">
-                <div class="log-body">
-                  <div class="playback-log-meta">
-                    <span class="server-pill">{{ entry.server_name }}</span>
-                    <span class="user-pill">{{ entry.playback_user || '--' }}</span>
-                    <span class="ip-pill">{{ entry.playback_ip || '--' }}</span>
-                    <span class="log-full-time">{{ formatLogTime(entry.timestamp_ms) }}</span>
-                    <strong>{{ entry.message }}</strong>
-                  </div>
-                  <p class="log-detail">{{ entry.detail || '暂无详情' }}</p>
-                </div>
-              </article>
-            </div>
-            <div v-else class="empty-state">暂无播放日志，开始播放后会自动出现。</div>
-          </section>
-
-          <section v-if="selectedLogKind !== 'playback'" class="panel log-panel">
-            <div class="panel-head">
-              <h2>信息</h2>
-              <span class="muted">{{ selectedLogServer === 'all' ? '全部服务器' : '单服务器' }}</span>
-            </div>
-            <div v-if="generalLogRows.length" class="log-list">
-              <article
-                v-for="entry in generalLogRows"
-                :key="entry.id"
-                :class="['log-entry', 'general', entry.level]"
-              >
-                <div class="log-time">{{ formatLogTime(entry.timestamp_ms) }}</div>
-                <div class="log-body">
-                  <div class="log-title">
-                    <strong>{{ entry.message }}</strong>
-                    <span class="server-pill">{{ entry.server_name }}</span>
-                    <span :class="['level-pill', entry.level]">{{ logLevelLabel(entry.level) }}</span>
-                  </div>
-                  <p>{{ entry.detail || '暂无详情' }}</p>
-                </div>
-              </article>
-            </div>
-            <div v-else class="empty-state">暂无 info 级别运行信息，服务启动或反代访问后会自动出现。</div>
           </section>
         </section>
 
