@@ -168,7 +168,7 @@ struct AppState {
     proxy_manager: Option<Arc<ProxyManager>>,
     proxy_server_id: Option<String>,
     playback_users: Arc<Mutex<HashMap<String, String>>>,
-    playback_rate_hits: Arc<Mutex<HashMap<String, VecDeque<u64>>>>,
+    playback_rate_hits: Arc<Mutex<HashMap<String, VecDeque<client_control::PlaybackRateHit>>>>,
     playback_rate_recent_events: Arc<Mutex<HashMap<String, u64>>>,
     playback_rate_bans: Arc<Mutex<HashMap<String, u64>>>,
     playback_rate_ip_bans: Arc<Mutex<HashMap<String, u64>>>,
@@ -332,6 +332,13 @@ impl ProxyManager {
             },
         );
         Ok(())
+    }
+
+    pub(crate) async fn stop_server(&self, server_id: &str) {
+        if let Some(task) = self.running.lock().await.remove(server_id) {
+            let _ = task.shutdown.send(());
+            task.handle.abort();
+        }
     }
 
     async fn record_request(&self, server_id: &str) {
@@ -599,22 +606,6 @@ async fn handle_request(
         }
     }
 
-    if should_record_general_request(path) {
-        record_proxy_request(
-            &state,
-            ActivityLevel::Info,
-            "代理请求",
-            format!(
-                "{} {}",
-                method,
-                uri.path_and_query()
-                    .map(|value| value.as_str())
-                    .unwrap_or(path)
-            ),
-        )
-        .await;
-    }
-
     if rewrite::is_base_html_player(path) {
         let result =
             handle_base_html_player(&state, method.clone(), uri.clone(), headers, body).await;
@@ -780,6 +771,10 @@ fn build_management_app(state: AppState) -> Router {
         .route(
             "/api/settings/restart-proxy",
             axum::routing::post(settings_api::restart_proxy_server),
+        )
+        .route(
+            "/api/settings/toggle-proxy",
+            axum::routing::post(settings_api::toggle_proxy_server),
         )
         .route(
             "/api/settings/validate",
@@ -957,6 +952,96 @@ fn response_outcome(status: StatusCode) -> &'static str {
     }
 }
 
+async fn record_significant_proxy_result(
+    state: &AppState,
+    config: &Config,
+    method: &str,
+    uri: &Uri,
+    path_type: &str,
+    status: StatusCode,
+    duration_ms: u128,
+    playback_user: &str,
+    playback_ip: &str,
+) {
+    if status.is_success() && duration_ms < 3000 {
+        return;
+    }
+    let (level, message) = if status.is_server_error() {
+        (ActivityLevel::Error, "代理服务错误")
+    } else if status.is_client_error() {
+        (ActivityLevel::Warn, "代理客户端错误")
+    } else if duration_ms >= 3000 {
+        (ActivityLevel::Warn, "代理慢请求")
+    } else {
+        return;
+    };
+    let (server_id, server_name) = config_server_label(config);
+    let detail = format!(
+        "{} {} status={} duration={}ms type={} user={} ip={}",
+        method,
+        sanitized_uri_for_log(uri),
+        status.as_u16(),
+        duration_ms,
+        path_type,
+        empty_log_value(playback_user),
+        empty_log_value(playback_ip)
+    );
+    state.activity_log.record(
+        ActivityKind::General,
+        level,
+        Some(&server_id),
+        &server_name,
+        message,
+        &detail,
+    );
+    state.file_log.write(
+        match level {
+            ActivityLevel::Success | ActivityLevel::Info => "info",
+            ActivityLevel::Warn => "warning",
+            ActivityLevel::Error => "error",
+        },
+        message,
+        &detail,
+    );
+}
+
+fn sanitized_uri_for_log(uri: &Uri) -> String {
+    const SENSITIVE_QUERY_KEYS: &[&str] = &[
+        "api_key",
+        "apikey",
+        "access_token",
+        "token",
+        "x-emby-token",
+        "x-mediabrowser-token",
+    ];
+    let path = uri.path();
+    let Some(query) = uri.query() else {
+        return path.to_string();
+    };
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        let value = if SENSITIVE_QUERY_KEYS
+            .iter()
+            .any(|sensitive| key.eq_ignore_ascii_case(sensitive))
+        {
+            "***".into()
+        } else {
+            value
+        };
+        serializer.append_pair(&key, &value);
+    }
+    let query = serializer.finish();
+    if query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{query}")
+    }
+}
+
+fn empty_log_value(value: &str) -> &str {
+    if value.trim().is_empty() { "--" } else { value }
+}
+
 async fn proxy_to_emby_recorded(
     state: &AppState,
     config: &Config,
@@ -971,6 +1056,8 @@ async fn proxy_to_emby_recorded(
     match &result {
         Ok(response) => {
             if let Some(trace) = trace {
+                let status = response.status();
+                let duration_ms = trace.started.elapsed().as_millis();
                 record_proxy_request_detail(
                     state,
                     config,
@@ -978,10 +1065,10 @@ async fn proxy_to_emby_recorded(
                         method: &method_label,
                         uri,
                         path_type: trace.path_type,
-                        status_code: response.status().as_u16(),
-                        outcome: response_outcome(response.status()),
+                        status_code: status.as_u16(),
+                        outcome: response_outcome(status),
                         started_at_ms: trace.started_at_ms,
-                        duration_ms: trace.started.elapsed().as_millis(),
+                        duration_ms,
                         playback_user: &trace.playback_user,
                         playback_ip: &trace.playback_ip,
                         cache_hit: false,
@@ -989,6 +1076,18 @@ async fn proxy_to_emby_recorded(
                         detail: "",
                     },
                 );
+                record_significant_proxy_result(
+                    state,
+                    config,
+                    &method_label,
+                    uri,
+                    trace.path_type,
+                    status,
+                    duration_ms,
+                    &trace.playback_user,
+                    &trace.playback_ip,
+                )
+                .await;
             }
         }
         Err(err) => {
@@ -1559,29 +1658,6 @@ fn query_param(query: &str, key: &str) -> Option<String> {
 
 fn is_direct_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
-}
-
-fn should_record_general_request(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    if lower.starts_with("/web/") || lower.starts_with("/emby/web/") {
-        return false;
-    }
-    !matches!(
-        lower.rsplit('.').next(),
-        Some(
-            "js" | "css"
-                | "png"
-                | "jpg"
-                | "jpeg"
-                | "gif"
-                | "svg"
-                | "webp"
-                | "ico"
-                | "woff"
-                | "woff2"
-                | "map"
-        )
-    )
 }
 
 fn record_playback_redirect(

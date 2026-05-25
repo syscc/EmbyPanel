@@ -24,6 +24,12 @@ pub struct RestartProxyRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ToggleProxyRequest {
+    server_id: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct BackupImportRequest {
     #[serde(default)]
     password: Option<String>,
@@ -154,6 +160,56 @@ pub async fn restart_proxy_server(
     Ok(Json(redact_config_secrets(
         state.config.read().await.clone(),
     )))
+}
+
+pub async fn toggle_proxy_server(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ToggleProxyRequest>,
+) -> AppResult<Json<Config>> {
+    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let server_id = payload.server_id.trim();
+    if server_id.is_empty() {
+        return Err(AppError::Validation("server_id is required".to_string()));
+    }
+
+    let mut config = state.config.read().await.clone();
+    let server_name = {
+        let server = config
+            .servers
+            .iter_mut()
+            .find(|server| server.id == server_id)
+            .ok_or_else(|| AppError::Validation("server_id does not exist".to_string()))?;
+        server.enabled = payload.enabled;
+        server.name.clone()
+    };
+    config
+        .validate_for_storage()
+        .map_err(|err| AppError::Config(err.to_string()))?;
+    state.settings_store.save_config(&config)?;
+    *state.config.write().await = config.clone();
+
+    if let Some(proxy_manager) = state.proxy_manager.as_ref() {
+        if payload.enabled {
+            proxy_manager
+                .restart_server(state.clone(), server_id)
+                .await?;
+        } else {
+            proxy_manager.stop_server(server_id).await;
+        }
+    }
+
+    state.settings_store.record_audit(
+        Some(admin_user_id),
+        "settings.toggle_proxy",
+        &format!(
+            "{}反代服务器 {}",
+            if payload.enabled { "开启" } else { "关闭" },
+            server_name
+        ),
+        "success",
+    )?;
+    Ok(Json(redact_config_secrets(config)))
 }
 
 pub async fn validate_settings(

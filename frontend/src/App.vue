@@ -192,7 +192,7 @@ type PlaybackRateBlockRecord = {
   id: string
   server_id: string
   server_name: string
-  action: 'block_ip' | 'disable_user'
+  action: 'block_ip' | 'disable_user' | 'mixed'
   ip: string
   user_name: string
   blocked_until: string
@@ -203,6 +203,9 @@ type PlaybackRateBlockRecord = {
 
 type PlaybackRateWindowStatus = {
   server_id: string
+  block_id?: string
+  block_action?: string
+  user_name: string
   ip: string
   current_count: number
   threshold: number
@@ -227,7 +230,7 @@ type ClientControlConfig = {
   playback_rate_limit_window_seconds: number
   playback_rate_limit_max_requests: number
   playback_rate_limit_block_seconds: number
-  playback_rate_limit_action: 'block_ip' | 'disable_user'
+  playback_rate_limit_action: 'block_ip' | 'disable_user' | 'mixed'
   rate_limit_blocks: PlaybackRateBlockRecord[]
   webhook?: WebhookNotifyConfig
   webhooks: WebhookNotifyConfig[]
@@ -459,6 +462,7 @@ const realIpModeOptions: Array<{ value: RealIpMode; label: string }> = [
 const playbackLimitActionOptions: Array<{ value: ClientControlConfig['playback_rate_limit_action']; label: string; description: string }> = [
   { value: 'block_ip', label: '屏蔽 IP', description: '屏蔽频繁播放的 IP' },
   { value: 'disable_user', label: '禁用用户', description: '通过 API 禁用该用户' },
+  { value: 'mixed', label: '混合模式', description: '同时禁用用户并屏蔽频繁播放的 IP' },
 ]
 
 const defaultCdnHeaders = [
@@ -596,7 +600,7 @@ const requestStatsTotals = computed(() =>
   ),
 )
 const rateLimitOverview = computed(() => ({
-  active_windows: rateLimitWindows.value.length,
+  active_windows: rateLimitWindows.value.filter((row) => row.current_count > 0).length,
   blocked_windows: rateLimitWindows.value.filter((row) => row.blocked).length,
   highest_count: rateLimitWindows.value.reduce((max, row) => Math.max(max, row.current_count), 0),
 }))
@@ -987,6 +991,28 @@ async function restartProxyServer(server: EmbyServerConfig) {
   }
 }
 
+async function toggleProxyServer(server: EmbyServerConfig) {
+  const nextEnabled = !server.enabled
+  restartingServerId.value = server.id
+  notice.value = ''
+  error.value = ''
+  try {
+    const response = await api<Settings>('/api/settings/toggle-proxy', {
+      method: 'POST',
+      body: JSON.stringify({ server_id: server.id, enabled: nextEnabled }),
+    })
+    Object.assign(settings, response)
+    normalizeSettingsServers()
+    notice.value = `${server.name || '服务器'} 已${nextEnabled ? '开启' : '关闭'}`
+    await refreshOperationalData()
+    await refreshDashboard()
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    restartingServerId.value = ''
+  }
+}
+
 function buildSettingsPayload() {
   const servers = settings.servers.map((server) => ({
     ...server,
@@ -1274,7 +1300,23 @@ async function unblockRateLimit(record: PlaybackRateBlockRecord) {
       body: JSON.stringify(await encryptPayload('rate_limit_block', { id: record.id })),
     })
     applyClientControlConfig(response)
-    notice.value = record.action === 'disable_user' ? '用户封禁已解除' : 'IP 屏蔽已解除'
+    notice.value = playbackRateUnblockNotice(record.action)
+  } catch (err) {
+    clientControlError.value = err instanceof Error ? err.message : String(err)
+  }
+}
+
+async function unblockRateLimitWindow(row: PlaybackRateWindowStatus) {
+  if (!row.block_id) return
+  clientControlError.value = ''
+  try {
+    const response = await api<ClientControlConfig>('/api/client-control/rate-blocks/unblock', {
+      method: 'POST',
+      body: JSON.stringify(await encryptPayload('rate_limit_block', { id: row.block_id })),
+    })
+    applyClientControlConfig(response)
+    await refreshRateLimitStatus()
+    notice.value = playbackRateUnblockNotice(row.block_action)
   } catch (err) {
     clientControlError.value = err instanceof Error ? err.message : String(err)
   }
@@ -1342,6 +1384,19 @@ function rateLimitBlockIp(record: PlaybackRateBlockRecord) {
   const ip = record.ip?.trim()
   if (ip) return ip
   return record.note.match(/(?:IP|ip)\s+([0-9a-fA-F:.]+)/)?.[1] ?? '--'
+}
+
+function playbackRateActionLabel(action?: string) {
+  if (action === 'disable_user') return '禁用用户'
+  if (action === 'mixed') return '混合模式'
+  if (action === 'block_ip') return '屏蔽 IP'
+  return '--'
+}
+
+function playbackRateUnblockNotice(action?: string) {
+  if (action === 'disable_user') return '用户封禁已解除'
+  if (action === 'mixed') return '混合封禁已解除'
+  return 'IP 屏蔽已解除'
 }
 
 function logout() {
@@ -2119,16 +2174,46 @@ onBeforeUnmount(stopDashboardPolling)
                 <small>当前窗口最大次数</small>
               </div>
             </div>
-            <div v-if="rateLimitWindows.length" class="rate-window-mini-list">
-              <div v-for="row in rateLimitWindows.slice(0, 5)" :key="`home-${row.server_id}-${row.ip}`" class="rate-window-mini-row">
-                <strong>{{ formatServerName(row.server_id) }}</strong>
-                <span>{{ row.ip }}</span>
-                <span>{{ row.current_count }}/{{ row.threshold }}</span>
-                <span>{{ row.window_seconds }}s</span>
-                <span :class="['client-badge', row.blocked ? 'blocked' : 'allowed']">
-                  {{ row.blocked ? '已封禁' : '观察中' }}
-                </span>
-              </div>
+            <div v-if="rateLimitWindows.length" class="rate-block-table-wrap home-rate-table">
+              <table class="rate-block-table">
+                <thead>
+                  <tr>
+                    <th>封禁方式</th>
+                    <th>服务器</th>
+                    <th>IP</th>
+                    <th>用户</th>
+                    <th>命中</th>
+                    <th>窗口</th>
+                    <th>状态</th>
+                    <th>{{ rateLimitWindows.length }} 条</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in rateLimitWindows.slice(0, 5)" :key="`home-${row.server_id}-${row.ip}`">
+                    <td>{{ playbackRateActionLabel(row.block_action) }}</td>
+                    <td>{{ formatServerName(row.server_id) }}</td>
+                    <td><strong>{{ row.ip }}</strong></td>
+                    <td>{{ row.user_name || '--' }}</td>
+                    <td>{{ row.current_count }}/{{ row.threshold }}</td>
+                    <td>{{ row.window_seconds }}s</td>
+                    <td>
+                      <span :class="['client-badge', row.blocked ? 'blocked' : 'allowed']">
+                        {{ row.blocked ? '已封禁' : '观察中' }}
+                      </span>
+                    </td>
+                    <td>
+                      <button
+                        v-if="row.blocked && row.block_id"
+                        type="button"
+                        class="secondary"
+                        @click="unblockRateLimitWindow(row)"
+                      >
+                        解除封禁
+                      </button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
             </div>
             <div v-else class="empty-state compact">当前没有播放频率窗口数据。</div>
           </section>
@@ -2186,17 +2271,22 @@ onBeforeUnmount(stopDashboardPolling)
               <div class="server-card-head">
                 <strong>{{ server.name || `服务器 ${index + 1}` }}</strong>
                 <div class="server-actions">
-                  <label class="check compact-check">
-                    <input v-model="server.enabled" type="checkbox" />
-                    <span>启用</span>
-                  </label>
+                  <button
+                    type="button"
+                    :class="['server-toggle-button', { disabled: !server.enabled }]"
+                    :disabled="saving || restartingServerId === server.id"
+                    :aria-pressed="server.enabled"
+                    @click="toggleProxyServer(server)"
+                  >
+                    {{ server.enabled ? '关闭服务器' : '开启服务器' }}
+                  </button>
                   <button
                     type="button"
                     class="secondary restart-button"
                     :disabled="saving || restartingServerId === server.id || !server.enabled"
                     @click="restartProxyServer(server)"
                   >
-                    {{ restartingServerId === server.id ? '重启中' : '重启' }}
+                    {{ restartingServerId === server.id ? '重启中' : '重启服务器' }}
                   </button>
                   <button class="danger-button" :disabled="settings.servers.length <= 1" @click="removeServer(server.id)">
                     删除
@@ -2414,11 +2504,6 @@ onBeforeUnmount(stopDashboardPolling)
                     {{ option.label }}
                   </option>
                 </select>
-                <small class="field-help">
-                  {{
-                    playbackLimitActionOptions.find((option) => option.value === clientControl.playback_rate_limit_action)?.description
-                  }}
-                </small>
               </label>
               <label>
                 <span>检测时间窗口（秒）</span>
@@ -2429,33 +2514,29 @@ onBeforeUnmount(stopDashboardPolling)
                 <input v-model.number="clientControl.playback_rate_limit_max_requests" type="number" min="1" />
               </label>
               <label>
-                <span>{{ clientControl.playback_rate_limit_action === 'block_ip' ? '屏蔽时长（秒）' : '重复拦截冷却（秒）' }}</span>
+                <span>{{ clientControl.playback_rate_limit_action === 'disable_user' ? '重复拦截冷却（秒）' : '封禁时长（秒）' }}</span>
                 <input v-model.number="clientControl.playback_rate_limit_block_seconds" type="number" min="1" />
               </label>
             </div>
             <p class="muted rate-limit-help">
-              同一 IP 在窗口内超过次数后，按选择的方式处理：屏蔽 IP 为临时封禁；禁用用户会调用 Emby API 禁用账号。
+              同一 IP 在窗口内超过次数后，按选择的方式处理：屏蔽 IP 为临时封禁；禁用用户会调用 Emby API 禁用账号；混合模式会同时处理用户和 IP。
             </p>
             <div class="rate-block-list">
-              <div class="rate-block-head">
-                <strong>当前封禁</strong>
-                <span>{{ activeRateLimitBlocks.length }} 条</span>
-              </div>
               <div v-if="activeRateLimitBlocks.length" class="rate-block-table-wrap">
                 <table class="rate-block-table">
                   <thead>
                     <tr>
-                      <th>方式</th>
+                      <th>封禁方式</th>
                       <th>服务器</th>
                       <th>IP</th>
                       <th>用户</th>
                       <th>到期时间</th>
-                      <th>操作</th>
+                      <th>{{ activeRateLimitBlocks.length }} 条</th>
                     </tr>
                   </thead>
                   <tbody>
                     <tr v-for="record in activeRateLimitBlocks" :key="record.id">
-                      <td>{{ record.action === 'disable_user' ? '禁用用户' : '屏蔽 IP' }}</td>
+                      <td>{{ playbackRateActionLabel(record.action) }}</td>
                       <td>{{ record.server_name }}</td>
                       <td>
                         <strong>{{ rateLimitBlockIp(record) }}</strong>
@@ -2519,6 +2600,7 @@ onBeforeUnmount(stopDashboardPolling)
                   <tr>
                     <th>服务器</th>
                     <th>IP</th>
+                    <th>用户</th>
                     <th>当前次数</th>
                     <th>阈值</th>
                     <th>剩余</th>
@@ -2531,6 +2613,7 @@ onBeforeUnmount(stopDashboardPolling)
                   <tr v-for="row in rateLimitWindows" :key="`${row.server_id}-${row.ip}`">
                     <td>{{ formatServerName(row.server_id) }}</td>
                     <td>{{ row.ip }}</td>
+                    <td>{{ row.user_name || '--' }}</td>
                     <td>{{ row.current_count }}</td>
                     <td>{{ row.threshold }}</td>
                     <td>{{ row.remaining }}</td>
@@ -2760,7 +2843,7 @@ onBeforeUnmount(stopDashboardPolling)
               </div>
             </div>
             <div v-if="logsError" class="notice error">{{ logsError }}</div>
-            <div class="log-toolbar compact">
+            <div :class="['log-toolbar', 'compact', { proxy: selectedLogView === 'proxy' }]">
               <label>
                 <span>日志类型</span>
                 <select v-model="selectedLogView" @change="handleLogViewChange">

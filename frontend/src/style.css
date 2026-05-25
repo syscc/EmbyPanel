@@ -608,31 +608,6 @@ label span {
   overflow-wrap: anywhere;
 }
 
-.rate-window-mini-list {
-  display: grid;
-  gap: 8px;
-  border-top: 1px dashed var(--border);
-  margin-top: 14px;
-  padding-top: 12px;
-}
-
-.rate-window-mini-row {
-  display: grid;
-  grid-template-columns: minmax(120px, 1fr) minmax(120px, 1fr) auto auto auto;
-  gap: 10px;
-  align-items: center;
-  color: var(--muted-strong);
-  font-size: 13px;
-}
-
-.rate-window-mini-row strong {
-  min-width: 0;
-  color: var(--text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .playback-strip {
   width: 100%;
   min-width: 0;
@@ -1000,11 +975,18 @@ label span {
 }
 
 .log-toolbar.compact {
-  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  grid-template-columns: 132px 132px 142px 100px 188px 188px 188px;
   gap: 10px;
   align-items: end;
+  justify-content: start;
   min-width: 0;
   max-width: 100%;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.log-toolbar.compact.proxy {
+  grid-template-columns: 132px 132px 142px 150px 100px 176px 176px 176px;
 }
 
 .log-search-field {
@@ -1523,6 +1505,16 @@ label span {
   font-weight: 800;
 }
 
+.home-rate-table {
+  border-top: 1px dashed var(--border);
+  margin-top: 14px;
+  padding-top: 12px;
+}
+
+.home-rate-table .rate-block-table {
+  min-width: 820px;
+}
+
 .rate-window-table-wrap {
   overflow-x: auto;
 }
@@ -1719,6 +1711,23 @@ label span {
   padding: 0 10px;
   font-size: 12px;
   font-weight: 700;
+}
+
+.server-toggle-button {
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--success-border);
+  background: var(--success-bg);
+  color: var(--success-text);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.server-toggle-button.disabled {
+  border-color: var(--border-strong);
+  background: var(--button-bg);
+  color: var(--muted);
 }
 
 .secret-input {
@@ -2119,6 +2128,8 @@ textarea:focus {
     grid-template-columns: 1fr 1fr;
   }
 
+  .server-actions .server-toggle-button,
+  .server-actions .restart-button,
   .server-actions .danger-button {
     width: 100%;
     height: 34px;
@@ -2203,15 +2214,6 @@ textarea:focus {
 
   .log-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .rate-window-mini-row {
-    grid-template-columns: 1fr 1fr;
-  }
-
-  .rate-window-mini-row strong,
-  .rate-window-mini-row span:last-child {
-    grid-column: 1 / -1;
   }
 
   .audit-row {

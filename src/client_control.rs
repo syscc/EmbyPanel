@@ -6,6 +6,7 @@ use axum::{
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashSet;
 use url::Url;
 
 use crate::{
@@ -18,6 +19,12 @@ use crate::{
 
 const SETTING_KEY: &str = "client_control";
 const PLAYBACK_RATE_RECENT_EVENT_TTL_SECONDS: u64 = 5;
+
+#[derive(Debug, Clone)]
+pub struct PlaybackRateHit {
+    pub timestamp: u64,
+    pub user_name: String,
+}
 
 pub struct PlaybackRateLimitInput<'a> {
     pub runtime_config: &'a Config,
@@ -111,6 +118,11 @@ pub struct PlaybackRateBlockRecord {
 #[derive(Debug, Serialize)]
 pub struct PlaybackRateWindowStatus {
     pub server_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_action: Option<String>,
+    pub user_name: String,
     pub ip: String,
     pub current_count: u64,
     pub threshold: u64,
@@ -357,13 +369,15 @@ pub async fn unblock_rate_limit(
 
     let record = config.rate_limit_blocks.remove(index);
     let server_id = record.server_id.clone();
+    let server_name = record.server_name.clone();
     let action = normalize_playback_rate_limit_action(&record.action);
     let ip = record.ip.clone();
     let user_name = record.user_name.clone();
+    let blocked_until = record.blocked_until.clone();
     state.playback_rate_ip_bans.lock().await.remove(&ip);
     state.playback_rate_bans.lock().await.remove(&user_name);
 
-    if action == "disable_user" && !user_name.trim().is_empty() && user_name != "--" {
+    if action_disables_user(&action) && !user_name.trim().is_empty() && user_name != "--" {
         let runtime_config = state
             .config
             .read()
@@ -383,7 +397,13 @@ pub async fn unblock_rate_limit(
         Some(admin_user_id),
         "rate_limit.unblock",
         "解除播放频率封禁",
-        "success",
+        &format!(
+            "服务器: {server_name}({server_id}); 类型: {}; 用户: {}; IP: {}; 原到期: {}",
+            rate_limit_action_label(&action),
+            empty_audit_value(&user_name),
+            empty_audit_value(&ip),
+            blocked_until
+        ),
     )?;
     Ok(Json(redact_webhook_secrets(config)))
 }
@@ -400,22 +420,43 @@ pub async fn rate_limit_status(
     let blocks = config.rate_limit_blocks;
     let hits = state.playback_rate_hits.lock().await;
     let mut rows = Vec::new();
+    let mut row_keys = HashSet::new();
     for (key, timestamps) in hits.iter() {
         let Some((server_id, ip)) = key.split_once(':') else {
             continue;
         };
         let active = timestamps
             .iter()
-            .copied()
-            .filter(|timestamp| now.saturating_sub(*timestamp) < window)
+            .filter(|hit| now.saturating_sub(hit.timestamp) < window)
             .collect::<Vec<_>>();
         if active.is_empty() {
             continue;
         }
-        let oldest = active.first().copied().unwrap_or(now);
+        let oldest = active.first().map(|hit| hit.timestamp).unwrap_or(now);
+        let user_name = active
+            .iter()
+            .rev()
+            .find_map(|hit| {
+                let user_name = hit.user_name.trim();
+                (!user_name.is_empty() && user_name != "--").then(|| user_name.to_string())
+            })
+            .or_else(|| {
+                blocks.iter().find_map(|record| {
+                    let blocked_until = record.blocked_until.parse::<u64>().unwrap_or_default();
+                    let user_name = record.user_name.trim();
+                    (record.enabled
+                        && record.server_id == server_id
+                        && record.ip == ip
+                        && blocked_until > now
+                        && !user_name.is_empty()
+                        && user_name != "--")
+                        .then(|| user_name.to_string())
+                })
+            })
+            .unwrap_or_else(|| "--".to_string());
         let current_count = active.len() as u64;
         let reset_at = oldest + window;
-        let blocked = blocks.iter().any(|record| {
+        let block_record = blocks.iter().find(|record| {
             record.enabled
                 && record.server_id == server_id
                 && record.ip == ip
@@ -423,13 +464,39 @@ pub async fn rate_limit_status(
         });
         rows.push(PlaybackRateWindowStatus {
             server_id: server_id.to_string(),
+            block_id: block_record.map(|record| record.id.clone()),
+            block_action: block_record.map(|record| record.action.clone()),
+            user_name,
             ip: ip.to_string(),
             current_count,
             threshold,
             remaining: threshold.saturating_sub(current_count),
             window_seconds: window,
             reset_at: reset_at.to_string(),
-            blocked,
+            blocked: block_record.is_some(),
+        });
+        row_keys.insert((server_id.to_string(), ip.to_string()));
+    }
+    for record in blocks.iter() {
+        let blocked_until = record.blocked_until.parse::<u64>().unwrap_or_default();
+        if !record.enabled || blocked_until <= now || record.ip.trim().is_empty() {
+            continue;
+        }
+        if !row_keys.insert((record.server_id.clone(), record.ip.clone())) {
+            continue;
+        }
+        rows.push(PlaybackRateWindowStatus {
+            server_id: record.server_id.clone(),
+            block_id: Some(record.id.clone()),
+            block_action: Some(record.action.clone()),
+            user_name: normalize_value(&record.user_name),
+            ip: normalize_value(&record.ip),
+            current_count: 0,
+            threshold,
+            remaining: threshold,
+            window_seconds: window,
+            reset_at: blocked_until.to_string(),
+            blocked: true,
         });
     }
     rows.sort_by_key(|row| std::cmp::Reverse(row.current_count));
@@ -719,11 +786,7 @@ fn rate_limit_webhook_payload(
     max_requests: u64,
     block_seconds: u64,
 ) -> (String, String) {
-    let action_label = if action == "disable_user" {
-        "禁用用户"
-    } else {
-        "屏蔽 IP"
-    };
+    let action_label = rate_limit_action_label(action);
     let title = format!("播放频率限制 - {action_label}");
     let text = format!(
         "服务器：{server_name}\n用户：{}\nIP：{}\n策略：{action_label}\n窗口：{window}s\n阈值：{max_requests} 次\n处理时长：{block_seconds}s",
@@ -780,7 +843,32 @@ fn active_webhooks(webhooks: Vec<WebhookNotifyConfig>) -> Vec<WebhookNotifyConfi
 fn normalize_playback_rate_limit_action(action: &str) -> String {
     match action.trim().to_ascii_lowercase().as_str() {
         "disable_user" | "user" | "disable" => "disable_user".to_string(),
+        "mixed" | "both" | "all" | "disable_user_and_block_ip" => "mixed".to_string(),
         _ => "block_ip".to_string(),
+    }
+}
+
+fn action_requires_user(action: &str) -> bool {
+    action == "disable_user"
+}
+
+fn action_disables_user(action: &str) -> bool {
+    action == "disable_user" || action == "mixed"
+}
+
+fn action_blocks_ip(action: &str) -> bool {
+    action == "block_ip" || action == "mixed"
+}
+
+fn action_uses_user_key(action: &str) -> bool {
+    action == "disable_user"
+}
+
+fn rate_limit_action_label(action: &str) -> &'static str {
+    match action {
+        "disable_user" => "禁用用户",
+        "mixed" => "混合模式",
+        _ => "屏蔽 IP",
     }
 }
 
@@ -824,7 +912,7 @@ fn upsert_rate_limit_block(
         record.enabled
             && record.server_id == server_id
             && record.action == action
-            && if action == "disable_user" {
+            && if action_uses_user_key(action) {
                 record.user_name == user_name
             } else {
                 record.ip == ip
@@ -849,11 +937,15 @@ fn upsert_rate_limit_block(
 }
 
 fn rate_limit_block_note(action: &str, ip: &str, user_name: &str) -> String {
-    if action == "disable_user" {
-        format!("频率超限禁用用户 {user_name}")
-    } else {
-        format!("频率超限屏蔽 IP {ip}")
+    match action {
+        "disable_user" => format!("频率超限禁用用户 {user_name}"),
+        "mixed" => format!("频率超限禁用用户 {user_name} 并屏蔽 IP {ip}"),
+        _ => format!("频率超限屏蔽 IP {ip}"),
     }
+}
+
+fn empty_audit_value(value: &str) -> &str {
+    if value.trim().is_empty() { "--" } else { value }
 }
 
 fn new_id() -> String {
@@ -1036,7 +1128,8 @@ pub async fn enforce_playback_rate_limit(
     if playback_ip.is_empty() || playback_ip == "--" {
         return Ok(false);
     }
-    if action == "disable_user" && (playback_user.is_empty() || playback_user == "--") {
+    let has_playback_user = !playback_user.is_empty() && playback_user != "--";
+    if action_requires_user(&action) && !has_playback_user {
         return Ok(false);
     }
 
@@ -1046,7 +1139,7 @@ pub async fn enforce_playback_rate_limit(
         record.enabled
             && record.server_id == input.server_id
             && record.blocked_until.parse::<u64>().unwrap_or_default() > now
-            && if action == "disable_user" {
+            && if action_uses_user_key(&action) {
                 record.user_name == playback_user
             } else {
                 record.ip == playback_ip
@@ -1119,11 +1212,14 @@ pub async fn enforce_playback_rate_limit(
         let timestamps = hits.entry(key).or_default();
         while timestamps
             .front()
-            .is_some_and(|timestamp| now.saturating_sub(*timestamp) >= window)
+            .is_some_and(|hit| now.saturating_sub(hit.timestamp) >= window)
         {
             timestamps.pop_front();
         }
-        timestamps.push_back(now);
+        timestamps.push_back(PlaybackRateHit {
+            timestamp: now,
+            user_name: playback_user.to_string(),
+        });
         timestamps.len() as u64 > max_requests
     };
 
@@ -1132,7 +1228,7 @@ pub async fn enforce_playback_rate_limit(
         let blocked_until = now + block_seconds;
         let notify_enabled = config.notify_enabled;
         let webhooks = config.webhooks.clone();
-        if action == "disable_user" {
+        if action_disables_user(&action) && has_playback_user {
             if let Err(err) =
                 disable_emby_user_by_name(input.client, input.runtime_config, playback_user).await
             {
@@ -1150,7 +1246,11 @@ pub async fn enforce_playback_rate_limit(
                     crate::activity_log::ActivityLevel::Warn,
                     Some(input.server_id),
                     "播放频率限制",
-                    "禁用用户",
+                    if action == "mixed" {
+                        "混合封禁"
+                    } else {
+                        "禁用用户"
+                    },
                     format!(
                         "用户 {playback_user} 在 IP {playback_ip} 的 {window}s 窗口内超过 {max_requests} 次播放请求，调用 Emby API 禁用用户"
                     ),
@@ -1161,7 +1261,8 @@ pub async fn enforce_playback_rate_limit(
                 .lock()
                 .await
                 .insert(playback_user.to_string(), blocked_until);
-        } else {
+        }
+        if action_blocks_ip(&action) {
             state
                 .playback_rate_ip_bans
                 .lock()
@@ -1172,7 +1273,11 @@ pub async fn enforce_playback_rate_limit(
                 crate::activity_log::ActivityLevel::Warn,
                 Some(input.server_id),
                 "播放频率限制",
-                "屏蔽 IP",
+                if action == "mixed" {
+                    "混合封禁"
+                } else {
+                    "屏蔽 IP"
+                },
                 format!(
                     "IP {playback_ip} 在 {window}s 窗口内超过 {max_requests} 次播放请求，屏蔽 {block_seconds}s"
                 ),
