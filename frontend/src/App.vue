@@ -757,7 +757,7 @@ async function loadAppData() {
   applyClientControlConfig(clientControlResponse)
   profileForm.username = profile.username
   mode.value = 'app'
-  void refreshUpdateCheck()
+  void refreshUpdateCheck(false)
   await refreshOperationalData()
   await refreshLogConfig()
   await refreshRateLimitStatus()
@@ -786,11 +786,18 @@ async function refreshOperationalData() {
   }
 }
 
-async function refreshUpdateCheck() {
+async function refreshUpdateCheck(force = true) {
   updateChecking.value = true
   updateCheckError.value = ''
   try {
-    updateCheck.value = await api<UpdateCheck>('/api/app-info/update-check')
+    updateCheck.value = await api<UpdateCheck>(`/api/app-info/update-check${force ? '?force=1' : ''}`)
+    if (force) {
+      showNotice(
+        updateCheck.value.has_update
+          ? `发现新版本 ${updateCheck.value.latest_version}`
+          : `已是最新版本 ${updateCheck.value.current_version}`,
+      )
+    }
   } catch (err) {
     updateCheck.value = null
     updateCheckError.value = err instanceof Error ? err.message : String(err)
@@ -2007,7 +2014,7 @@ onBeforeUnmount(stopDashboardPolling)
                   ? `检查失败：${updateCheckError}`
                   : '点击检查更新'
           "
-          @click="refreshUpdateCheck"
+          @click="refreshUpdateCheck(true)"
         >
           <strong>{{ appInfo.name }}</strong>
           <small>

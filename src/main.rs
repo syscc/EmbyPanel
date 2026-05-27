@@ -28,7 +28,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Request, State},
+    extract::{ConnectInfo, Query, Request, State},
     http::{Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::{any, get},
@@ -74,6 +74,11 @@ struct UpdateCheckResponse {
     release_url: String,
     has_update: bool,
     checked_at_ms: u128,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct UpdateCheckQuery {
+    force: Option<bool>,
 }
 
 async fn app_info() -> Json<AppInfo> {
@@ -1155,11 +1160,13 @@ async fn public_healthz(State(state): State<AppState>) -> Json<serde_json::Value
 
 async fn update_check(
     State(state): State<AppState>,
+    Query(query): Query<UpdateCheckQuery>,
     headers: axum::http::HeaderMap,
 ) -> AppResult<Json<UpdateCheckResponse>> {
     auth::require_auth(&state, &headers).await?;
     let now = now_ms();
-    if let Some((checked_at, cached)) = state.update_check.lock().await.as_ref()
+    if !query.force.unwrap_or(false)
+        && let Some((checked_at, cached)) = state.update_check.lock().await.as_ref()
         && now.saturating_sub(*checked_at) < 6 * 3600 * 1000
     {
         return Ok(Json(cached.clone()));
