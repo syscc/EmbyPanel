@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use crate::{
     config::Config,
     error::{AppError, AppResult},
+    ip_location::IpLocation,
 };
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +72,8 @@ pub struct PlaybackSession {
     pub client: String,
     pub device_name: String,
     pub user_agent: String,
+    pub playback_ip: Option<String>,
+    pub ip_location: Option<IpLocation>,
     pub item_name: String,
     pub series_name: Option<String>,
     pub position_ticks: Option<i64>,
@@ -157,6 +161,13 @@ struct SessionResponse {
     device_id: Option<String>,
     #[serde(rename = "ApplicationVersion")]
     application_version: Option<String>,
+    #[serde(
+        rename = "RemoteEndPoint",
+        alias = "RemoteEndpoint",
+        alias = "RemoteAddress",
+        alias = "IpAddress"
+    )]
+    remote_endpoint: Option<String>,
     #[serde(rename = "NowPlayingItem")]
     now_playing_item: Option<NowPlayingItem>,
     #[serde(rename = "PlayState")]
@@ -223,6 +234,8 @@ pub async fn get_active_playback_sessions(
                     session.application_version.as_deref(),
                     session.device_id.as_deref(),
                 ),
+                playback_ip: session_remote_ip(session.remote_endpoint.as_deref()),
+                ip_location: None,
                 item_name: item.name.unwrap_or_else(|| "Unknown".to_string()),
                 series_name: item.series_name,
                 position_ticks,
@@ -444,6 +457,46 @@ fn session_user_agent(
         format!("{client} ({device_id})")
     } else {
         client.to_string()
+    }
+}
+
+fn session_remote_ip(remote_endpoint: Option<&str>) -> Option<String> {
+    let endpoint = remote_endpoint?.trim();
+    if endpoint.is_empty() {
+        return None;
+    }
+
+    if let Ok(socket_addr) = endpoint.parse::<SocketAddr>() {
+        return Some(normalize_ip(socket_addr.ip()));
+    }
+    if let Ok(ip) = endpoint.parse::<IpAddr>() {
+        return Some(normalize_ip(ip));
+    }
+
+    if endpoint.starts_with('[') {
+        if let Some(end) = endpoint.find(']') {
+            let ip = &endpoint[1..end];
+            if let Ok(ip) = ip.parse::<IpAddr>() {
+                return Some(normalize_ip(ip));
+            }
+        }
+    }
+
+    if let Some((ip, _port)) = endpoint.rsplit_once(':') {
+        if let Ok(ip) = ip.parse::<Ipv4Addr>() {
+            return Some(ip.to_string());
+        }
+    }
+
+    None
+}
+
+fn normalize_ip(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map_or_else(|| ip.to_string(), |ip| ip.to_string()),
     }
 }
 

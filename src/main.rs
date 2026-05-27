@@ -10,6 +10,7 @@ mod emby;
 mod error;
 mod file_log;
 mod internal_redirect;
+mod ip_location;
 mod monitoring;
 mod openlist;
 mod proxy;
@@ -164,6 +165,7 @@ struct AppState {
     crypto_keys: CryptoKeys,
     activity_log: Arc<ActivityLogStore>,
     file_log: Arc<FileLogStore>,
+    ip_location: Arc<ip_location::IpLocationStore>,
     connectivity: Arc<connectivity::ConnectivityMonitor>,
     proxy_manager: Option<Arc<ProxyManager>>,
     proxy_server_id: Option<String>,
@@ -401,6 +403,11 @@ async fn main() -> AppResult<()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
+    let ip_location = Arc::new(ip_location::IpLocationStore::new());
+    if let Err(err) = ip_location.initialize(&client).await {
+        tracing::warn!(error = %err, "failed to initialize IP database");
+        file_log.write("warning", "IP 数据库初始化失败", &err.to_string());
+    }
     let cache = DirectLinkCache::new(config.cache_ttl_seconds, config.cache_max_capacity);
     let proxy_manager = Arc::new(ProxyManager::new());
     let state = AppState {
@@ -411,6 +418,7 @@ async fn main() -> AppResult<()> {
         crypto_keys: CryptoKeys::generate()?,
         activity_log: Arc::new(ActivityLogStore::new(800)),
         file_log,
+        ip_location,
         connectivity: Arc::new(connectivity::ConnectivityMonitor::new()),
         proxy_manager: Some(proxy_manager.clone()),
         proxy_server_id: None,
@@ -2128,6 +2136,7 @@ mod tests {
             settings_store,
             crypto_keys: CryptoKeys::generate().unwrap(),
             activity_log: Arc::new(ActivityLogStore::new(100)),
+            ip_location: Arc::new(ip_location::IpLocationStore::new()),
             connectivity: Arc::new(connectivity::ConnectivityMonitor::new()),
             proxy_manager: None,
             proxy_server_id: None,

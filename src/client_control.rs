@@ -15,6 +15,7 @@ use crate::{
     crypto_api::EncryptedRequest,
     emby,
     error::{AppError, AppResult},
+    ip_location::IpLocation,
 };
 
 const SETTING_KEY: &str = "client_control";
@@ -113,6 +114,8 @@ pub struct PlaybackRateBlockRecord {
     pub created_at: String,
     pub enabled: bool,
     pub note: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_location: Option<IpLocation>,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,6 +127,8 @@ pub struct PlaybackRateWindowStatus {
     pub block_action: Option<String>,
     pub user_name: String,
     pub ip: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_location: Option<IpLocation>,
     pub current_count: u64,
     pub threshold: u64,
     pub remaining: u64,
@@ -184,7 +189,9 @@ pub async fn get_client_control(
     headers: HeaderMap,
 ) -> AppResult<Json<ClientControlConfig>> {
     auth::require_auth(&state, &headers).await?;
-    Ok(Json(redact_webhook_secrets(load_or_default(&state)?)))
+    Ok(Json(
+        enrich_client_control_response(&state, load_or_default(&state)?).await,
+    ))
 }
 
 pub async fn update_client_control(
@@ -229,7 +236,7 @@ pub async fn update_client_control(
         "保存客户端管控和通知配置",
         "success",
     )?;
-    Ok(Json(redact_webhook_secrets(config)))
+    Ok(Json(enrich_client_control_response(&state, config).await))
 }
 
 pub async fn add_user_agent_rule(
@@ -287,7 +294,7 @@ pub async fn add_user_agent_rule(
         "添加 UA 拦截规则",
         "success",
     )?;
-    Ok(Json(redact_webhook_secrets(config)))
+    Ok(Json(enrich_client_control_response(&state, config).await))
 }
 
 pub async fn toggle_client_rule(
@@ -318,7 +325,7 @@ pub async fn toggle_client_rule(
         "切换 UA 拦截规则状态",
         "success",
     )?;
-    Ok(Json(redact_webhook_secrets(config)))
+    Ok(Json(enrich_client_control_response(&state, config).await))
 }
 
 pub async fn delete_client_rule(
@@ -344,7 +351,7 @@ pub async fn delete_client_rule(
         "删除 UA 拦截规则",
         "success",
     )?;
-    Ok(Json(redact_webhook_secrets(config)))
+    Ok(Json(enrich_client_control_response(&state, config).await))
 }
 
 pub async fn unblock_rate_limit(
@@ -405,7 +412,7 @@ pub async fn unblock_rate_limit(
             blocked_until
         ),
     )?;
-    Ok(Json(redact_webhook_secrets(config)))
+    Ok(Json(enrich_client_control_response(&state, config).await))
 }
 
 pub async fn rate_limit_status(
@@ -468,6 +475,7 @@ pub async fn rate_limit_status(
             block_action: block_record.map(|record| record.action.clone()),
             user_name,
             ip: ip.to_string(),
+            ip_location: state.ip_location.lookup(ip).await,
             current_count,
             threshold,
             remaining: threshold.saturating_sub(current_count),
@@ -491,6 +499,7 @@ pub async fn rate_limit_status(
             block_action: Some(record.action.clone()),
             user_name: normalize_value(&record.user_name),
             ip: normalize_value(&record.ip),
+            ip_location: state.ip_location.lookup(&record.ip).await,
             current_count: 0,
             threshold,
             remaining: threshold,
@@ -730,6 +739,17 @@ fn redact_webhook_secrets(mut config: ClientControlConfig) -> ClientControlConfi
     config
 }
 
+async fn enrich_client_control_response(
+    state: &AppState,
+    config: ClientControlConfig,
+) -> ClientControlConfig {
+    let mut config = redact_webhook_secrets(config);
+    for record in &mut config.rate_limit_blocks {
+        record.ip_location = state.ip_location.lookup(&record.ip).await;
+    }
+    config
+}
+
 fn normalize_webhook_test_text(value: &str, fallback: &str) -> String {
     let value = value.trim();
     if value.is_empty() {
@@ -933,6 +953,7 @@ fn upsert_rate_limit_block(
         created_at: now,
         enabled: true,
         note: rate_limit_block_note(action, ip, user_name),
+        ip_location: None,
     });
 }
 

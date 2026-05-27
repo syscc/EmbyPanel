@@ -9,6 +9,8 @@ use std::{
 
 use serde::Serialize;
 
+use crate::ip_location::IpLocation;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityKind {
     Playback,
@@ -63,6 +65,8 @@ pub struct ActivityLogEntry {
     pub server_name: String,
     pub playback_user: Option<String>,
     pub playback_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_location: Option<IpLocation>,
     pub message: String,
     pub detail: String,
 }
@@ -114,6 +118,7 @@ impl ActivityLogStore {
             server_name: server_name.to_string(),
             playback_user: None,
             playback_ip: None,
+            ip_location: None,
             message: message.into(),
             detail: detail.into(),
         });
@@ -133,6 +138,7 @@ impl ActivityLogStore {
             server_name: record.server_name.to_string(),
             playback_user: Some(record.playback_user.to_string()),
             playback_ip: Some(record.playback_ip.to_string()),
+            ip_location: None,
             message: record.message,
             detail: record.detail,
         });

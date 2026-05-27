@@ -59,6 +59,8 @@ type PlaybackSession = {
   client: string
   device_name: string
   user_agent: string
+  playback_ip: string | null
+  ip_location?: IpLocation
   item_name: string
   series_name: string | null
   position_ticks: number | null
@@ -148,6 +150,14 @@ type RequestStatsDaily = {
   updated_at_ms: number
 }
 
+type IpLocation = {
+  country_name: string
+  region_name: string
+  city_name: string
+  district_name: string
+  isp_domain: string
+}
+
 type ProxyRequestDetail = {
   id: number
   timestamp_ms: number
@@ -162,6 +172,7 @@ type ProxyRequestDetail = {
   duration_ms: number
   playback_user: string
   playback_ip: string
+  ip_location?: IpLocation
   cache_hit: boolean
   blocked: boolean
   detail: string
@@ -194,6 +205,7 @@ type PlaybackRateBlockRecord = {
   server_name: string
   action: 'block_ip' | 'disable_user' | 'mixed'
   ip: string
+  ip_location?: IpLocation
   user_name: string
   blocked_until: string
   created_at: string
@@ -207,6 +219,7 @@ type PlaybackRateWindowStatus = {
   block_action?: string
   user_name: string
   ip: string
+  ip_location?: IpLocation
   current_count: number
   threshold: number
   remaining: number
@@ -246,6 +259,7 @@ type ActivityLogEntry = {
   server_name: string
   playback_user: string | null
   playback_ip: string | null
+  ip_location?: IpLocation
   message: string
   detail: string
 }
@@ -373,6 +387,7 @@ const logConfig = reactive<SystemLogConfig>({
 })
 let dashboardTimer: number | undefined
 let logsTimer: number | undefined
+let noticeTimer: number | undefined
 
 const credentials = reactive({
   username: '',
@@ -636,7 +651,22 @@ function storedPage(): Page {
   return validPages.includes(stored as Page) ? (stored as Page) : 'home'
 }
 
+function clearNotice() {
+  if (noticeTimer !== undefined) {
+    window.clearTimeout(noticeTimer)
+    noticeTimer = undefined
+  }
+  notice.value = ''
+}
+
+function showNotice(message: string) {
+  clearNotice()
+  notice.value = message
+  noticeTimer = window.setTimeout(clearNotice, 3500)
+}
+
 function setPage(nextPage: Page) {
+  clearNotice()
   page.value = nextPage
   writeStorage(localStorage, pageKey, nextPage)
   if (nextPage === 'logs') void refreshActivityLogs()
@@ -808,7 +838,7 @@ async function refreshAuditLogs() {
 
 async function saveSettings() {
   saving.value = true
-  notice.value = ''
+  clearNotice()
   error.value = ''
   try {
     const payload = buildSettingsPayload()
@@ -818,7 +848,7 @@ async function saveSettings() {
     })
     Object.assign(settings, response)
     normalizeSettingsServers()
-    notice.value = '服务器配置已保存，反代服务已重启'
+    showNotice('服务器配置已保存，反代服务已重启')
     await refreshOperationalData()
     await refreshDashboard()
   } catch (err) {
@@ -831,7 +861,7 @@ async function saveSettings() {
 async function validateSettings() {
   saving.value = true
   error.value = ''
-  notice.value = ''
+  clearNotice()
   validationResults.value = []
   try {
     const payload = buildSettingsPayload()
@@ -840,7 +870,7 @@ async function validateSettings() {
       body: JSON.stringify(await encryptPayload('settings', payload)),
     })
     validationResults.value = response.results
-    notice.value = response.ok ? '配置测试通过' : '配置测试完成，请查看警告项'
+    showNotice(response.ok ? '配置测试通过' : '配置测试完成，请查看警告项')
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -850,13 +880,13 @@ async function validateSettings() {
 
 async function exportBackup() {
   backupError.value = ''
-  notice.value = ''
+  clearNotice()
   try {
     const response = await api<{ backup: string }>('/api/settings/backup/export', {
       method: 'POST',
     })
     downloadTextFile(response.backup, backupFileName())
-    notice.value = '配置文件已生成，请在浏览器下载记录中查看'
+    showNotice('配置文件已生成，请在浏览器下载记录中查看')
   } catch (err) {
     backupError.value = err instanceof Error ? err.message : String(err)
   }
@@ -864,7 +894,7 @@ async function exportBackup() {
 
 async function importBackup() {
   backupError.value = ''
-  notice.value = ''
+  clearNotice()
   backupFileInput.value?.click()
 }
 
@@ -874,7 +904,7 @@ async function handleBackupFileSelected(event: Event) {
   input.value = ''
   if (!file) return
   backupError.value = ''
-  notice.value = ''
+  clearNotice()
   try {
     const backup = await file.text()
     await importBackupText(backup)
@@ -885,7 +915,7 @@ async function handleBackupFileSelected(event: Event) {
 
 async function importBackupText(backupText: string) {
   backupError.value = ''
-  notice.value = ''
+  clearNotice()
   const backup = backupText.trim()
   if (!backup) {
     backupError.value = '配置文件内容为空'
@@ -901,7 +931,7 @@ async function importBackupText(backupText: string) {
     Object.assign(settings, response)
     normalizeSettingsServers()
     await refreshOperationalData()
-    notice.value = '配置文件已还原，反代服务已重启'
+    showNotice('配置文件已还原，反代服务已重启')
   } catch (err) {
     backupError.value = err instanceof Error ? err.message : String(err)
   }
@@ -929,13 +959,13 @@ function backupFileName() {
 
 async function saveLogConfig() {
   logsError.value = ''
-  notice.value = ''
+  clearNotice()
   try {
     Object.assign(logConfig, await api<SystemLogConfig>('/api/settings/log-config', {
       method: 'PUT',
       body: JSON.stringify(await encryptPayload('log_config', { ...logConfig })),
     }))
-    notice.value = '日志配置已保存'
+    showNotice('日志配置已保存')
   } catch (err) {
     logsError.value = err instanceof Error ? err.message : String(err)
   }
@@ -974,7 +1004,7 @@ function handleLogViewChange() {
 
 async function restartProxyServer(server: EmbyServerConfig) {
   restartingServerId.value = server.id
-  notice.value = ''
+  clearNotice()
   error.value = ''
   try {
     const response = await api<Settings>('/api/settings/restart-proxy', {
@@ -983,7 +1013,7 @@ async function restartProxyServer(server: EmbyServerConfig) {
     })
     Object.assign(settings, response)
     normalizeSettingsServers()
-    notice.value = `${server.name || '服务器'} 反代服务已重启`
+    showNotice(`${server.name || '服务器'} 反代服务已重启`)
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -994,7 +1024,7 @@ async function restartProxyServer(server: EmbyServerConfig) {
 async function toggleProxyServer(server: EmbyServerConfig) {
   const nextEnabled = !server.enabled
   restartingServerId.value = server.id
-  notice.value = ''
+  clearNotice()
   error.value = ''
   try {
     const response = await api<Settings>('/api/settings/toggle-proxy', {
@@ -1003,7 +1033,7 @@ async function toggleProxyServer(server: EmbyServerConfig) {
     })
     Object.assign(settings, response)
     normalizeSettingsServers()
-    notice.value = `${server.name || '服务器'} 已${nextEnabled ? '开启' : '关闭'}`
+    showNotice(`${server.name || '服务器'} 已${nextEnabled ? '开启' : '关闭'}`)
     await refreshOperationalData()
     await refreshDashboard()
   } catch (err) {
@@ -1112,7 +1142,7 @@ function toggleApiKeyVisible(serverId: string) {
 
 async function saveProfile() {
   savingProfile.value = true
-  notice.value = ''
+  clearNotice()
   error.value = ''
   try {
     const response = await api<Profile>('/api/profile', {
@@ -1121,7 +1151,7 @@ async function saveProfile() {
     })
     Object.assign(profile, response)
     profileForm.username = response.username
-    notice.value = '账户资料已更新'
+    showNotice('账户资料已更新')
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -1131,7 +1161,7 @@ async function saveProfile() {
 
 async function saveClientControl() {
   savingClientControl.value = true
-  notice.value = ''
+  clearNotice()
   clientControlError.value = ''
   try {
     const response = await api<ClientControlConfig>('/api/client-control', {
@@ -1139,7 +1169,7 @@ async function saveClientControl() {
       body: JSON.stringify(await encryptPayload('client_control', sanitizeClientControl())),
     })
     applyClientControlConfig(response)
-    notice.value = '客户端管控规则已保存'
+    showNotice('客户端管控规则已保存')
   } catch (err) {
     clientControlError.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -1168,7 +1198,7 @@ function sanitizeClientControl() {
 
 async function testWebhook(webhook: WebhookNotifyConfig) {
   clientControlError.value = ''
-  notice.value = ''
+  clearNotice()
   const url = webhook.url.trim()
   if (!url) {
     clientControlError.value = 'Webhook URL 不能为空'
@@ -1187,7 +1217,7 @@ async function testWebhook(webhook: WebhookNotifyConfig) {
         }),
       ),
     })
-    notice.value = 'Webhook 测试发送成功'
+    showNotice('Webhook 测试发送成功')
   } catch (err) {
     clientControlError.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -1246,7 +1276,7 @@ function newWebhookId() {
 
 async function addClientRule() {
   clientControlError.value = ''
-  notice.value = ''
+  clearNotice()
   const userAgent = manualClientRule.user_agent.trim()
   if (!userAgent) {
     clientControlError.value = 'UA 关键字不能为空'
@@ -1266,7 +1296,7 @@ async function addClientRule() {
     applyClientControlConfig(response)
     manualClientRule.user_agent = ''
     manualClientRule.note = ''
-    notice.value = 'UA 拦截规则已添加'
+    showNotice('UA 拦截规则已添加')
   } catch (err) {
     clientControlError.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -1300,7 +1330,7 @@ async function unblockRateLimit(record: PlaybackRateBlockRecord) {
       body: JSON.stringify(await encryptPayload('rate_limit_block', { id: record.id })),
     })
     applyClientControlConfig(response)
-    notice.value = playbackRateUnblockNotice(record.action)
+    showNotice(playbackRateUnblockNotice(record.action))
   } catch (err) {
     clientControlError.value = err instanceof Error ? err.message : String(err)
   }
@@ -1316,7 +1346,7 @@ async function unblockRateLimitWindow(row: PlaybackRateWindowStatus) {
     })
     applyClientControlConfig(response)
     await refreshRateLimitStatus()
-    notice.value = playbackRateUnblockNotice(row.block_action)
+    showNotice(playbackRateUnblockNotice(row.block_action))
   } catch (err) {
     clientControlError.value = err instanceof Error ? err.message : String(err)
   }
@@ -1324,7 +1354,7 @@ async function unblockRateLimitWindow(row: PlaybackRateWindowStatus) {
 
 async function changePassword() {
   error.value = ''
-  notice.value = ''
+  clearNotice()
   if (!passwordForm.new_password) {
     error.value = '新密码不能为空'
     return
@@ -1347,7 +1377,7 @@ async function changePassword() {
     passwordForm.current_password = ''
     passwordForm.new_password = ''
     passwordForm.confirm_password = ''
-    notice.value = '管理员密码已更新'
+    showNotice('管理员密码已更新')
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -1369,7 +1399,7 @@ async function deleteClientRule(record: ClientRuleRecord) {
       ),
     })
     applyClientControlConfig(response)
-    notice.value = 'UA 规则已删除'
+    showNotice('UA 规则已删除')
   } catch (err) {
     clientControlError.value = err instanceof Error ? err.message : String(err)
   }
@@ -1397,6 +1427,26 @@ function playbackRateUnblockNotice(action?: string) {
   if (action === 'disable_user') return '用户封禁已解除'
   if (action === 'mixed') return '混合封禁已解除'
   return 'IP 屏蔽已解除'
+}
+
+function formatIpLocation(location?: IpLocation) {
+  if (!location) return ''
+  return [
+    location.country_name,
+    location.region_name,
+    location.city_name,
+    location.district_name,
+    location.isp_domain,
+  ]
+    .map((value) => value?.trim())
+    .filter((value, index, values) => value && values.indexOf(value) === index)
+    .join(' ')
+}
+
+function ipWithLocation(ip: string | null | undefined, location?: IpLocation) {
+  const ipText = ip?.trim() || '--'
+  const locationText = formatIpLocation(location)
+  return locationText ? `${ipText} · ${locationText}` : ipText
 }
 
 function logout() {
@@ -1611,6 +1661,7 @@ function stopDashboardPolling() {
     window.clearInterval(logsTimer)
     logsTimer = undefined
   }
+  clearNotice()
 }
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -2192,7 +2243,10 @@ onBeforeUnmount(stopDashboardPolling)
                   <tr v-for="row in rateLimitWindows.slice(0, 5)" :key="`home-${row.server_id}-${row.ip}`">
                     <td>{{ playbackRateActionLabel(row.block_action) }}</td>
                     <td>{{ formatServerName(row.server_id) }}</td>
-                    <td><strong>{{ row.ip }}</strong></td>
+                    <td>
+                      <strong>{{ row.ip }}</strong>
+                      <small v-if="formatIpLocation(row.ip_location)" class="ip-location">{{ formatIpLocation(row.ip_location) }}</small>
+                    </td>
                     <td>{{ row.user_name || '--' }}</td>
                     <td>{{ row.current_count }}/{{ row.threshold }}</td>
                     <td>{{ row.window_seconds }}s</td>
@@ -2235,6 +2289,9 @@ onBeforeUnmount(stopDashboardPolling)
                   <div class="play-title">{{ session.item_name }}</div>
                   <div class="play-meta">
                     {{ session.series_name || session.client }} · {{ session.user_name }} · {{ session.device_name }}
+                  </div>
+                  <div v-if="session.playback_ip" class="play-ip">
+                    IP {{ ipWithLocation(session.playback_ip, session.ip_location) }}
                   </div>
                   <div class="progress-track">
                     <div class="progress-bar" :style="{ width: `${session.percent ?? 0}%` }" />
@@ -2540,6 +2597,7 @@ onBeforeUnmount(stopDashboardPolling)
                       <td>{{ record.server_name }}</td>
                       <td>
                         <strong>{{ rateLimitBlockIp(record) }}</strong>
+                        <small v-if="formatIpLocation(record.ip_location)" class="ip-location">{{ formatIpLocation(record.ip_location) }}</small>
                       </td>
                       <td>{{ record.user_name || '--' }}</td>
                       <td>{{ formatTimestamp(record.blocked_until) }}</td>
@@ -2612,7 +2670,10 @@ onBeforeUnmount(stopDashboardPolling)
                 <tbody>
                   <tr v-for="row in rateLimitWindows" :key="`${row.server_id}-${row.ip}`">
                     <td>{{ formatServerName(row.server_id) }}</td>
-                    <td>{{ row.ip }}</td>
+                    <td>
+                      <strong>{{ row.ip }}</strong>
+                      <small v-if="formatIpLocation(row.ip_location)" class="ip-location">{{ formatIpLocation(row.ip_location) }}</small>
+                    </td>
                     <td>{{ row.user_name || '--' }}</td>
                     <td>{{ row.current_count }}</td>
                     <td>{{ row.threshold }}</td>
@@ -2924,7 +2985,7 @@ onBeforeUnmount(stopDashboardPolling)
                       <span :class="['level-pill', entry.level]">{{ logLevelLabel(entry.level) }}</span>
                       <span class="server-pill">{{ entry.server_name }}</span>
                       <span v-if="entry.playback_user" class="user-pill">{{ entry.playback_user }}</span>
-                      <span v-if="entry.playback_ip" class="ip-pill">{{ entry.playback_ip }}</span>
+                      <span v-if="entry.playback_ip" class="ip-pill">{{ ipWithLocation(entry.playback_ip, entry.ip_location) }}</span>
                     </div>
                     <p :class="{ 'log-detail': entry.kind === 'playback' }">{{ entry.detail || '暂无详情' }}</p>
                   </div>
@@ -2941,7 +3002,7 @@ onBeforeUnmount(stopDashboardPolling)
                       <span :class="['level-pill', requestSeverity(row)]">{{ requestSeverityLabel(row) }}</span>
                       <span class="server-pill">{{ row.server_name }}</span>
                       <span class="user-pill">{{ row.playback_user || '--' }}</span>
-                      <span class="ip-pill">{{ row.playback_ip || '--' }}</span>
+                      <span class="ip-pill">{{ ipWithLocation(row.playback_ip, row.ip_location) }}</span>
                       <span class="request-time">{{ formatLogTime(row.timestamp_ms) }}</span>
                     </div>
                     <div class="request-path">

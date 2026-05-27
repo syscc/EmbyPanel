@@ -7,7 +7,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::{config::Config, error::AppResult};
+use crate::{config::Config, error::AppResult, ip_location::IpLocation};
 
 const DEFAULT_DATABASE_PATH: &str = "data/embypanel.db";
 const CONTAINER_DATABASE_PATH: &str = "/data/embypanel.db";
@@ -469,6 +469,7 @@ impl SettingsStore {
                 duration_ms: row.get::<_, i64>(10)? as u128,
                 playback_user: row.get(11)?,
                 playback_ip: row.get(12)?,
+                ip_location: None,
                 cache_hit: row.get(13)?,
                 blocked: row.get(14)?,
                 detail: row.get(15)?,
@@ -756,6 +757,8 @@ pub struct ProxyRequestDetail {
     pub duration_ms: u128,
     pub playback_user: String,
     pub playback_ip: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_location: Option<IpLocation>,
     pub cache_hit: bool,
     pub blocked: bool,
     pub detail: String,

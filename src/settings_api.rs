@@ -601,6 +601,7 @@ mod tests {
                 created_at: "1".to_string(),
                 enabled: true,
                 note: "active".to_string(),
+                ip_location: None,
             });
         config
             .rate_limit_blocks
@@ -615,6 +616,7 @@ mod tests {
                 created_at: "1".to_string(),
                 enabled: true,
                 note: "expired".to_string(),
+                ip_location: None,
             });
         config
             .rate_limit_blocks
@@ -629,6 +631,7 @@ mod tests {
                 created_at: "1".to_string(),
                 enabled: false,
                 note: "disabled".to_string(),
+                ip_location: None,
             });
 
         let value = backup_client_control_value(Some(config)).unwrap().unwrap();

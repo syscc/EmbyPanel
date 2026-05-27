@@ -101,8 +101,11 @@ pub async fn list_playback_sessions(
     let mut sessions = Vec::new();
     for config in configs {
         match crate::emby::get_active_playback_sessions(&state.client, &config).await {
-            Ok(server_sessions) => {
-                for session in &server_sessions {
+            Ok(mut server_sessions) => {
+                for session in &mut server_sessions {
+                    if let Some(ip) = session.playback_ip.as_deref() {
+                        session.ip_location = state.ip_location.lookup(ip).await;
+                    }
                     if let Err(err) = crate::client_control::record_client_event(
                         &state,
                         session.client.clone(),
@@ -147,7 +150,7 @@ pub async fn list_activity_logs(
         _ => None,
     };
     let server_id = query.server_id.as_deref().filter(|value| *value != "all");
-    Ok(Json(state.activity_log.list_filtered(ActivityLogFilter {
+    let mut entries = state.activity_log.list_filtered(ActivityLogFilter {
         server_id,
         kind,
         level: query.level.as_deref(),
@@ -155,7 +158,13 @@ pub async fn list_activity_logs(
         since_ms: query.since_ms,
         until_ms: query.until_ms,
         limit: query.limit.unwrap_or(120),
-    })))
+    });
+    for entry in &mut entries {
+        if let Some(ip) = entry.playback_ip.as_deref() {
+            entry.ip_location = state.ip_location.lookup(ip).await;
+        }
+    }
+    Ok(Json(entries))
 }
 
 pub async fn export_activity_logs(
@@ -255,16 +264,21 @@ pub async fn request_details(
     Query(query): Query<RequestDetailQuery>,
 ) -> AppResult<Json<Vec<crate::db::ProxyRequestDetail>>> {
     auth::require_auth(&state, &headers).await?;
-    Ok(Json(state.settings_store.list_proxy_request_details(
-        crate::db::ProxyRequestDetailFilter {
-            server_id: query.server_id.as_deref().filter(|value| *value != "all"),
-            path_type: query.path_type.as_deref().filter(|value| *value != "all"),
-            keyword: query.keyword.as_deref(),
-            since_ms: query.since_ms,
-            until_ms: query.until_ms,
-            limit: query.limit.unwrap_or(200),
-        },
-    )?))
+    let mut rows =
+        state
+            .settings_store
+            .list_proxy_request_details(crate::db::ProxyRequestDetailFilter {
+                server_id: query.server_id.as_deref().filter(|value| *value != "all"),
+                path_type: query.path_type.as_deref().filter(|value| *value != "all"),
+                keyword: query.keyword.as_deref(),
+                since_ms: query.since_ms,
+                until_ms: query.until_ms,
+                limit: query.limit.unwrap_or(200),
+            })?;
+    for row in &mut rows {
+        row.ip_location = state.ip_location.lookup(&row.playback_ip).await;
+    }
+    Ok(Json(rows))
 }
 
 pub async fn proxy_status(

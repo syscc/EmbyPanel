@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "emby302gateway-rs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -357,6 +357,7 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
+ "ipdb",
  "moka",
  "rand 0.9.4",
  "regex",
@@ -852,6 +853,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "ipdb"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d07b6684d753266e4ca4b55e97a9a13ea181255edae3714bbbfa55e7eb9aa90"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

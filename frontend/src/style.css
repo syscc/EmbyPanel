@@ -660,16 +660,22 @@ label span {
 }
 
 .play-meta,
+.play-ip,
 .play-footer {
   color: var(--muted-strong);
   font-size: 12px;
 }
 
-.play-meta {
+.play-meta,
+.play-ip {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.play-ip {
+  color: var(--muted);
 }
 
 .progress-track {
@@ -1337,6 +1343,15 @@ label span {
 .ip-pill {
   background: var(--active-bg);
   color: var(--active-text);
+}
+
+.ip-location {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 .level-pill.info {
