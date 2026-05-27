@@ -1,5 +1,6 @@
 mod activity_log;
 mod auth;
+mod block_log;
 mod cache;
 mod client_control;
 mod config;
@@ -53,6 +54,7 @@ use tracing_subscriber::{
 
 use crate::cache::DirectLinkCache;
 use activity_log::{ActivityKind, ActivityLevel, ActivityLogStore, PlaybackLogRecord};
+use block_log::BlockLogStore;
 use file_log::FileLogStore;
 
 const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -78,7 +80,7 @@ struct UpdateCheckResponse {
 
 #[derive(Debug, Default, serde::Deserialize)]
 struct UpdateCheckQuery {
-    force: Option<bool>,
+    force: Option<String>,
 }
 
 async fn app_info() -> Json<AppInfo> {
@@ -170,6 +172,7 @@ struct AppState {
     crypto_keys: CryptoKeys,
     activity_log: Arc<ActivityLogStore>,
     file_log: Arc<FileLogStore>,
+    block_log: Arc<BlockLogStore>,
     ip_location: Arc<ip_location::IpLocationStore>,
     connectivity: Arc<connectivity::ConnectivityMonitor>,
     proxy_manager: Option<Arc<ProxyManager>>,
@@ -408,6 +411,8 @@ async fn main() -> AppResult<()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
+    let block_log = Arc::new(BlockLogStore::new());
+    block_log.bootstrap_from_proxy_logs(&settings_store);
     let ip_location = Arc::new(ip_location::IpLocationStore::new());
     if let Err(err) = ip_location.initialize(&client).await {
         tracing::warn!(error = %err, "failed to initialize IP database");
@@ -423,6 +428,7 @@ async fn main() -> AppResult<()> {
         crypto_keys: CryptoKeys::generate()?,
         activity_log: Arc::new(ActivityLogStore::new(800)),
         file_log,
+        block_log,
         ip_location,
         connectivity: Arc::new(connectivity::ConnectivityMonitor::new()),
         proxy_manager: Some(proxy_manager.clone()),
@@ -614,7 +620,8 @@ async fn handle_request(
                     blocked: true,
                     detail: &rule.user_agent,
                 },
-            );
+            )
+            .await;
             return Ok((StatusCode::FORBIDDEN, "client disabled by EmbyPanel").into_response());
         }
     }
@@ -642,7 +649,8 @@ async fn handle_request(
                     blocked: false,
                     detail: "",
                 },
-            );
+            )
+            .await;
         }
         return result;
     }
@@ -669,7 +677,8 @@ async fn handle_request(
                     blocked: false,
                     detail: "",
                 },
-            );
+            )
+            .await;
         }
         return result;
     }
@@ -746,6 +755,7 @@ fn build_management_app(state: AppState) -> Router {
             "/api/monitoring/request-details",
             get(monitoring::request_details),
         )
+        .route("/api/monitoring/block-logs", get(monitoring::block_logs))
         .route("/api/monitoring/audit-logs", get(monitoring::audit_logs))
         .route("/api/monitoring/logs", get(monitoring::list_activity_logs))
         .route(
@@ -905,7 +915,7 @@ struct ProxyRequestDetailInput<'a> {
     detail: &'a str,
 }
 
-fn record_proxy_request_detail(
+async fn record_proxy_request_detail(
     state: &AppState,
     config: &Config,
     input: ProxyRequestDetailInput<'_>,
@@ -935,6 +945,32 @@ fn record_proxy_request_detail(
             blocked: input.blocked,
             detail: input.detail,
         });
+    if input.blocked {
+        let ip_location_text = state
+            .ip_location
+            .lookup(input.playback_ip)
+            .await
+            .map(|location| location.display_text())
+            .unwrap_or_default();
+        state.block_log.record(block_log::BlockLogInsert {
+            event_type: "request",
+            timestamp_ms: input.started_at_ms,
+            server_id: &server_id,
+            server_name: &server_name,
+            port: config.port,
+            method: input.method,
+            path,
+            path_type: input.path_type,
+            status_code: input.status_code,
+            outcome: input.outcome,
+            duration_ms: input.duration_ms,
+            playback_user: input.playback_user,
+            playback_ip: input.playback_ip,
+            ip_location_text: &ip_location_text,
+            cache_hit: input.cache_hit,
+            detail: input.detail,
+        });
+    }
 }
 
 fn request_path_type(path: &str) -> &'static str {
@@ -1088,7 +1124,8 @@ async fn proxy_to_emby_recorded(
                         blocked: false,
                         detail: "",
                     },
-                );
+                )
+                .await;
                 record_significant_proxy_result(
                     state,
                     config,
@@ -1140,7 +1177,8 @@ async fn proxy_to_emby_recorded(
                         blocked: false,
                         detail: &err.to_string(),
                     },
-                );
+                )
+                .await;
             }
         }
     }
@@ -1165,7 +1203,7 @@ async fn update_check(
 ) -> AppResult<Json<UpdateCheckResponse>> {
     auth::require_auth(&state, &headers).await?;
     let now = now_ms();
-    if !query.force.unwrap_or(false)
+    if !is_force_update_check(&query)
         && let Some((checked_at, cached)) = state.update_check.lock().await.as_ref()
         && now.saturating_sub(*checked_at) < 6 * 3600 * 1000
     {
@@ -1194,6 +1232,15 @@ async fn update_check(
     };
     *state.update_check.lock().await = Some((now, response.clone()));
     Ok(Json(response))
+}
+
+fn is_force_update_check(query: &UpdateCheckQuery) -> bool {
+    query.force.as_deref().map(str::trim).is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn normalize_version(value: &str) -> Vec<u64> {
@@ -1318,7 +1365,8 @@ async fn handle_playback_info(
                 blocked: false,
                 detail: "",
             },
-        );
+        )
+        .await;
         return proxy::body_response(status, response_headers, text);
     }
 
@@ -1340,7 +1388,8 @@ async fn handle_playback_info(
                 blocked: false,
                 detail: "非 JSON 响应",
             },
-        );
+        )
+        .await;
         return proxy::body_response(status, response_headers, text);
     };
     let stream_query = playback_stream_query(query.as_deref().unwrap_or(""), &headers);
@@ -1363,7 +1412,8 @@ async fn handle_playback_info(
             blocked: false,
             detail: "",
         },
-    );
+    )
+    .await;
     proxy::body_response(
         status,
         rewrite::json_headers(),
@@ -1399,7 +1449,8 @@ async fn handle_video_stream(
                 blocked: false,
                 detail: "缺少媒体项目 ID",
             },
-        );
+        )
+        .await;
         return Ok((StatusCode::BAD_REQUEST, "Bad Request").into_response());
     };
 
@@ -1449,7 +1500,8 @@ async fn handle_video_stream(
                 blocked: true,
                 detail: &item_id,
             },
-        );
+        )
+        .await;
         return Ok((
             StatusCode::TOO_MANY_REQUESTS,
             "playback rate limit exceeded",
@@ -1496,7 +1548,8 @@ async fn handle_video_stream(
                 blocked: false,
                 detail: &cached,
             },
-        );
+        )
+        .await;
         return Ok(proxy::redirect_response(cached));
     }
 
@@ -1542,7 +1595,8 @@ async fn handle_video_stream(
                         blocked: false,
                         detail: &err.to_string(),
                     },
-                );
+                )
+                .await;
                 return Err(err);
             }
         };
@@ -1589,7 +1643,8 @@ async fn handle_video_stream(
                 blocked: false,
                 detail: &redirect_url,
             },
-        );
+        )
+        .await;
         return Ok(proxy::redirect_response(redirect_url));
     }
 
@@ -1661,7 +1716,8 @@ async fn handle_video_stream(
             blocked: false,
             detail: &raw_url,
         },
-    );
+    )
+    .await;
     Ok(proxy::redirect_response(raw_url))
 }
 
@@ -2143,6 +2199,7 @@ mod tests {
             settings_store,
             crypto_keys: CryptoKeys::generate().unwrap(),
             activity_log: Arc::new(ActivityLogStore::new(100)),
+            block_log: Arc::new(BlockLogStore::new()),
             ip_location: Arc::new(ip_location::IpLocationStore::new()),
             connectivity: Arc::new(connectivity::ConnectivityMonitor::new()),
             proxy_manager: None,

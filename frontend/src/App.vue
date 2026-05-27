@@ -160,6 +160,7 @@ type IpLocation = {
 
 type ProxyRequestDetail = {
   id: number
+  event_type?: 'request' | 'block' | 'unblock'
   timestamp_ms: number
   server_id: string
   server_name: string
@@ -298,7 +299,7 @@ type AuthMode = 'loading' | 'setup' | 'login' | 'app'
 type Page = 'home' | 'server' | 'clients' | 'notifications' | 'backup' | 'logs' | 'account'
 type ClientStatusFilter = 'all' | 'blocked' | 'allowed'
 type LogKindFilter = 'all' | 'playback' | 'general'
-type LogViewFilter = 'playback' | 'proxy' | 'general'
+type LogViewFilter = 'playback' | 'blocked' | 'proxy' | 'general'
 type EncryptionPublicKey =
   | { kind: 'webcrypto'; key: CryptoKey }
   | { kind: 'forge'; key: forge.pki.rsa.PublicKey }
@@ -461,6 +462,7 @@ const activityLogLoadStep = 80
 const requestDetailLoadStep = 100
 const logViewLabels: Record<LogViewFilter, string> = {
   playback: '播放日志',
+  blocked: '拦截日志明细',
   proxy: '反代请求明细',
   general: '信息',
 }
@@ -526,12 +528,19 @@ const canLoadMoreGeneralLogs = computed(() =>
     && generalLogLimit.value < activityLogMaxLimit,
 )
 const canLoadMoreRequestDetails = computed(() =>
-  selectedLogView.value === 'proxy'
+  isRequestDetailLogView.value
     && requestDetailRows.value.length >= requestDetailLimit.value
     && requestDetailLimit.value < requestDetailDisplayMax,
 )
+const isRequestDetailLogView = computed(() => selectedLogView.value === 'proxy' || selectedLogView.value === 'blocked')
 const logLevelOptions = computed(() => {
-  if (selectedLogView.value === 'proxy') {
+  if (selectedLogView.value === 'blocked') {
+    return [
+      { value: 'all', label: '全部级别' },
+      { value: 'blocked', label: 'BLOCKED - 已拦截' },
+    ]
+  }
+  if (isRequestDetailLogView.value) {
     return [
       { value: 'all', label: '全部级别' },
       { value: 'success', label: 'SUCCESS - 成功' },
@@ -567,11 +576,11 @@ const filteredRequestDetailRows = computed(() =>
   }),
 )
 const visibleLogCount = computed(() => {
-  if (selectedLogView.value === 'proxy') return filteredRequestDetailRows.value.length
+  if (isRequestDetailLogView.value) return filteredRequestDetailRows.value.length
   return visibleActivityLogRows.value.length
 })
 const canLoadMoreSelectedLogs = computed(() => {
-  if (selectedLogView.value === 'proxy') return canLoadMoreRequestDetails.value
+  if (isRequestDetailLogView.value) return canLoadMoreRequestDetails.value
   if (selectedLogView.value === 'general') return canLoadMoreGeneralLogs.value
   return canLoadMorePlaybackLogs.value
 })
@@ -790,14 +799,7 @@ async function refreshUpdateCheck(force = true) {
   updateChecking.value = true
   updateCheckError.value = ''
   try {
-    updateCheck.value = await api<UpdateCheck>(`/api/app-info/update-check${force ? '?force=1' : ''}`)
-    if (force) {
-      showNotice(
-        updateCheck.value.has_update
-          ? `发现新版本 ${updateCheck.value.latest_version}`
-          : `已是最新版本 ${updateCheck.value.current_version}`,
-      )
-    }
+    updateCheck.value = await api<UpdateCheck>(`/api/app-info/update-check${force ? '?force=true' : ''}`)
   } catch (err) {
     updateCheck.value = null
     updateCheckError.value = err instanceof Error ? err.message : String(err)
@@ -1593,7 +1595,10 @@ async function fetchProxyRequestDetails() {
   if (logKeywordFilter.value.trim()) params.set('keyword', logKeywordFilter.value.trim())
   if (logSince.value) params.set('since_ms', String(new Date(logSince.value).getTime()))
   if (logUntil.value) params.set('until_ms', String(new Date(logUntil.value).getTime()))
-  return api<ProxyRequestDetail[]>(`/api/monitoring/request-details?${params.toString()}`)
+  const endpoint = selectedLogView.value === 'blocked'
+    ? '/api/monitoring/block-logs'
+    : '/api/monitoring/request-details'
+  return api<ProxyRequestDetail[]>(`${endpoint}?${params.toString()}`)
 }
 
 function loadMorePlaybackLogs() {
@@ -1615,7 +1620,7 @@ function loadMoreRequestDetails() {
 }
 
 function loadMoreSelectedLogs() {
-  if (selectedLogView.value === 'proxy') return loadMoreRequestDetails()
+  if (isRequestDetailLogView.value) return loadMoreRequestDetails()
   if (selectedLogView.value === 'general') return loadMoreGeneralLogs()
   return loadMorePlaybackLogs()
 }
@@ -1628,6 +1633,7 @@ function handleScrollableLogListScroll(event: Event, loadMore: () => void) {
 }
 
 function requestSeverity(row: ProxyRequestDetail) {
+  if (row.event_type === 'unblock') return 'success'
   if (row.blocked) return 'blocked'
   if (row.cache_hit) return 'cache'
   if (row.status_code >= 500) return 'error'
@@ -1637,6 +1643,8 @@ function requestSeverity(row: ProxyRequestDetail) {
 }
 
 function requestSeverityLabel(row: ProxyRequestDetail) {
+  if (row.event_type === 'block') return '封禁动作'
+  if (row.event_type === 'unblock') return '解除封禁'
   const severity = requestSeverity(row)
   if (severity === 'blocked') return '已拦截'
   if (severity === 'cache') return '缓存'
@@ -1940,6 +1948,7 @@ function logLevelLabel(level: ActivityLogEntry['level']) {
 }
 
 function requestPathTypeLabel(type: string) {
+  if (type === 'rate_limit_action') return '封禁动作'
   if (type === 'video_stream') return '视频流'
   if (type === 'playback_info') return '播放信息'
   if (type === 'system_info') return '系统信息'
@@ -1947,7 +1956,14 @@ function requestPathTypeLabel(type: string) {
   return '普通代理'
 }
 
+function requestRowTitle(row: ProxyRequestDetail) {
+  if (row.event_type === 'block') return `封禁 ${row.playback_ip || '--'}`
+  if (row.event_type === 'unblock') return `解除封禁 ${row.playback_ip || '--'}`
+  return `${row.method} ${row.path}`
+}
+
 function requestOutcomeClass(row: ProxyRequestDetail) {
+  if (row.event_type === 'unblock') return 'ok'
   if (row.blocked) return 'blocked'
   if (row.cache_hit) return 'cache'
   if (row.status_code >= 500) return 'error'
@@ -2021,6 +2037,7 @@ onBeforeUnmount(stopDashboardPolling)
             {{ appInfo.version || '版本读取中' }}
             <span v-if="updateChecking" class="brand-version-badge">检查中</span>
             <span v-else-if="updateCheck?.has_update" class="brand-version-badge update">有更新</span>
+            <span v-else-if="updateCheck" class="brand-version-badge latest">最新</span>
             <span v-else-if="updateCheckError" class="brand-version-badge error">失败</span>
           </small>
         </button>
@@ -2899,7 +2916,7 @@ onBeforeUnmount(stopDashboardPolling)
               <div>
                 <h2>日志</h2>
                 <p class="muted">
-                  单列表查看播放日志、反代请求明细和运行信息，页面打开时每 3 秒自动刷新。
+                  单列表查看播放日志、拦截日志明细、反代请求明细和运行信息，页面打开时每 3 秒自动刷新。
                 </p>
               </div>
               <div class="panel-actions">
@@ -2907,15 +2924,16 @@ onBeforeUnmount(stopDashboardPolling)
                 <button class="secondary" :disabled="logsLoading" @click="refreshActivityLogs">
                   {{ logsLoading ? '刷新中' : '刷新' }}
                 </button>
-                <button v-if="selectedLogView !== 'proxy'" class="secondary" @click="exportLogs">导出 CSV</button>
+                <button v-if="!isRequestDetailLogView" class="secondary" @click="exportLogs">导出 CSV</button>
               </div>
             </div>
             <div v-if="logsError" class="notice error">{{ logsError }}</div>
-            <div :class="['log-toolbar', 'compact', { proxy: selectedLogView === 'proxy' }]">
+            <div :class="['log-toolbar', 'compact', { proxy: isRequestDetailLogView }]">
               <label>
                 <span>日志类型</span>
                 <select v-model="selectedLogView" @change="handleLogViewChange">
                   <option value="playback">播放日志</option>
+                  <option value="blocked">拦截日志明细</option>
                   <option value="proxy">反代请求明细</option>
                   <option value="general">信息</option>
                 </select>
@@ -2937,7 +2955,7 @@ onBeforeUnmount(stopDashboardPolling)
                   </option>
                 </select>
               </label>
-              <label v-if="selectedLogView === 'proxy'">
+              <label v-if="isRequestDetailLogView">
                 <span>请求类型</span>
                 <select v-model="selectedRequestPathType" @change="refreshLogsWithReset">
                   <option value="all">全部请求</option>
@@ -2945,6 +2963,7 @@ onBeforeUnmount(stopDashboardPolling)
                   <option value="playback_info">播放信息</option>
                   <option value="system_info">系统信息</option>
                   <option value="base_html_player">播放器脚本</option>
+                  <option v-if="selectedLogView === 'blocked'" value="rate_limit_action">封禁动作</option>
                   <option value="proxy">普通代理</option>
                 </select>
               </label>
@@ -2968,7 +2987,7 @@ onBeforeUnmount(stopDashboardPolling)
             <div class="log-console-meta">
               <span>{{ selectedLogViewLabel }}</span>
               <strong>{{ visibleLogCount }}</strong>
-              <span v-if="selectedLogView === 'proxy'">
+              <span v-if="isRequestDetailLogView">
                 单次最多 {{ requestDetailDisplayMax }} 条，保留 {{ requestDetailPersistDays }} 天或最近 {{ requestDetailPersistMax }} 条
               </span>
               <span v-else>内存最多保留最近 {{ activityLogMaxLimit }} 条可视化日志</span>
@@ -2979,7 +2998,7 @@ onBeforeUnmount(stopDashboardPolling)
               class="log-console-list"
               @scroll="handleScrollableLogListScroll($event, loadMoreSelectedLogs)"
             >
-              <template v-if="selectedLogView !== 'proxy'">
+              <template v-if="!isRequestDetailLogView">
                 <article
                   v-for="entry in visibleActivityLogRows"
                   :key="`activity-${entry.id}`"
@@ -3013,17 +3032,17 @@ onBeforeUnmount(stopDashboardPolling)
                       <span class="request-time">{{ formatLogTime(row.timestamp_ms) }}</span>
                     </div>
                     <div class="request-path">
-                      <strong>{{ row.method }} {{ row.path }}</strong>
+                      <strong>{{ requestRowTitle(row) }}</strong>
                       <span>{{ row.detail }}</span>
                     </div>
                   </div>
                   <div class="request-state">
                     <span>{{ row.outcome }}</span>
-                    <span>{{ row.path_type }}</span>
-                    <span>HTTP {{ row.status_code }}</span>
-                    <span>{{ row.duration_ms }}ms</span>
-                    <span>{{ row.cache_hit ? '缓存命中' : '未命中' }}</span>
-                    <span>{{ row.blocked ? '已拦截' : '未拦截' }}</span>
+                    <span>{{ requestPathTypeLabel(row.path_type) }}</span>
+                    <span v-if="row.event_type !== 'block' && row.event_type !== 'unblock'">HTTP {{ row.status_code }}</span>
+                    <span v-if="row.event_type !== 'block' && row.event_type !== 'unblock'">{{ row.duration_ms }}ms</span>
+                    <span v-if="row.event_type !== 'block' && row.event_type !== 'unblock'">{{ row.cache_hit ? '缓存命中' : '未命中' }}</span>
+                    <span>{{ row.event_type === 'unblock' ? '已解除' : row.blocked ? '已拦截' : '未拦截' }}</span>
                   </div>
                 </article>
               </template>

@@ -32,6 +32,23 @@ impl IpLocation {
             && self.district_name.is_empty()
             && self.isp_domain.is_empty()
     }
+
+    pub fn display_text(&self) -> String {
+        let mut parts = Vec::new();
+        for value in [
+            &self.country_name,
+            &self.region_name,
+            &self.city_name,
+            &self.district_name,
+            &self.isp_domain,
+        ] {
+            let value = value.trim();
+            if !value.is_empty() && !parts.contains(&value) {
+                parts.push(value);
+            }
+        }
+        parts.join(" ")
+    }
 }
 
 #[derive(Clone)]

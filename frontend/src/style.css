@@ -228,6 +228,11 @@ button:disabled {
   color: var(--warn-text);
 }
 
+.brand-version-badge.latest {
+  background: var(--success-bg);
+  color: var(--success-text);
+}
+
 .brand-version-badge.error {
   background: var(--danger-bg);
   color: var(--danger-text);

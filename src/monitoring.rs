@@ -59,6 +59,16 @@ pub struct RequestDetailQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BlockLogQuery {
+    server_id: Option<String>,
+    path_type: Option<String>,
+    keyword: Option<String>,
+    since_ms: Option<u128>,
+    until_ms: Option<u128>,
+    limit: Option<usize>,
+}
+
 pub async fn media_overview(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -275,6 +285,26 @@ pub async fn request_details(
                 until_ms: query.until_ms,
                 limit: query.limit.unwrap_or(200),
             })?;
+    for row in &mut rows {
+        row.ip_location = state.ip_location.lookup(&row.playback_ip).await;
+    }
+    Ok(Json(rows))
+}
+
+pub async fn block_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<BlockLogQuery>,
+) -> AppResult<Json<Vec<crate::block_log::BlockLogEntry>>> {
+    auth::require_auth(&state, &headers).await?;
+    let mut rows = state.block_log.list(crate::block_log::BlockLogFilter {
+        server_id: query.server_id.as_deref().filter(|value| *value != "all"),
+        path_type: query.path_type.as_deref().filter(|value| *value != "all"),
+        keyword: query.keyword.as_deref(),
+        since_ms: query.since_ms,
+        until_ms: query.until_ms,
+        limit: query.limit.unwrap_or(200),
+    })?;
     for row in &mut rows {
         row.ip_location = state.ip_location.lookup(&row.playback_ip).await;
     }

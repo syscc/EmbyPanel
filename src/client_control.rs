@@ -412,6 +412,34 @@ pub async fn unblock_rate_limit(
             blocked_until
         ),
     )?;
+    let ip_location_text = state
+        .ip_location
+        .lookup(&ip)
+        .await
+        .map(|location| location.display_text())
+        .unwrap_or_default();
+    state.block_log.record(crate::block_log::BlockLogInsert {
+        event_type: "unblock",
+        timestamp_ms: now_millis(),
+        server_id: &server_id,
+        server_name: &server_name,
+        port: 0,
+        method: "ACTION",
+        path: "rate_limit/unblock",
+        path_type: "rate_limit_action",
+        status_code: 200,
+        outcome: "解除封禁",
+        duration_ms: 0,
+        playback_user: &user_name,
+        playback_ip: &ip,
+        ip_location_text: &ip_location_text,
+        cache_hit: false,
+        detail: &format!(
+            "方式: {}; 原到期: {}",
+            rate_limit_action_label(&action),
+            blocked_until
+        ),
+    });
     Ok(Json(enrich_client_control_response(&state, config).await))
 }
 
@@ -993,6 +1021,13 @@ fn now_seconds() -> u64 {
         .as_secs()
 }
 
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 fn normalize_client_name(user_agent: &str) -> String {
     let ua = user_agent.to_ascii_lowercase();
     if ua.contains("android tv") || ua.contains("shield") || ua.contains("kodi") {
@@ -1313,6 +1348,32 @@ pub async fn enforce_playback_rate_limit(
             playback_user,
             blocked_until,
         );
+        let ip_location_text = state
+            .ip_location
+            .lookup(playback_ip)
+            .await
+            .map(|location| location.display_text())
+            .unwrap_or_default();
+        state.block_log.record(crate::block_log::BlockLogInsert {
+            event_type: "block",
+            timestamp_ms: now as u128 * 1000,
+            server_id: input.server_id,
+            server_name: input.server_name,
+            port: input.runtime_config.port,
+            method: "ACTION",
+            path: "rate_limit/block",
+            path_type: "rate_limit_action",
+            status_code: 429,
+            outcome: rate_limit_action_label(&action),
+            duration_ms: 0,
+            playback_user,
+            playback_ip,
+            ip_location_text: &ip_location_text,
+            cache_hit: false,
+            detail: &format!(
+                "窗口: {window}s; 阈值: {max_requests}; 封禁: {block_seconds}s; 到期: {blocked_until}"
+            ),
+        });
         changed = true;
 
         if notify_enabled {

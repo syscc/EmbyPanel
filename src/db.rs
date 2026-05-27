@@ -4,7 +4,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, ToSql, params};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{config::Config, error::AppResult, ip_location::IpLocation};
@@ -444,17 +444,69 @@ impl SettingsStore {
         filter: ProxyRequestDetailFilter<'_>,
     ) -> AppResult<Vec<ProxyRequestDetail>> {
         let conn = self.connection()?;
-        let mut stmt = conn.prepare(
+        let mut conditions = Vec::new();
+        let mut values: Vec<Box<dyn ToSql>> = Vec::new();
+        if let Some(server_id) = filter.server_id {
+            conditions.push("server_id = ?");
+            values.push(Box::new(server_id.to_string()));
+        }
+        if let Some(path_type) = filter.path_type {
+            conditions.push("path_type = ?");
+            values.push(Box::new(path_type.to_string()));
+        }
+        if let Some(since_ms) = filter.since_ms {
+            conditions.push("timestamp_ms >= ?");
+            values.push(Box::new(since_ms as i64));
+        }
+        if let Some(until_ms) = filter.until_ms {
+            conditions.push("timestamp_ms <= ?");
+            values.push(Box::new(until_ms as i64));
+        }
+        if let Some(keyword) = filter
+            .keyword
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let keyword = format!("%{}%", keyword.to_ascii_lowercase());
+            conditions.push(
+                r#"(lower(server_name) LIKE ?
+                    OR lower(method) LIKE ?
+                    OR lower(path) LIKE ?
+                    OR lower(path_type) LIKE ?
+                    OR lower(outcome) LIKE ?
+                    OR lower(playback_user) LIKE ?
+                    OR lower(playback_ip) LIKE ?
+                    OR lower(detail) LIKE ?)"#,
+            );
+            for _ in 0..8 {
+                values.push(Box::new(keyword.clone()));
+            }
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+        let limit = filter.limit.clamp(1, 500) as i64;
+        values.push(Box::new(limit));
+        let params = values
+            .iter()
+            .map(|value| value.as_ref() as &dyn ToSql)
+            .collect::<Vec<_>>();
+        let sql = format!(
             r#"
             SELECT id, timestamp_ms, server_id, server_name, port, method, path, path_type,
                    status_code, outcome, duration_ms, playback_user, playback_ip,
                    cache_hit, blocked, detail
             FROM proxy_request_logs
+            {where_clause}
             ORDER BY timestamp_ms DESC, id DESC
-            LIMIT 2000
+            LIMIT ?
             "#,
-        )?;
-        let rows = stmt.query_map([], |row| {
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |row| {
             Ok(ProxyRequestDetail {
                 id: row.get(0)?,
                 timestamp_ms: row.get::<_, i64>(1)? as u128,
@@ -475,57 +527,47 @@ impl SettingsStore {
                 detail: row.get(15)?,
             })
         })?;
-        let keyword = filter.keyword.map(str::to_ascii_lowercase);
-        let mut entries = Vec::new();
-        for row in rows {
-            let entry = row?;
-            if filter
-                .server_id
-                .is_some_and(|server_id| entry.server_id != server_id)
-            {
-                continue;
-            }
-            if filter
-                .path_type
-                .is_some_and(|path_type| entry.path_type != path_type)
-            {
-                continue;
-            }
-            if filter
-                .since_ms
-                .is_some_and(|since| entry.timestamp_ms < since)
-            {
-                continue;
-            }
-            if filter
-                .until_ms
-                .is_some_and(|until| entry.timestamp_ms > until)
-            {
-                continue;
-            }
-            if let Some(keyword) = keyword.as_ref() {
-                let haystack = format!(
-                    "{} {} {} {} {} {} {} {}",
-                    entry.server_name,
-                    entry.method,
-                    entry.path,
-                    entry.path_type,
-                    entry.outcome,
-                    entry.playback_user,
-                    entry.playback_ip,
-                    entry.detail
-                )
-                .to_ascii_lowercase();
-                if !haystack.contains(keyword) {
-                    continue;
-                }
-            }
-            entries.push(entry);
-            if entries.len() >= filter.limit.clamp(1, 500) {
-                break;
-            }
-        }
-        Ok(entries)
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_blocked_proxy_request_details(
+        &self,
+        limit: usize,
+    ) -> AppResult<Vec<ProxyRequestDetail>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, timestamp_ms, server_id, server_name, port, method, path, path_type,
+                   status_code, outcome, duration_ms, playback_user, playback_ip,
+                   cache_hit, blocked, detail
+            FROM proxy_request_logs
+            WHERE blocked = TRUE
+            ORDER BY timestamp_ms DESC, id DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map([limit.clamp(1, 500) as i64], |row| {
+            Ok(ProxyRequestDetail {
+                id: row.get(0)?,
+                timestamp_ms: row.get::<_, i64>(1)? as u128,
+                server_id: row.get(2)?,
+                server_name: row.get(3)?,
+                port: row.get(4)?,
+                method: row.get(5)?,
+                path: row.get(6)?,
+                path_type: row.get(7)?,
+                status_code: row.get(8)?,
+                outcome: row.get(9)?,
+                duration_ms: row.get::<_, i64>(10)? as u128,
+                playback_user: row.get(11)?,
+                playback_ip: row.get(12)?,
+                ip_location: None,
+                cache_hit: row.get(13)?,
+                blocked: row.get(14)?,
+                detail: row.get(15)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     fn prune_audit_logs(&self, conn: &Connection, keep_days: i64, max_rows: i64) -> AppResult<()> {
