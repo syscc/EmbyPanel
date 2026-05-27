@@ -1926,7 +1926,7 @@ textarea:focus {
     top: 0;
     height: auto;
     display: grid;
-    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
     gap: 10px;
     border-right: 0;
@@ -1935,15 +1935,21 @@ textarea:focus {
   }
 
   .sidebar .brand-row.compact {
+    min-width: 0;
     padding: 0;
   }
 
-  .sidebar .brand-row.compact strong,
-  .sidebar .brand-row.compact small {
-    display: none;
+  .sidebar .brand-version strong,
+  .sidebar .brand-version small {
+    overflow: hidden;
+    max-width: 42vw;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   nav {
+    grid-column: 1 / -1;
+    grid-row: 2;
     display: flex;
     gap: 6px;
     min-width: 0;
@@ -1966,6 +1972,8 @@ textarea:focus {
   }
 
   .nav-item.logout {
+    grid-column: 2;
+    grid-row: 1;
     width: auto;
     margin-top: 0;
     min-width: max-content;
@@ -2264,11 +2272,12 @@ textarea:focus {
   }
 
   .sidebar {
-    grid-template-columns: 30px minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr) auto;
   }
 
   .nav-item.logout {
-    grid-column: 1 / -1;
+    grid-column: 2;
+    grid-row: 1;
     justify-content: center;
   }
 
