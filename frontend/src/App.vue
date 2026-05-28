@@ -594,13 +594,7 @@ const clientRuleRows = computed(() =>
     .filter((record) => {
       const keyword = clientKeywordFilter.value.trim().toLowerCase()
       if (!keyword) return true
-      return [
-        record.user_agent,
-        record.client_name,
-        record.device_name,
-        record.user_name,
-        record.note,
-      ].some((value) => value.toLowerCase().includes(keyword))
+      return record.user_agent.toLowerCase().includes(keyword)
     })
     .sort((left, right) => Number(right.updated_at) - Number(left.updated_at)),
 )
@@ -1978,6 +1972,13 @@ function clientKeyword(record: ClientRuleRecord) {
   return record.user_agent || record.client_name || '--'
 }
 
+function clientSubtext(record: ClientRuleRecord) {
+  const keyword = clientKeyword(record).trim().toLowerCase()
+  const client = record.client_name.trim()
+  if (!client || client.toLowerCase() === keyword) return ''
+  return client
+}
+
 onMounted(bootstrap)
 onBeforeUnmount(stopDashboardPolling)
 </script>
@@ -2658,7 +2659,7 @@ onBeforeUnmount(stopDashboardPolling)
               <input
                 v-model="clientKeywordFilter"
                 class="client-search"
-                placeholder="搜索 UA / 客户端 / 设备 / 用户 / 描述"
+                placeholder="搜索 UA"
               />
               <button
                 class="secondary"
@@ -2761,11 +2762,10 @@ onBeforeUnmount(stopDashboardPolling)
                   <tr v-for="record in clientRuleRows" :key="record.id">
                     <td>
                       <strong>{{ clientKeyword(record) }}</strong>
-                      <small>{{ record.client_name }} · {{ record.device_name }} · {{ record.user_name }}</small>
+                      <small v-if="clientSubtext(record)">{{ clientSubtext(record) }}</small>
                     </td>
                     <td>
                       <span>{{ record.note || (record.source === 'auto' ? '自动记录播放设备' : '手动 UA 拦截') }}</span>
-                      <small>{{ record.source === 'auto' ? '自动记录' : '手动添加' }}</small>
                     </td>
                     <td>
                       <span :class="['client-badge', record.enabled ? 'blocked' : 'allowed']">

@@ -249,7 +249,7 @@ pub async fn add_user_agent_rule(
     let payload: AddUserAgentRuleRequest =
         state.crypto_keys.decrypt_named(&request, "client_rule")?;
     let mut config = load_or_default(&state)?;
-    let user_agent = payload.user_agent.trim().to_string();
+    let user_agent = normalize_manual_user_agent_rule(&payload.user_agent);
     if user_agent.is_empty() {
         return Err(AppError::Validation(
             "user_agent cannot be empty".to_string(),
@@ -603,7 +603,7 @@ pub fn record_client_event(
     user_name: String,
     user_agent: String,
 ) -> AppResult<()> {
-    let user_agent = user_agent.trim().to_string();
+    let user_agent = normalize_auto_user_agent_rule(&user_agent);
     if user_agent.is_empty() {
         return Ok(());
     }
@@ -659,7 +659,9 @@ fn load_or_default(state: &AppState) -> AppResult<ClientControlConfig> {
         .load_setting_json(SETTING_KEY)?
         .unwrap_or_else(default_config);
     migrate_webhook_config(&mut config);
-    if prune_inactive_rate_limit_blocks(&mut config, now_seconds()) {
+    let mut changed = normalize_client_rule_records(&mut config);
+    changed |= prune_inactive_rate_limit_blocks(&mut config, now_seconds());
+    if changed {
         state
             .settings_store
             .save_setting_json(SETTING_KEY, &config)?;
@@ -1445,6 +1447,84 @@ fn normalize_value(value: &str) -> String {
     }
 }
 
+fn normalize_manual_user_agent_rule(user_agent: &str) -> String {
+    user_agent.trim().to_string()
+}
+
+fn normalize_auto_user_agent_rule(user_agent: &str) -> String {
+    let value = normalize_manual_user_agent_rule(user_agent);
+    if value.is_empty() {
+        return String::new();
+    }
+    if let Some((name, version)) = value.as_str().rsplit_once('/')
+        && is_version_like(version)
+        && !name.trim().is_empty()
+    {
+        return name.trim().to_string();
+    }
+    value
+}
+
+fn is_version_like(value: &str) -> bool {
+    let value = value
+        .trim()
+        .split_once(' ')
+        .map_or(value.trim(), |(version, _)| version);
+    !value.is_empty()
+        && value.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+        && value
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_alphanumeric()))
+}
+
+fn normalize_client_rule_records(config: &mut ClientControlConfig) -> bool {
+    let mut changed = false;
+    let mut normalized = Vec::<ClientRuleRecord>::new();
+    for mut record in std::mem::take(&mut config.records) {
+        let normalized_ua = match record.source {
+            ClientRuleSource::Auto => normalize_auto_user_agent_rule(&record.user_agent),
+            ClientRuleSource::Manual => normalize_manual_user_agent_rule(&record.user_agent),
+        };
+        if normalized_ua.is_empty() {
+            changed = true;
+            continue;
+        }
+        if record.user_agent != normalized_ua {
+            record.user_agent = normalized_ua;
+            changed = true;
+        }
+        if let Some(existing) = normalized
+            .iter_mut()
+            .find(|item| item.user_agent.eq_ignore_ascii_case(&record.user_agent))
+        {
+            merge_client_rule_record(existing, record);
+            changed = true;
+        } else {
+            normalized.push(record);
+        }
+    }
+    config.records = normalized;
+    changed
+}
+
+fn merge_client_rule_record(existing: &mut ClientRuleRecord, incoming: ClientRuleRecord) {
+    existing.enabled |= incoming.enabled;
+    if incoming.updated_at > existing.updated_at {
+        existing.client_name = incoming.client_name;
+        existing.device_name = incoming.device_name;
+        existing.user_name = incoming.user_name;
+        existing.updated_at = incoming.updated_at;
+    }
+    if existing.note.trim().is_empty() || existing.note == "自动记录播放设备" {
+        existing.note = incoming.note;
+    }
+    if matches!(existing.source, ClientRuleSource::Auto)
+        && matches!(incoming.source, ClientRuleSource::Manual)
+    {
+        existing.source = ClientRuleSource::Manual;
+    }
+}
+
 fn rule_matches(record: &ClientRuleRecord, user_agent: &str) -> bool {
     let rule_ua = record.user_agent.trim().to_ascii_lowercase();
     if rule_ua.is_empty() {
@@ -1485,5 +1565,100 @@ mod tests {
         let record = rule("infuse-library", "Infuse-Direct");
 
         assert!(!rule_matches(&record, "Infuse-Direct/8.0"));
+    }
+
+    #[test]
+    fn ua_rule_does_not_match_device_or_user_only() {
+        let record = ClientRuleRecord {
+            id: "rule-1".to_string(),
+            client_name: "网易爆米花 iOS".to_string(),
+            device_name: "AppleTV14".to_string(),
+            user_name: "jhoupeng".to_string(),
+            user_agent: "网易爆米花 iOS/2.6.9".to_string(),
+            source: ClientRuleSource::Auto,
+            enabled: true,
+            created_at: "0".to_string(),
+            updated_at: "0".to_string(),
+            note: String::new(),
+        };
+
+        assert!(!rule_matches(&record, "AppleTV14"));
+        assert!(!rule_matches(&record, "jhoupeng"));
+    }
+
+    #[test]
+    fn normalizes_auto_versioned_client_user_agents() {
+        assert_eq!(
+            normalize_auto_user_agent_rule("Infuse-Direct/8.4.5"),
+            "Infuse-Direct"
+        );
+        assert_eq!(normalize_auto_user_agent_rule("VidHub/2.3.0"), "VidHub");
+        assert_eq!(
+            normalize_auto_user_agent_rule("AndroidTv/2.0.95g"),
+            "AndroidTv"
+        );
+        assert_eq!(
+            normalize_auto_user_agent_rule("网易爆米花 iOS/2.6.9"),
+            "网易爆米花 iOS"
+        );
+        assert_eq!(
+            normalize_auto_user_agent_rule("Emby for Apple TV/1.9.8 (2)"),
+            "Emby for Apple TV"
+        );
+        assert_eq!(normalize_auto_user_agent_rule("Mozilla/5.0"), "Mozilla");
+        assert_eq!(
+            normalize_auto_user_agent_rule("CustomClient/beta"),
+            "CustomClient/beta"
+        );
+    }
+
+    #[test]
+    fn keeps_manual_versioned_user_agent_rules_precise() {
+        assert_eq!(
+            normalize_manual_user_agent_rule("VidHub/2.2.9"),
+            "VidHub/2.2.9"
+        );
+        let precise = rule("VidHub/2.2.9", "VidHub");
+        assert!(rule_matches(&precise, "VidHub/2.2.9"));
+        assert!(!rule_matches(&precise, "VidHub/2.3.0"));
+
+        let family = rule("VidHub", "VidHub");
+        assert!(rule_matches(&family, "VidHub/2.2.9"));
+        assert!(rule_matches(&family, "VidHub/2.3.0"));
+    }
+
+    #[test]
+    fn merges_versioned_client_rule_records() {
+        let mut config = default_config();
+        config.records.push(ClientRuleRecord {
+            id: "old".to_string(),
+            client_name: "Infuse-Direct".to_string(),
+            device_name: "Apple TV".to_string(),
+            user_name: "Lucifinil".to_string(),
+            user_agent: "Infuse-Direct/8.4.5".to_string(),
+            source: ClientRuleSource::Auto,
+            enabled: false,
+            created_at: "100".to_string(),
+            updated_at: "100".to_string(),
+            note: "自动记录播放设备".to_string(),
+        });
+        config.records.push(ClientRuleRecord {
+            id: "new".to_string(),
+            client_name: "Infuse-Direct".to_string(),
+            device_name: "Apple TV".to_string(),
+            user_name: "王德发".to_string(),
+            user_agent: "Infuse-Direct/8.4.3".to_string(),
+            source: ClientRuleSource::Auto,
+            enabled: true,
+            created_at: "90".to_string(),
+            updated_at: "200".to_string(),
+            note: "自动记录播放设备".to_string(),
+        });
+
+        assert!(normalize_client_rule_records(&mut config));
+        assert_eq!(config.records.len(), 1);
+        assert_eq!(config.records[0].user_agent, "Infuse-Direct");
+        assert_eq!(config.records[0].user_name, "王德发");
+        assert!(config.records[0].enabled);
     }
 }
