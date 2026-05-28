@@ -45,6 +45,7 @@ struct RateLimitNotification<'a> {
     action: &'a str,
     playback_user: &'a str,
     playback_ip: &'a str,
+    ip_location_text: &'a str,
     window: u64,
     max_requests: u64,
     block_seconds: u64,
@@ -830,16 +831,23 @@ fn rate_limit_webhook_payload(
     action: &str,
     playback_user: &str,
     playback_ip: &str,
+    ip_location_text: &str,
     window: u64,
     max_requests: u64,
     block_seconds: u64,
 ) -> (String, String) {
     let action_label = rate_limit_action_label(action);
     let title = format!("播放频率限制 - {action_label}");
+    let ip_location_line = if ip_location_text.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n归属地：{}", ip_location_text.trim())
+    };
     let text = format!(
-        "服务器：{server_name}\n用户：{}\nIP：{}\n策略：{action_label}\n窗口：{window}s\n阈值：{max_requests} 次\n处理时长：{block_seconds}s",
+        "服务器：{server_name}\n用户：{}\nIP：{}{}\n策略：{action_label}\n窗口：{window}s\n阈值：{max_requests} 次\n处理时长：{block_seconds}s",
         normalize_value(playback_user),
         normalize_value(playback_ip),
+        ip_location_line,
     );
     (title, text)
 }
@@ -854,6 +862,7 @@ async fn notify_rate_limit_block(
         notification.action,
         notification.playback_user,
         notification.playback_ip,
+        notification.ip_location_text,
         notification.window,
         notification.max_requests,
         notification.block_seconds,
@@ -1386,6 +1395,7 @@ pub async fn enforce_playback_rate_limit(
                     action: &action,
                     playback_user,
                     playback_ip,
+                    ip_location_text: &ip_location_text,
                     window,
                     max_requests,
                     block_seconds,

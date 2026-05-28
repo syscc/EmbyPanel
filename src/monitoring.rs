@@ -63,6 +63,7 @@ pub struct RequestDetailQuery {
 pub struct BlockLogQuery {
     server_id: Option<String>,
     path_type: Option<String>,
+    level: Option<String>,
     keyword: Option<String>,
     since_ms: Option<u128>,
     until_ms: Option<u128>,
@@ -300,6 +301,7 @@ pub async fn block_logs(
     let mut rows = state.block_log.list(crate::block_log::BlockLogFilter {
         server_id: query.server_id.as_deref().filter(|value| *value != "all"),
         path_type: query.path_type.as_deref().filter(|value| *value != "all"),
+        level: query.level.as_deref().filter(|value| *value != "all"),
         keyword: query.keyword.as_deref(),
         since_ms: query.since_ms,
         until_ms: query.until_ms,

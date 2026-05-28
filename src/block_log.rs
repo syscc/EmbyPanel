@@ -71,6 +71,7 @@ pub struct BlockLogInsert<'a> {
 pub struct BlockLogFilter<'a> {
     pub server_id: Option<&'a str>,
     pub path_type: Option<&'a str>,
+    pub level: Option<&'a str>,
     pub keyword: Option<&'a str>,
     pub since_ms: Option<u128>,
     pub until_ms: Option<u128>,
@@ -369,6 +370,12 @@ fn matches_filter(
         return false;
     }
     if filter
+        .level
+        .is_some_and(|level| !matches_level(entry, level))
+    {
+        return false;
+    }
+    if filter
         .since_ms
         .is_some_and(|since| entry.timestamp_ms < since)
     {
@@ -399,6 +406,19 @@ fn matches_filter(
         }
     }
     true
+}
+
+fn matches_level(entry: &BlockLogEntry, level: &str) -> bool {
+    match level {
+        "blocked" => entry.event_type == "request" && entry.blocked,
+        "ban_change" => matches!(entry.event_type.as_str(), "block" | "unblock"),
+        "success" => entry.event_type == "request" && entry.status_code < 300,
+        "redirect" => entry.event_type == "request" && (300..400).contains(&entry.status_code),
+        "cache" => entry.event_type == "request" && entry.cache_hit,
+        "warn" => entry.event_type == "request" && (400..500).contains(&entry.status_code),
+        "error" => entry.event_type == "request" && entry.status_code >= 500,
+        _ => true,
+    }
 }
 
 fn default_event_type() -> String {

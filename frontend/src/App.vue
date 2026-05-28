@@ -462,9 +462,9 @@ const activityLogLoadStep = 80
 const requestDetailLoadStep = 100
 const logViewLabels: Record<LogViewFilter, string> = {
   playback: '播放日志',
-  blocked: '拦截日志明细',
-  proxy: '反代请求明细',
-  general: '信息',
+  blocked: '拦截日志',
+  proxy: '反代请求',
+  general: '运行日志',
 }
 
 const realIpModeOptions: Array<{ value: RealIpMode; label: string }> = [
@@ -533,11 +533,13 @@ const canLoadMoreRequestDetails = computed(() =>
     && requestDetailLimit.value < requestDetailDisplayMax,
 )
 const isRequestDetailLogView = computed(() => selectedLogView.value === 'proxy' || selectedLogView.value === 'blocked')
+const showLogLevelFilter = computed(() => selectedLogView.value !== 'playback')
 const logLevelOptions = computed(() => {
   if (selectedLogView.value === 'blocked') {
     return [
       { value: 'all', label: '全部级别' },
-      { value: 'blocked', label: 'BLOCKED - 已拦截' },
+      { value: 'blocked', label: '已拦截' },
+      { value: 'ban_change', label: '封禁变更' },
     ]
   }
   if (isRequestDetailLogView.value) {
@@ -554,11 +556,9 @@ const logLevelOptions = computed(() => {
   if (selectedLogView.value === 'general') {
     return [
       { value: 'all', label: '全部级别' },
-      { value: 'debug', label: 'DEBUG - 调试' },
       { value: 'info', label: 'INFO - 信息' },
       { value: 'warn', label: 'WARNING - 警告' },
       { value: 'error', label: 'ERROR - 错误' },
-      { value: 'critical', label: 'CRITICAL - 严重' },
     ]
   }
   return [
@@ -1581,7 +1581,7 @@ function logQueryParams(limit: number) {
   if (selectedLogServer.value !== 'all') params.set('server_id', selectedLogServer.value)
   if (selectedLogView.value === 'playback') params.set('kind', 'playback')
   if (selectedLogView.value === 'general') params.set('kind', 'general')
-  if (selectedLogLevel.value !== 'all') params.set('level', selectedLogLevel.value)
+  if (showLogLevelFilter.value && selectedLogLevel.value !== 'all') params.set('level', selectedLogLevel.value)
   if (logKeywordFilter.value.trim()) params.set('keyword', logKeywordFilter.value.trim())
   if (logSince.value) params.set('since_ms', String(new Date(logSince.value).getTime()))
   if (logUntil.value) params.set('until_ms', String(new Date(logUntil.value).getTime()))
@@ -1592,6 +1592,7 @@ async function fetchProxyRequestDetails() {
   const params = new URLSearchParams({ limit: String(requestDetailLimit.value) })
   if (selectedLogServer.value !== 'all') params.set('server_id', selectedLogServer.value)
   if (selectedRequestPathType.value !== 'all') params.set('path_type', selectedRequestPathType.value)
+  if (selectedLogView.value === 'blocked' && selectedLogLevel.value !== 'all') params.set('level', selectedLogLevel.value)
   if (logKeywordFilter.value.trim()) params.set('keyword', logKeywordFilter.value.trim())
   if (logSince.value) params.set('since_ms', String(new Date(logSince.value).getTime()))
   if (logUntil.value) params.set('until_ms', String(new Date(logUntil.value).getTime()))
@@ -1633,6 +1634,7 @@ function handleScrollableLogListScroll(event: Event, loadMore: () => void) {
 }
 
 function requestSeverity(row: ProxyRequestDetail) {
+  if (row.event_type === 'block') return 'blocked'
   if (row.event_type === 'unblock') return 'success'
   if (row.blocked) return 'blocked'
   if (row.cache_hit) return 'cache'
@@ -2916,7 +2918,7 @@ onBeforeUnmount(stopDashboardPolling)
               <div>
                 <h2>日志</h2>
                 <p class="muted">
-                  单列表查看播放日志、拦截日志明细、反代请求明细和运行信息，页面打开时每 3 秒自动刷新。
+                  单列表查看播放日志、拦截日志、反代请求和运行日志，页面打开时每 3 秒自动刷新。
                 </p>
               </div>
               <div class="panel-actions">
@@ -2933,12 +2935,12 @@ onBeforeUnmount(stopDashboardPolling)
                 <span>日志类型</span>
                 <select v-model="selectedLogView" @change="handleLogViewChange">
                   <option value="playback">播放日志</option>
-                  <option value="blocked">拦截日志明细</option>
-                  <option value="proxy">反代请求明细</option>
-                  <option value="general">信息</option>
+                  <option value="blocked">拦截日志</option>
+                  <option value="proxy">反代请求</option>
+                  <option value="general">运行日志</option>
                 </select>
               </label>
-              <label>
+              <label v-if="showLogLevelFilter">
                 <span>级别</span>
                 <select v-model="selectedLogLevel" @change="refreshLogsWithReset">
                   <option v-for="option in logLevelOptions" :key="option.value" :value="option.value">

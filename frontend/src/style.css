@@ -986,7 +986,7 @@ label span {
 }
 
 .log-toolbar.compact {
-  grid-template-columns: 132px 132px 142px 100px 188px 188px 188px;
+  grid-template-columns: 108px 132px 142px 100px 188px 188px 188px;
   gap: 10px;
   align-items: end;
   justify-content: start;
@@ -997,7 +997,7 @@ label span {
 }
 
 .log-toolbar.compact.proxy {
-  grid-template-columns: 132px 132px 142px 150px 100px 176px 176px 176px;
+  grid-template-columns: 108px 132px 142px 132px 100px 176px 176px 176px;
 }
 
 .log-search-field {
