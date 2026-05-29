@@ -1456,25 +1456,12 @@ fn normalize_auto_user_agent_rule(user_agent: &str) -> String {
     if value.is_empty() {
         return String::new();
     }
-    if let Some((name, version)) = value.as_str().rsplit_once('/')
-        && is_version_like(version)
+    if let Some((name, _)) = value.as_str().split_once('/')
         && !name.trim().is_empty()
     {
         return name.trim().to_string();
     }
     value
-}
-
-fn is_version_like(value: &str) -> bool {
-    let value = value
-        .trim()
-        .split_once(' ')
-        .map_or(value.trim(), |(version, _)| version);
-    !value.is_empty()
-        && value.chars().next().is_some_and(|ch| ch.is_ascii_digit())
-        && value
-            .split('.')
-            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_alphanumeric()))
 }
 
 fn normalize_client_rule_records(config: &mut ClientControlConfig) -> bool {
@@ -1605,10 +1592,18 @@ mod tests {
             normalize_auto_user_agent_rule("Emby for Apple TV/1.9.8 (2)"),
             "Emby for Apple TV"
         );
+        assert_eq!(
+            normalize_auto_user_agent_rule("Filmly/2.5.13-340"),
+            "Filmly"
+        );
+        assert_eq!(
+            normalize_auto_user_agent_rule("Filmly/2.9.21-395"),
+            "Filmly"
+        );
         assert_eq!(normalize_auto_user_agent_rule("Mozilla/5.0"), "Mozilla");
         assert_eq!(
             normalize_auto_user_agent_rule("CustomClient/beta"),
-            "CustomClient/beta"
+            "CustomClient"
         );
     }
 
