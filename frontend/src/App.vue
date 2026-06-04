@@ -572,7 +572,7 @@ const logLevelOptions = computed(() => {
 const filteredRequestDetailRows = computed(() =>
   requestDetailRows.value.filter((row) => {
     if (selectedLogLevel.value === 'all') return true
-    return requestSeverity(row) === selectedLogLevel.value
+    return requestLogLevelMatches(row, selectedLogLevel.value)
   }),
 )
 const visibleLogCount = computed(() => {
@@ -1636,6 +1636,11 @@ function requestSeverity(row: ProxyRequestDetail) {
   if (row.status_code >= 400) return 'warn'
   if (row.status_code >= 300) return 'redirect'
   return 'success'
+}
+
+function requestLogLevelMatches(row: ProxyRequestDetail, level: string) {
+  if (level === 'ban_change') return row.event_type === 'block' || row.event_type === 'unblock'
+  return requestSeverity(row) === level
 }
 
 function requestSeverityLabel(row: ProxyRequestDetail) {

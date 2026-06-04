@@ -9,7 +9,6 @@
 # Local environment
 .env
 .env.*
-AGENTS.md
 
 # Rust
 target/
