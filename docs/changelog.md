@@ -1,5 +1,31 @@
 # 版本更新日志
 
+## v0.1.9
+
+发布时间：2026-06-06
+
+### 新增
+
+- 内部重定向解析新增客户端 `User-Agent` 透传，确保 OpenList / 115 直链按真实播放客户端生成。
+
+### 优化
+
+- 内部重定向从 `HEAD` 跟随改为 `GET` 探测第一跳 `Location`，不跟随最终 CDN、不下载媒体内容。
+- `HEAD /videos/.../stream` 请求也进入 STRM 解析流程，但不计入播放频率限制。
+
+### 修复
+
+- 修复 115 CDN 直链因生成链接时使用后端默认 UA、播放时使用客户端 UA 导致 403 无法播放的问题。
+- 修复内部重定向提前触碰最终 CDN 链接后，客户端再次请求同一链接出现 403 的问题。
+
+### 验证
+
+- `cargo fmt --check`
+- `cargo check`
+- `cargo test internal_redirect`
+- `cargo test head_video_stream_resolves`
+- `cd frontend && npx vue-tsc -b --noEmit`
+
 ## v0.1.8
 
 发布时间：2026-06-04

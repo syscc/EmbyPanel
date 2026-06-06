@@ -688,7 +688,7 @@ async fn handle_request(
             .await;
     }
 
-    if method != Method::HEAD && rewrite::is_video_stream(path) {
+    if rewrite::is_video_stream(path) {
         return handle_video_stream(&state, method, uri, headers, body, Some(peer_addr), timing)
             .await;
     }
@@ -1466,22 +1466,23 @@ async fn handle_video_stream(
         .or_else(|| peer_addr.map(|addr| addr.ip().to_string()))
         .unwrap_or_else(|| "--".to_string());
     let (server_id, server_name) = config_server_label(&config);
-    if client_control::enforce_playback_rate_limit(
-        state,
-        client_control::PlaybackRateLimitInput {
-            runtime_config: &config,
-            client: &state.client,
-            server_id: &server_id,
-            server_name: &server_name,
-            playback_user: &playback_user,
-            playback_ip: &playback_ip,
-            playback_event: &item_id,
-            skip_recent_event: false,
-            record_recent_event: false,
-        },
-    )
-    .await?
-    {
+    let rate_limited = method != Method::HEAD
+        && client_control::enforce_playback_rate_limit(
+            state,
+            client_control::PlaybackRateLimitInput {
+                runtime_config: &config,
+                client: &state.client,
+                server_id: &server_id,
+                server_name: &server_name,
+                playback_user: &playback_user,
+                playback_ip: &playback_ip,
+                playback_event: &item_id,
+                skip_recent_event: false,
+                record_recent_event: false,
+            },
+        )
+        .await?;
+    if rate_limited {
         record_stat(state, &config, RequestStatKind::Block).await;
         record_proxy_request_detail(
             state,
@@ -1603,7 +1604,7 @@ async fn handle_video_stream(
     let media_path = apply_strm_url_mappings(&config, &media_path);
 
     if is_direct_url(&media_path) && config.openlist_addr.is_none() {
-        let redirect_url = maybe_resolve_internal_redirect(&config, &media_path).await;
+        let redirect_url = maybe_resolve_internal_redirect(&config, &media_path, user_agent).await;
         let should_cache = should_cache_direct_link(&config, &redirect_url);
         if should_cache {
             let cache = state.cache.read().await.clone();
@@ -1675,7 +1676,7 @@ async fn handle_video_stream(
     let mut raw_url = openlist::ensure_raw_url(
         openlist::fs_get(&state.client, &config, &openlist_path, user_agent).await?,
     )?;
-    raw_url = maybe_resolve_internal_redirect(&config, &raw_url).await;
+    raw_url = maybe_resolve_internal_redirect(&config, &raw_url, user_agent).await;
     let should_cache = should_cache_direct_link(&config, &raw_url);
     if should_cache {
         let cache = state.cache.read().await.clone();
@@ -2101,12 +2102,17 @@ fn apply_strm_url_mappings(config: &Config, media_path: &str) -> String {
     mapped
 }
 
-async fn maybe_resolve_internal_redirect(config: &Config, url: &str) -> String {
+async fn maybe_resolve_internal_redirect(config: &Config, url: &str, user_agent: &str) -> String {
     if !config.enable_internal_redirect {
         return url.to_string();
     }
 
-    match internal_redirect::resolve_with_head(url, config.internal_redirect_timeout_seconds).await
+    match internal_redirect::resolve_redirect_location(
+        url,
+        config.internal_redirect_timeout_seconds,
+        user_agent,
+    )
+    .await
     {
         Ok(resolved) => {
             tracing::info!(
@@ -2154,7 +2160,10 @@ mod tests {
         http::Request as HttpRequest,
     };
     use serde_json::json;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    };
     use tokio::net::TcpListener;
     use tower::ServiceExt;
 
@@ -2574,6 +2583,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn head_video_stream_resolves_direct_media_url() {
+        let emby = spawn_mock_server(|request| async move {
+            if request.uri().path() == "/Items" {
+                return response_json(json!({
+                    "Items": [{
+                        "MediaSources": [{
+                            "Id": "source1",
+                            "Path": "https://cdn.example.test/direct.mkv"
+                        }]
+                    }]
+                }));
+            }
+
+            if request.uri().path() == "/videos/item1/stream" {
+                return response_text(StatusCode::OK, "emby stream");
+            }
+
+            response_text(StatusCode::NOT_FOUND, "not found")
+        })
+        .await;
+        let app = test_app_without_openlist(&emby, 8096);
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::HEAD)
+                    .uri("/videos/item1/stream?MediaSourceId=source1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "https://cdn.example.test/direct.mkv"
+        );
+    }
+
+    #[tokio::test]
     async fn video_stream_redirects_openlist_download_url_without_openlist_api() {
         let emby = spawn_mock_server(|request| async move {
             if request.uri().path() == "/Items" {
@@ -2697,7 +2747,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn internal_redirect_resolves_final_url_with_head() {
+    async fn internal_redirect_resolves_first_redirect_location() {
         let final_server = spawn_mock_server(|request| async move {
             if request.uri().path() == "/final.mkv" {
                 return response_text(StatusCode::OK, "");
@@ -2747,6 +2797,161 @@ mod tests {
         let response = app
             .oneshot(
                 HttpRequest::builder()
+                    .uri("/videos/item1/stream?MediaSourceId=source1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            redirect_target.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_redirect_uses_location_without_requesting_final_url() {
+        let final_hits = Arc::new(AtomicUsize::new(0));
+        let final_hits_for_server = final_hits.clone();
+        let final_server = spawn_mock_server(move |request| {
+            let final_hits = final_hits_for_server.clone();
+            async move {
+                if request.uri().path() == "/final.mkv" {
+                    final_hits.fetch_add(1, Ordering::Relaxed);
+                    return response_text(StatusCode::FORBIDDEN, "forbidden");
+                }
+
+                response_text(StatusCode::NOT_FOUND, "not found")
+            }
+        })
+        .await;
+        let redirect_target = format!("{final_server}/final.mkv");
+        let redirect_target_for_server = redirect_target.clone();
+        let media_server = spawn_mock_server(move |request| {
+            let redirect_target = redirect_target_for_server.clone();
+            async move {
+                if request.uri().path() == "/direct.mkv" {
+                    return (
+                        StatusCode::FOUND,
+                        [(header::LOCATION, redirect_target.as_str())],
+                    )
+                        .into_response();
+                }
+
+                response_text(StatusCode::NOT_FOUND, "not found")
+            }
+        })
+        .await;
+        let media_url = format!("{media_server}/direct.mkv");
+
+        assert_eq!(
+            internal_redirect::resolve_redirect_location(&media_url, 15, "test-player")
+                .await
+                .unwrap(),
+            redirect_target
+        );
+        assert_eq!(final_hits.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_redirect_forwards_playback_user_agent() {
+        let seen_user_agent = Arc::new(std::sync::Mutex::new(String::new()));
+        let seen_user_agent_for_server = seen_user_agent.clone();
+        let media_server = spawn_mock_server(move |request| {
+            let seen_user_agent = seen_user_agent_for_server.clone();
+            async move {
+                if request.uri().path() == "/direct.mkv" {
+                    if let Some(user_agent) = request
+                        .headers()
+                        .get(header::USER_AGENT)
+                        .and_then(|value| value.to_str().ok())
+                    {
+                        *seen_user_agent.lock().unwrap() = user_agent.to_string();
+                    }
+                    return (
+                        StatusCode::FOUND,
+                        [(header::LOCATION, "https://cdn.example.test/final.mkv")],
+                    )
+                        .into_response();
+                }
+
+                response_text(StatusCode::NOT_FOUND, "not found")
+            }
+        })
+        .await;
+        let media_url = format!("{media_server}/direct.mkv");
+
+        let resolved =
+            internal_redirect::resolve_redirect_location(&media_url, 15, "Emby Web Test/1.0")
+                .await
+                .unwrap();
+
+        assert_eq!(resolved, "https://cdn.example.test/final.mkv");
+        assert_eq!(
+            seen_user_agent.lock().unwrap().as_str(),
+            "Emby Web Test/1.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn head_video_stream_resolves_internal_redirect_final_url() {
+        let final_server = spawn_mock_server(|request| async move {
+            if request.uri().path() == "/final.mkv" {
+                return response_text(StatusCode::OK, "");
+            }
+
+            response_text(StatusCode::NOT_FOUND, "not found")
+        })
+        .await;
+        let redirect_target = format!("{final_server}/final.mkv");
+        let redirect_target_for_server = redirect_target.clone();
+        let media_server = spawn_mock_server(move |request| {
+            let redirect_target = redirect_target_for_server.clone();
+            async move {
+                if request.uri().path() == "/openlist/d/movie.mkv" {
+                    return (
+                        StatusCode::FOUND,
+                        [(header::LOCATION, redirect_target.as_str())],
+                        format!(r#"<a href="{redirect_target}">Found</a>."#),
+                    )
+                        .into_response();
+                }
+
+                response_text(StatusCode::NOT_FOUND, "not found")
+            }
+        })
+        .await;
+        let media_url = format!("{media_server}/openlist/d/movie.mkv");
+        let emby = spawn_mock_server(move |request| {
+            let media_url = media_url.clone();
+            async move {
+                if request.uri().path() == "/Items" {
+                    return response_json(json!({
+                        "Items": [{
+                            "MediaSources": [{
+                                "Id": "source1",
+                                "Path": media_url
+                            }]
+                        }]
+                    }));
+                }
+
+                if request.uri().path() == "/videos/item1/stream" {
+                    return response_text(StatusCode::OK, "emby stream");
+                }
+
+                response_text(StatusCode::NOT_FOUND, "not found")
+            }
+        })
+        .await;
+        let app = test_app_without_openlist_with_internal_redirect(&emby, 8096, true);
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::HEAD)
                     .uri("/videos/item1/stream?MediaSourceId=source1")
                     .body(Body::empty())
                     .unwrap(),
