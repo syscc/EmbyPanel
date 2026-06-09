@@ -165,19 +165,25 @@ impl Config {
 
     fn normalize_servers(&mut self) -> AppResult<()> {
         if self.servers.is_empty() {
-            self.emby_host = trim_base_url("emby_host", &self.emby_host)?;
-            self.emby_api_key = required("emby_api_key", &self.emby_api_key)?;
+            if !self.emby_host.trim().is_empty() || !self.emby_api_key.trim().is_empty() {
+                self.emby_host = trim_base_url("emby_host", &self.emby_host)?;
+                self.emby_api_key = required("emby_api_key", &self.emby_api_key)?;
+                validate_port(self.port)?;
+                self.servers.push(EmbyServerConfig {
+                    id: "default".to_string(),
+                    name: "默认服务器".to_string(),
+                    emby_host: self.emby_host.clone(),
+                    emby_api_key: self.emby_api_key.clone(),
+                    port: self.port,
+                    enabled: true,
+                    real_ip_mode: default_real_ip_mode(),
+                    real_ip_header: String::new(),
+                });
+                return Ok(());
+            }
             validate_port(self.port)?;
-            self.servers.push(EmbyServerConfig {
-                id: "default".to_string(),
-                name: "默认服务器".to_string(),
-                emby_host: self.emby_host.clone(),
-                emby_api_key: self.emby_api_key.clone(),
-                port: self.port,
-                enabled: true,
-                real_ip_mode: default_real_ip_mode(),
-                real_ip_header: String::new(),
-            });
+            self.emby_host = String::new();
+            self.emby_api_key = String::new();
             return Ok(());
         }
 
@@ -480,6 +486,37 @@ mod tests {
         };
 
         assert!(config.normalize_and_validate().is_ok());
+    }
+
+    #[test]
+    fn config_allows_empty_server_list_when_top_level_emby_is_empty() {
+        let mut config = Config {
+            emby_host: String::new(),
+            emby_api_key: String::new(),
+            servers: Vec::new(),
+            openlist_addr: None,
+            openlist_token: None,
+            port: 8096,
+            cache_ttl_seconds: 180,
+            cache_max_capacity: 10_000,
+            cache_domain_filter_mode: "off".to_string(),
+            cache_domain_whitelist: String::new(),
+            cache_domain_blacklist: String::new(),
+            enable_internal_redirect: false,
+            internal_redirect_timeout_seconds: 15,
+            strm_url_mappings: String::new(),
+            connectivity_check_enabled: true,
+            connectivity_check_interval_seconds: 60,
+            connectivity_check_timeout_seconds: 5,
+            connectivity_auto_restart_seconds: 180,
+            strm_url_mapping_rules: Vec::new(),
+        };
+
+        config.normalize_and_validate().unwrap();
+
+        assert!(config.servers.is_empty());
+        assert!(config.emby_host.is_empty());
+        assert!(config.emby_api_key.is_empty());
     }
 
     #[test]

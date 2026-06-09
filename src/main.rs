@@ -38,7 +38,7 @@ use bytes::Bytes;
 use config::Config;
 use crypto_api::CryptoKeys;
 use db::{ProxyRequestDetailInsert, RequestStatKind, SettingsStore};
-use error::{AppError, AppResult};
+use error::{AppError, AppResult, safe_error_message};
 use serde::Serialize;
 use tokio::{
     sync::{Mutex, RwLock, oneshot},
@@ -182,6 +182,7 @@ struct AppState {
     playback_rate_recent_events: Arc<Mutex<HashMap<String, u64>>>,
     playback_rate_bans: Arc<Mutex<HashMap<String, u64>>>,
     playback_rate_ip_bans: Arc<Mutex<HashMap<String, u64>>>,
+    login_failures: Arc<Mutex<HashMap<String, VecDeque<i64>>>>,
     update_check: Arc<Mutex<Option<(u128, UpdateCheckResponse)>>>,
 }
 
@@ -416,7 +417,7 @@ async fn main() -> AppResult<()> {
     let ip_location = Arc::new(ip_location::IpLocationStore::new());
     if let Err(err) = ip_location.initialize(&client).await {
         tracing::warn!(error = %err, "failed to initialize IP database");
-        file_log.write("warning", "IP 数据库初始化失败", &err.to_string());
+        file_log.write("warning", "IP 数据库初始化失败", &err.safe_log_message());
     }
     let cache = DirectLinkCache::new(config.cache_ttl_seconds, config.cache_max_capacity);
     let proxy_manager = Arc::new(ProxyManager::new());
@@ -438,6 +439,7 @@ async fn main() -> AppResult<()> {
         playback_rate_recent_events: Arc::new(Mutex::new(HashMap::new())),
         playback_rate_bans: Arc::new(Mutex::new(HashMap::new())),
         playback_rate_ip_bans: Arc::new(Mutex::new(HashMap::new())),
+        login_failures: Arc::new(Mutex::new(HashMap::new())),
         update_check: Arc::new(Mutex::new(None)),
     };
     state.activity_log.record(
@@ -478,10 +480,13 @@ async fn main() -> AppResult<()> {
         &format!("http://{}/ui/", listener.local_addr()?),
     );
 
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|err| AppError::Internal(format!("server error: {err}")));
+    let result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .map_err(|err| AppError::Internal(format!("server error: {err}")));
     connectivity_task.abort();
     proxy_manager.shutdown().await;
     result
@@ -921,11 +926,8 @@ async fn record_proxy_request_detail(
     input: ProxyRequestDetailInput<'_>,
 ) {
     let (server_id, server_name) = config_server_label(config);
-    let path = input
-        .uri
-        .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or_else(|| input.uri.path());
+    let path = sanitized_uri_for_log(input.uri);
+    let detail = sanitized_detail_for_log(input.detail);
     let _ = state
         .settings_store
         .record_proxy_request_detail(ProxyRequestDetailInsert {
@@ -934,7 +936,7 @@ async fn record_proxy_request_detail(
             server_name: &server_name,
             port: config.port,
             method: input.method,
-            path,
+            path: &path,
             path_type: input.path_type,
             status_code: input.status_code,
             outcome: input.outcome,
@@ -943,7 +945,7 @@ async fn record_proxy_request_detail(
             playback_ip: input.playback_ip,
             cache_hit: input.cache_hit,
             blocked: input.blocked,
-            detail: input.detail,
+            detail: &detail,
         });
     if input.blocked {
         let ip_location_text = state
@@ -959,7 +961,7 @@ async fn record_proxy_request_detail(
             server_name: &server_name,
             port: config.port,
             method: input.method,
-            path,
+            path: &path,
             path_type: input.path_type,
             status_code: input.status_code,
             outcome: input.outcome,
@@ -968,7 +970,7 @@ async fn record_proxy_request_detail(
             playback_ip: input.playback_ip,
             ip_location_text: &ip_location_text,
             cache_hit: input.cache_hit,
-            detail: input.detail,
+            detail: &detail,
         });
     }
 }
@@ -1087,6 +1089,43 @@ fn sanitized_uri_for_log(uri: &Uri) -> String {
     }
 }
 
+fn sanitized_detail_for_log(detail: &str) -> String {
+    let trimmed = detail.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some(redacted) = sanitized_url_for_log(trimmed) {
+        return redacted;
+    }
+    detail
+        .split_whitespace()
+        .map(|part| sanitized_url_token_for_log(part).unwrap_or_else(|| part.to_string()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn sanitized_url_token_for_log(token: &str) -> Option<String> {
+    let prefix_len = token.find("http://").or_else(|| token.find("https://"))?;
+    let (prefix, url_with_suffix) = token.split_at(prefix_len);
+    let url_len = url_with_suffix
+        .find(|ch: char| ch.is_whitespace() || matches!(ch, ')' | '"' | '\'' | '>' | '<'))
+        .unwrap_or(url_with_suffix.len());
+    let (url_part, suffix) = url_with_suffix.split_at(url_len);
+    sanitized_url_for_log(url_part).map(|url| format!("{prefix}{url}{suffix}"))
+}
+
+fn sanitized_url_for_log(value: &str) -> Option<String> {
+    let mut url = url::Url::parse(value).ok()?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return None;
+    }
+    if url.query().is_some() {
+        url.set_query(Some("***"));
+    }
+    url.set_fragment(None);
+    Some(url.to_string())
+}
+
 fn empty_log_value(value: &str) -> &str {
     if value.trim().is_empty() { "--" } else { value }
 }
@@ -1142,10 +1181,11 @@ async fn proxy_to_emby_recorded(
         }
         Err(err) => {
             let (server_id, server_name) = config_server_label(config);
+            let error_detail = sanitized_detail_for_log(&err.safe_log_message());
             record_stat(state, config, RequestStatKind::Error).await;
             if let Some(proxy_manager) = state.proxy_manager.as_ref() {
                 proxy_manager
-                    .record_error(&server_id, err.to_string())
+                    .record_error(&server_id, error_detail.clone())
                     .await;
             }
             state.activity_log.record(
@@ -1154,11 +1194,9 @@ async fn proxy_to_emby_recorded(
                 Some(&server_id),
                 &server_name,
                 "代理请求失败",
-                err.to_string(),
+                error_detail.clone(),
             );
-            state
-                .file_log
-                .write("error", "代理请求失败", &err.to_string());
+            state.file_log.write("error", "代理请求失败", &error_detail);
             if let Some(trace) = trace {
                 record_proxy_request_detail(
                     state,
@@ -1175,7 +1213,7 @@ async fn proxy_to_emby_recorded(
                         playback_ip: &trace.playback_ip,
                         cache_hit: false,
                         blocked: false,
-                        detail: &err.to_string(),
+                        detail: &error_detail,
                     },
                 )
                 .await;
@@ -1466,6 +1504,46 @@ async fn handle_video_stream(
         .or_else(|| peer_addr.map(|addr| addr.ip().to_string()))
         .unwrap_or_else(|| "--".to_string());
     let (server_id, server_name) = config_server_label(&config);
+    let concurrent_limited = method != Method::HEAD
+        && client_control::enforce_concurrent_playback_limit(
+            state,
+            client_control::ConcurrentPlaybackLimitInput {
+                runtime_config: &config,
+                server_id: &server_id,
+                server_name: &server_name,
+                playback_user: &playback_user,
+                playback_ip: &playback_ip,
+                item_id: &item_id,
+            },
+        )
+        .await?;
+    if concurrent_limited {
+        record_stat(state, &config, RequestStatKind::Block).await;
+        record_proxy_request_detail(
+            state,
+            &config,
+            ProxyRequestDetailInput {
+                method: &method_label,
+                uri: &uri,
+                path_type: "video_stream",
+                status_code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                outcome: "同时播放限制",
+                started_at_ms: timing.started_at_ms,
+                duration_ms: timing.started.elapsed().as_millis(),
+                playback_user: &playback_user,
+                playback_ip: &playback_ip,
+                cache_hit: false,
+                blocked: true,
+                detail: &item_id,
+            },
+        )
+        .await;
+        return Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            "concurrent playback limit exceeded",
+        )
+            .into_response());
+    }
     let rate_limited = method != Method::HEAD
         && client_control::enforce_playback_rate_limit(
             state,
@@ -1594,7 +1672,7 @@ async fn handle_video_stream(
                         playback_ip: &playback_ip,
                         cache_hit: false,
                         blocked: false,
-                        detail: &err.to_string(),
+                        detail: &err.safe_log_message(),
                     },
                 )
                 .await;
@@ -1742,6 +1820,7 @@ fn record_playback_redirect(
 ) {
     let (server_id, server_name) = config_server_label(config);
     let message = message.into();
+    let log_detail = sanitized_detail_for_log(redirect_url);
     state.activity_log.record_playback(PlaybackLogRecord {
         level: ActivityLevel::Success,
         server_id: Some(&server_id),
@@ -1749,11 +1828,11 @@ fn record_playback_redirect(
         playback_user,
         playback_ip,
         message: message.clone(),
-        detail: redirect_url.to_string(),
+        detail: log_detail.clone(),
     });
     state
         .file_log
-        .write("info", &message, &format!("{playback_user} {redirect_url}"));
+        .write("info", &message, &format!("{playback_user} {log_detail}"));
     let kind = if message.contains("缓存命中") {
         RequestStatKind::CacheHit
     } else {
@@ -1816,7 +1895,11 @@ async fn playback_user_name(
         Ok(Some(user_name)) => user_name,
         Ok(None) => "--".to_string(),
         Err(err) => {
-            tracing::warn!(device_id, error = %err, "failed to resolve playback user name");
+            tracing::warn!(
+                device_id,
+                error = %err.safe_log_message(),
+                "failed to resolve playback user name"
+            );
             "--".to_string()
         }
     }
@@ -1847,7 +1930,11 @@ async fn remember_playback_user(
             Ok(Some(user_name)) => user_name,
             Ok(None) => return,
             Err(err) => {
-                tracing::warn!(device_id, error = %err, "failed to remember playback user name");
+                tracing::warn!(
+                    device_id,
+                    error = %err.safe_log_message(),
+                    "failed to remember playback user name"
+                );
                 return;
             }
         }
@@ -1895,7 +1982,11 @@ async fn user_name_by_user_id(
         Ok(Some(user_name)) => Some(user_name),
         Ok(None) => None,
         Err(err) => {
-            tracing::warn!(user_id, error = %err, "failed to resolve playback user by user id");
+            tracing::warn!(
+                user_id,
+                error = %err.safe_log_message(),
+                "failed to resolve playback user by user id"
+            );
             None
         }
     }
@@ -1922,7 +2013,10 @@ async fn user_name_by_token(
         Ok(Some(user_name)) => Some(user_name),
         Ok(None) => None,
         Err(err) => {
-            tracing::warn!(error = %err, "failed to resolve playback user by token");
+            tracing::warn!(
+                error = %err.safe_log_message(),
+                "failed to resolve playback user by token"
+            );
             None
         }
     }
@@ -2097,7 +2191,11 @@ fn forwarded_header_value<'a>(headers: &'a axum::http::HeaderMap, name: &str) ->
 fn apply_strm_url_mappings(config: &Config, media_path: &str) -> String {
     let mapped = url_mapping::apply_rules(media_path, &config.strm_url_mapping_rules);
     if mapped != media_path {
-        tracing::info!(from = media_path, to = mapped, "mapped STRM URL");
+        tracing::info!(
+            from = sanitized_detail_for_log(media_path),
+            to = sanitized_detail_for_log(&mapped),
+            "mapped STRM URL"
+        );
     }
     mapped
 }
@@ -2116,14 +2214,18 @@ async fn maybe_resolve_internal_redirect(config: &Config, url: &str, user_agent:
     {
         Ok(resolved) => {
             tracing::info!(
-                from = url,
-                to = resolved,
+                from = sanitized_detail_for_log(url),
+                to = sanitized_detail_for_log(&resolved),
                 "internal redirect resolved final URL"
             );
             resolved
         }
         Err(err) => {
-            tracing::warn!(url, error = %err, "internal redirect failed; using original URL");
+            tracing::warn!(
+                url = sanitized_detail_for_log(url),
+                error = %safe_error_message(&err),
+                "internal redirect failed; using original URL"
+            );
             url.to_string()
         }
     }
@@ -2218,6 +2320,7 @@ mod tests {
             playback_rate_recent_events: Arc::new(Mutex::new(HashMap::new())),
             playback_rate_bans: Arc::new(Mutex::new(HashMap::new())),
             playback_rate_ip_bans: Arc::new(Mutex::new(HashMap::new())),
+            login_failures: Arc::new(Mutex::new(HashMap::new())),
             update_check: Arc::new(Mutex::new(None)),
         }
     }
@@ -2283,6 +2386,8 @@ mod tests {
                     playback_rate_limit_max_requests: 5,
                     playback_rate_limit_block_seconds: 1800,
                     playback_rate_limit_action: "block_ip".to_string(),
+                    concurrent_playback_limit_enabled: false,
+                    concurrent_playback_limit_max: 3,
                     rate_limit_blocks: Vec::new(),
                     webhook: client_control::WebhookNotifyConfig::default(),
                     webhooks: Vec::new(),
@@ -2346,6 +2451,8 @@ mod tests {
                     playback_rate_limit_max_requests: 5,
                     playback_rate_limit_block_seconds: 1800,
                     playback_rate_limit_action: "block_ip".to_string(),
+                    concurrent_playback_limit_enabled: false,
+                    concurrent_playback_limit_max: 3,
                     rate_limit_blocks: Vec::new(),
                     webhook: client_control::WebhookNotifyConfig::default(),
                     webhooks: Vec::new(),
@@ -2395,6 +2502,123 @@ mod tests {
         assert!(blocked);
     }
 
+    #[tokio::test]
+    async fn concurrent_playback_limit_blocks_next_distinct_video() {
+        let store = test_store();
+        store
+            .save_setting_json(
+                "client_control",
+                &client_control::ClientControlConfig {
+                    enabled: false,
+                    notify_enabled: false,
+                    playback_rate_limit_enabled: false,
+                    playback_rate_limit_window_seconds: 30,
+                    playback_rate_limit_max_requests: 20,
+                    playback_rate_limit_block_seconds: 1800,
+                    playback_rate_limit_action: "block_ip".to_string(),
+                    concurrent_playback_limit_enabled: true,
+                    concurrent_playback_limit_max: 3,
+                    rate_limit_blocks: Vec::new(),
+                    webhook: client_control::WebhookNotifyConfig::default(),
+                    webhooks: Vec::new(),
+                    records: Vec::new(),
+                },
+            )
+            .unwrap();
+        let emby = spawn_mock_server(|request| async move {
+            if request.uri().path() == "/Sessions" {
+                return response_json(serde_json::json!([
+                    {"Id": "s1", "UserName": "test", "NowPlayingItem": {"Id": "item-1", "Name": "A"}},
+                    {"Id": "s2", "UserName": "test", "NowPlayingItem": {"Id": "item-2", "Name": "B"}},
+                    {"Id": "s3", "UserName": "test", "NowPlayingItem": {"Id": "item-3", "Name": "C"}}
+                ]));
+            }
+            response_text(StatusCode::NOT_FOUND, "not found")
+        })
+        .await;
+        let config = test_config(&emby, "http://127.0.0.1:5244", 8096);
+        let state = test_state(config.clone(), store);
+
+        let blocked = client_control::enforce_concurrent_playback_limit(
+            &state,
+            client_control::ConcurrentPlaybackLimitInput {
+                runtime_config: &config,
+                server_id: "default",
+                server_name: "default",
+                playback_user: "test",
+                playback_ip: "10.0.0.88",
+                item_id: "item-4",
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(blocked);
+        assert_eq!(
+            state
+                .playback_rate_ip_bans
+                .lock()
+                .await
+                .get("10.0.0.88")
+                .is_some(),
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_playback_limit_allows_same_video_refresh() {
+        let store = test_store();
+        store
+            .save_setting_json(
+                "client_control",
+                &client_control::ClientControlConfig {
+                    enabled: false,
+                    notify_enabled: false,
+                    playback_rate_limit_enabled: false,
+                    playback_rate_limit_window_seconds: 30,
+                    playback_rate_limit_max_requests: 20,
+                    playback_rate_limit_block_seconds: 1800,
+                    playback_rate_limit_action: "block_ip".to_string(),
+                    concurrent_playback_limit_enabled: true,
+                    concurrent_playback_limit_max: 3,
+                    rate_limit_blocks: Vec::new(),
+                    webhook: client_control::WebhookNotifyConfig::default(),
+                    webhooks: Vec::new(),
+                    records: Vec::new(),
+                },
+            )
+            .unwrap();
+        let emby = spawn_mock_server(|request| async move {
+            if request.uri().path() == "/Sessions" {
+                return response_json(serde_json::json!([
+                    {"Id": "s1", "UserName": "test", "NowPlayingItem": {"Id": "item-1", "Name": "A"}},
+                    {"Id": "s2", "UserName": "test", "NowPlayingItem": {"Id": "item-2", "Name": "B"}},
+                    {"Id": "s3", "UserName": "test", "NowPlayingItem": {"Id": "item-3", "Name": "C"}}
+                ]));
+            }
+            response_text(StatusCode::NOT_FOUND, "not found")
+        })
+        .await;
+        let config = test_config(&emby, "http://127.0.0.1:5244", 8096);
+        let state = test_state(config.clone(), store);
+
+        let blocked = client_control::enforce_concurrent_playback_limit(
+            &state,
+            client_control::ConcurrentPlaybackLimitInput {
+                runtime_config: &config,
+                server_id: "default",
+                server_name: "default",
+                playback_user: "test",
+                playback_ip: "10.0.0.89",
+                item_id: "item-1",
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!blocked);
+    }
+
     #[test]
     fn cache_domain_filters_match_host_only() {
         let mut config = test_config("http://emby.test", "http://openlist.test", 18096);
@@ -2419,6 +2643,33 @@ mod tests {
             &config,
             "https://cdn.example.com/a.mkv"
         ));
+    }
+
+    #[test]
+    fn sanitized_detail_for_log_removes_direct_link_query() {
+        assert_eq!(
+            sanitized_detail_for_log(
+                "https://cdn.example.test/movie.mkv?t=1780801682&u=2401236&k=secret"
+            ),
+            "https://cdn.example.test/movie.mkv?***"
+        );
+        assert_eq!(
+            sanitized_detail_for_log(
+                "alice https://cdn.example.test/movie.mkv?t=1780801682&u=2401236"
+            ),
+            "alice https://cdn.example.test/movie.mkv?***"
+        );
+    }
+
+    #[test]
+    fn sanitized_uri_for_log_masks_sensitive_query_keys() {
+        let uri: Uri = "/videos/item1/stream?DeviceId=d1&api_key=secret&Static=true"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            sanitized_uri_for_log(&uri),
+            "/videos/item1/stream?DeviceId=d1&api_key=***&Static=true"
+        );
     }
 
     #[test]

@@ -68,6 +68,7 @@ pub struct PlaybackSession {
     pub server_id: String,
     pub server_name: String,
     pub id: String,
+    pub item_id: String,
     pub user_name: String,
     pub client: String,
     pub device_name: String,
@@ -178,6 +179,8 @@ struct SessionResponse {
 
 #[derive(Debug, Deserialize)]
 struct NowPlayingItem {
+    #[serde(rename = "Id")]
+    id: Option<String>,
     #[serde(rename = "Name")]
     name: Option<String>,
     #[serde(rename = "SeriesName")]
@@ -223,6 +226,7 @@ pub async fn get_active_playback_sessions(
                 server_id: server_id.clone(),
                 server_name: server_name.clone(),
                 id: session.id.unwrap_or_default(),
+                item_id: item.id.unwrap_or_default(),
                 user_name: session.user_name.unwrap_or_else(|| "Unknown".to_string()),
                 client: session
                     .client

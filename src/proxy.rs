@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use axum::{
     body::Body,
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header},
@@ -263,12 +265,26 @@ fn header_ip_list(value: &str) -> Vec<String> {
         .filter_map(|item| item.split(';').next())
         .map(str::trim)
         .filter(|item| !item.is_empty())
-        .map(|item| {
-            item.trim_start_matches("for=")
-                .trim_matches('"')
-                .to_string()
-        })
+        .filter_map(normalize_header_ip_value)
         .collect()
+}
+
+fn normalize_header_ip_value(value: &str) -> Option<String> {
+    let mut value = value
+        .trim()
+        .trim_start_matches("for=")
+        .trim_matches('"')
+        .trim();
+    if value.starts_with('[') {
+        let end = value.find(']')?;
+        value = &value[1..end];
+    } else if let Some((host, port)) = value.rsplit_once(':')
+        && !host.contains(':')
+        && port.chars().all(|ch| ch.is_ascii_digit())
+    {
+        value = host;
+    }
+    value.parse::<IpAddr>().ok().map(|ip| ip.to_string())
 }
 
 fn should_copy_response_header(name: &str) -> bool {
@@ -398,5 +414,24 @@ mod tests {
         headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10"));
 
         assert_eq!(real_ip_for_log(&test_config("auto", ""), &headers), None);
+    }
+
+    #[test]
+    fn configured_real_ip_rejects_invalid_header_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-connecting-ip", HeaderValue::from_static("not-an-ip"));
+
+        assert_eq!(
+            configured_real_ip(&test_config("header", "CF-Connecting-IP"), &headers),
+            None
+        );
+    }
+
+    #[test]
+    fn configured_real_ip_accepts_forwarded_ip_formats() {
+        assert_eq!(
+            header_ip_list("for=\"[2001:db8::1]:443\", for=198.51.100.7:1234"),
+            vec!["2001:db8::1".to_string(), "198.51.100.7".to_string()]
+        );
     }
 }

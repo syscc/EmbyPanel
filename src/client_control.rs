@@ -14,7 +14,7 @@ use crate::{
     config::Config,
     crypto_api::EncryptedRequest,
     emby,
-    error::{AppError, AppResult},
+    error::{AppError, AppResult, safe_error_message},
     ip_location::IpLocation,
 };
 
@@ -37,6 +37,15 @@ pub struct PlaybackRateLimitInput<'a> {
     pub playback_event: &'a str,
     pub skip_recent_event: bool,
     pub record_recent_event: bool,
+}
+
+pub struct ConcurrentPlaybackLimitInput<'a> {
+    pub runtime_config: &'a Config,
+    pub server_id: &'a str,
+    pub server_name: &'a str,
+    pub playback_user: &'a str,
+    pub playback_ip: &'a str,
+    pub item_id: &'a str,
 }
 
 struct RateLimitNotification<'a> {
@@ -67,6 +76,10 @@ pub struct ClientControlConfig {
     pub playback_rate_limit_block_seconds: u64,
     #[serde(default = "default_playback_rate_limit_action")]
     pub playback_rate_limit_action: String,
+    #[serde(default)]
+    pub concurrent_playback_limit_enabled: bool,
+    #[serde(default = "default_concurrent_playback_limit_max")]
+    pub concurrent_playback_limit_max: u64,
     #[serde(default)]
     pub rate_limit_blocks: Vec<PlaybackRateBlockRecord>,
     #[serde(default)]
@@ -174,6 +187,10 @@ pub struct UpdateClientControlRequest {
     #[serde(default)]
     pub playback_rate_limit_action: String,
     #[serde(default)]
+    pub concurrent_playback_limit_enabled: bool,
+    #[serde(default)]
+    pub concurrent_playback_limit_max: u64,
+    #[serde(default)]
     pub webhook: WebhookNotifyConfig,
     #[serde(default)]
     pub webhooks: Vec<WebhookNotifyConfig>,
@@ -219,6 +236,10 @@ pub async fn update_client_control(
     }
     config.playback_rate_limit_action =
         normalize_playback_rate_limit_action(&payload.playback_rate_limit_action);
+    config.concurrent_playback_limit_enabled = payload.concurrent_playback_limit_enabled;
+    if payload.concurrent_playback_limit_max > 0 {
+        config.concurrent_playback_limit_max = payload.concurrent_playback_limit_max;
+    }
     config.webhooks = merge_existing_webhook_secrets(
         normalize_webhook_configs(payload.webhooks, payload.webhook),
         &config.webhooks,
@@ -678,6 +699,8 @@ fn default_config() -> ClientControlConfig {
         playback_rate_limit_max_requests: default_playback_rate_limit_max_requests(),
         playback_rate_limit_block_seconds: default_playback_rate_limit_block_seconds(),
         playback_rate_limit_action: default_playback_rate_limit_action(),
+        concurrent_playback_limit_enabled: false,
+        concurrent_playback_limit_max: default_concurrent_playback_limit_max(),
         rate_limit_blocks: Vec::new(),
         webhook: WebhookNotifyConfig::default(),
         webhooks: Vec::new(),
@@ -699,6 +722,10 @@ fn default_playback_rate_limit_block_seconds() -> u64 {
 
 fn default_playback_rate_limit_action() -> String {
     "block_ip".to_string()
+}
+
+fn default_concurrent_playback_limit_max() -> u64 {
+    3
 }
 
 fn default_webhook_name() -> String {
@@ -891,6 +918,50 @@ async fn notify_rate_limit_block(
     }
 }
 
+async fn notify_concurrent_playback_block(
+    state: &AppState,
+    webhooks: Vec<WebhookNotifyConfig>,
+    notification: RateLimitNotification<'_>,
+    active_count: u64,
+) {
+    let action_label = rate_limit_action_label(notification.action);
+    let title = format!("同时播放限制 - {action_label}");
+    let ip_location_line = if notification.ip_location_text.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n归属地：{}", notification.ip_location_text.trim())
+    };
+    let text = format!(
+        "服务器：{}\n用户：{}\nIP：{}{}\n策略：{action_label}\n当前播放：{active_count} 路\n允许同时播放：{} 路\n处理时长：{}s",
+        notification.server_name,
+        normalize_value(notification.playback_user),
+        normalize_value(notification.playback_ip),
+        ip_location_line,
+        notification.max_requests,
+        notification.block_seconds,
+    );
+    for webhook in active_webhooks(webhooks) {
+        if let Err(err) = send_webhook(
+            &state.client,
+            &webhook.url,
+            Some(webhook.secret.as_str()),
+            &title,
+            &text,
+        )
+        .await
+        {
+            state.activity_log.record(
+                crate::activity_log::ActivityKind::General,
+                crate::activity_log::ActivityLevel::Warn,
+                Some(notification.server_id),
+                "Webhook 通知",
+                "发送失败",
+                format!("{} 发送失败: {err}", webhook.name),
+            );
+        }
+    }
+}
+
 fn active_webhooks(webhooks: Vec<WebhookNotifyConfig>) -> Vec<WebhookNotifyConfig> {
     webhooks
         .into_iter()
@@ -966,6 +1037,28 @@ fn upsert_rate_limit_block(
     user_name: &str,
     blocked_until: u64,
 ) {
+    upsert_rate_limit_block_with_note(
+        config,
+        server_id,
+        server_name,
+        action,
+        ip,
+        user_name,
+        blocked_until,
+        rate_limit_block_note(action, ip, user_name),
+    );
+}
+
+fn upsert_rate_limit_block_with_note(
+    config: &mut ClientControlConfig,
+    server_id: &str,
+    server_name: &str,
+    action: &str,
+    ip: &str,
+    user_name: &str,
+    blocked_until: u64,
+    note: String,
+) {
     let now = chrono_like_now();
     if let Some(existing) = config.rate_limit_blocks.iter_mut().find(|record| {
         record.enabled
@@ -978,7 +1071,7 @@ fn upsert_rate_limit_block(
             }
     }) {
         existing.blocked_until = blocked_until.to_string();
-        existing.note = rate_limit_block_note(action, ip, user_name);
+        existing.note = note;
         return;
     }
     config.rate_limit_blocks.push(PlaybackRateBlockRecord {
@@ -991,7 +1084,7 @@ fn upsert_rate_limit_block(
         blocked_until: blocked_until.to_string(),
         created_at: now,
         enabled: true,
-        note: rate_limit_block_note(action, ip, user_name),
+        note,
         ip_location: None,
     });
 }
@@ -1002,6 +1095,10 @@ fn rate_limit_block_note(action: &str, ip: &str, user_name: &str) -> String {
         "mixed" => format!("频率超限禁用用户 {user_name} 并屏蔽 IP {ip}"),
         _ => format!("频率超限屏蔽 IP {ip}"),
     }
+}
+
+fn concurrent_limit_block_note(ip: &str, user_name: &str) -> String {
+    format!("同时播放超限屏蔽用户 {user_name} 的 IP {ip}")
 }
 
 fn empty_audit_value(value: &str) -> &str {
@@ -1305,7 +1402,11 @@ pub async fn enforce_playback_rate_limit(
                     Some(input.server_id),
                     "播放频率限制",
                     "禁用用户失败",
-                    format!("用户 {playback_user} 调用 Emby API 失败: {err}"),
+                    format!(
+                        "用户 {} 调用 Emby API 失败: {}",
+                        playback_user,
+                        err.safe_log_message()
+                    ),
                 );
             } else {
                 state.activity_log.record(
@@ -1414,6 +1515,185 @@ pub async fn enforce_playback_rate_limit(
     }
 
     Ok(should_block)
+}
+
+pub async fn enforce_concurrent_playback_limit(
+    state: &AppState,
+    input: ConcurrentPlaybackLimitInput<'_>,
+) -> AppResult<bool> {
+    let mut config = load_or_default(state)?;
+    if !config.concurrent_playback_limit_enabled {
+        return Ok(false);
+    }
+
+    let playback_user = input.playback_user.trim();
+    let playback_ip = input.playback_ip.trim();
+    if playback_user.is_empty()
+        || playback_user == "--"
+        || playback_ip.is_empty()
+        || playback_ip == "--"
+    {
+        return Ok(false);
+    }
+
+    let action = "block_ip";
+    let now = now_seconds();
+    let mut changed = prune_inactive_rate_limit_blocks(&mut config, now);
+    if config.rate_limit_blocks.iter().any(|record| {
+        record.enabled
+            && record.server_id == input.server_id
+            && record.action == action
+            && record.ip == playback_ip
+            && record.blocked_until.parse::<u64>().unwrap_or_default() > now
+    }) {
+        if changed {
+            state
+                .settings_store
+                .save_setting_json(SETTING_KEY, &config)?;
+        }
+        return Ok(true);
+    }
+    {
+        let mut ip_bans = state.playback_rate_ip_bans.lock().await;
+        if let Some(blocked_until) = ip_bans.get(playback_ip).copied() {
+            if blocked_until > now {
+                return Ok(true);
+            }
+            ip_bans.remove(playback_ip);
+        }
+    }
+
+    let sessions =
+        match emby::get_active_playback_sessions(&state.client, input.runtime_config).await {
+            Ok(sessions) => sessions,
+            Err(err) => {
+                state.activity_log.record(
+                    crate::activity_log::ActivityKind::General,
+                    crate::activity_log::ActivityLevel::Warn,
+                    Some(input.server_id),
+                    "同时播放限制",
+                    "会话查询失败",
+                    format!(
+                        "查询 Emby 当前播放会话失败，已放行本次请求: {}",
+                        safe_error_message(&err)
+                    ),
+                );
+                if changed {
+                    state
+                        .settings_store
+                        .save_setting_json(SETTING_KEY, &config)?;
+                }
+                return Ok(false);
+            }
+        };
+    let current_item_id = input.item_id.trim();
+    let active_count = sessions
+        .iter()
+        .filter(|session| {
+            session.server_id == input.server_id
+                && session.user_name.trim().eq_ignore_ascii_case(playback_user)
+                && {
+                    let session_item_id = session.item_id.trim();
+                    current_item_id.is_empty()
+                        || session_item_id.is_empty()
+                        || session_item_id != current_item_id
+                }
+        })
+        .count() as u64;
+    let max_concurrent = config.concurrent_playback_limit_max.max(1);
+    if active_count < max_concurrent {
+        if changed {
+            state
+                .settings_store
+                .save_setting_json(SETTING_KEY, &config)?;
+        }
+        return Ok(false);
+    }
+
+    let block_seconds = config.playback_rate_limit_block_seconds.max(1);
+    let blocked_until = now + block_seconds;
+    let notify_enabled = config.notify_enabled;
+    let webhooks = config.webhooks.clone();
+    state
+        .playback_rate_ip_bans
+        .lock()
+        .await
+        .insert(playback_ip.to_string(), blocked_until);
+    upsert_rate_limit_block_with_note(
+        &mut config,
+        input.server_id,
+        input.server_name,
+        action,
+        playback_ip,
+        playback_user,
+        blocked_until,
+        concurrent_limit_block_note(playback_ip, playback_user),
+    );
+    let ip_location_text = state
+        .ip_location
+        .lookup(playback_ip)
+        .await
+        .map(|location| location.display_text())
+        .unwrap_or_default();
+    state.activity_log.record(
+        crate::activity_log::ActivityKind::General,
+        crate::activity_log::ActivityLevel::Warn,
+        Some(input.server_id),
+        "同时播放限制",
+        "屏蔽 IP",
+        format!(
+            "用户 {playback_user} 已有 {active_count} 路播放，超过允许同时播放 {max_concurrent} 路，屏蔽 IP {playback_ip} {block_seconds}s"
+        ),
+    );
+    state.block_log.record(crate::block_log::BlockLogInsert {
+        event_type: "block",
+        timestamp_ms: now as u128 * 1000,
+        server_id: input.server_id,
+        server_name: input.server_name,
+        port: input.runtime_config.port,
+        method: "ACTION",
+        path: "concurrent_limit/block",
+        path_type: "rate_limit_action",
+        status_code: 429,
+        outcome: "屏蔽 IP",
+        duration_ms: 0,
+        playback_user,
+        playback_ip,
+        ip_location_text: &ip_location_text,
+        cache_hit: false,
+        detail: &format!(
+            "当前播放: {active_count}; 允许同时播放: {max_concurrent}; 封禁: {block_seconds}s; 到期: {blocked_until}"
+        ),
+    });
+    changed = true;
+
+    if notify_enabled {
+        notify_concurrent_playback_block(
+            state,
+            webhooks,
+            RateLimitNotification {
+                server_id: input.server_id,
+                server_name: input.server_name,
+                action,
+                playback_user,
+                playback_ip,
+                ip_location_text: &ip_location_text,
+                window: 0,
+                max_requests: max_concurrent,
+                block_seconds,
+            },
+            active_count,
+        )
+        .await;
+    }
+
+    if changed {
+        state
+            .settings_store
+            .save_setting_json(SETTING_KEY, &config)?;
+    }
+
+    Ok(true)
 }
 
 pub fn extract_user_agent(headers: &HeaderMap) -> String {

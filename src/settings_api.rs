@@ -5,7 +5,6 @@ use aes_gcm::{
 use argon2::Argon2;
 use axum::{Json, extract::State, http::HeaderMap};
 use base64::{Engine, engine::general_purpose::STANDARD};
-#[cfg(test)]
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
@@ -14,7 +13,7 @@ use crate::{
     client_control::ClientControlConfig,
     config::Config,
     crypto_api::EncryptedRequest,
-    error::{AppError, AppResult},
+    error::{AppError, AppResult, safe_error_message},
     file_log::{SystemLogConfig, normalize_config},
 };
 
@@ -34,6 +33,11 @@ pub struct BackupImportRequest {
     #[serde(default)]
     password: Option<String>,
     backup: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BackupExportRequest {
+    password: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,9 +94,6 @@ pub async fn update_settings(
     let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
     let mut payload: Config = state.crypto_keys.decrypt_named(&request, "settings")?;
     let existing = state.config.read().await.clone();
-    if payload.servers.is_empty() && !existing.servers.is_empty() {
-        payload.servers = existing.servers.clone();
-    }
     for server in &mut payload.servers {
         if server.emby_api_key.trim().is_empty()
             && let Some(existing_server) = existing
@@ -103,8 +104,11 @@ pub async fn update_settings(
             server.emby_api_key = existing_server.emby_api_key.clone();
         }
     }
-    if payload.emby_api_key.trim().is_empty() {
+    if !payload.servers.is_empty() && payload.emby_api_key.trim().is_empty() {
         payload.emby_api_key = existing.emby_api_key;
+    } else if payload.servers.is_empty() {
+        payload.emby_host.clear();
+        payload.emby_api_key.clear();
     }
     if payload.openlist_addr.is_none() {
         payload.openlist_token = None;
@@ -273,7 +277,11 @@ pub async fn validate_settings(
                 "Emby API Key 可用",
                 &server.emby_host,
             )),
-            Err(err) => results.push(err_result(&server.name, "Emby 连接失败", &err.to_string())),
+            Err(err) => results.push(err_result(
+                &server.name,
+                "Emby 连接失败",
+                &safe_error_message(&err),
+            )),
         }
     }
 
@@ -283,7 +291,7 @@ pub async fn validate_settings(
             Err(err) => results.push(err_result(
                 "OpenList",
                 "OpenList 连接失败",
-                &err.to_string(),
+                &safe_error_message(&err),
             )),
         }
     } else {
@@ -330,18 +338,27 @@ pub async fn update_log_config(
 pub async fn export_backup(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<BackupExportResponse>> {
     let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let payload: BackupExportRequest =
+        state.crypto_keys.decrypt_named(&request, "backup_export")?;
+    let password = payload.password.trim();
+    if password.len() < 4 {
+        return Err(AppError::Validation(
+            "backup password must be at least 4 characters".to_string(),
+        ));
+    }
     let backup = BackupPayload {
         runtime_config: state.config.read().await.clone(),
         client_control: backup_client_control_config(&state)?,
         system_log_config: Some(state.file_log.config()),
     };
-    let backup = serde_json::to_string_pretty(&backup)?;
+    let backup = encrypt_backup(password, &backup)?;
     state.settings_store.record_audit(
         Some(admin_user_id),
         "backup.export",
-        "导出配置文本",
+        "导出加密配置备份",
         "success",
     )?;
     Ok(Json(BackupExportResponse { backup }))
@@ -453,7 +470,6 @@ fn parse_backup_text(password: Option<&str>, value: &str) -> AppResult<BackupPay
     }
 }
 
-#[cfg(test)]
 fn encrypt_backup(password: &str, payload: &BackupPayload) -> AppResult<String> {
     let mut salt = [0_u8; 16];
     let mut nonce = [0_u8; 12];
@@ -558,6 +574,8 @@ mod tests {
             playback_rate_limit_max_requests: 20,
             playback_rate_limit_block_seconds: 1800,
             playback_rate_limit_action: "block_ip".to_string(),
+            concurrent_playback_limit_enabled: false,
+            concurrent_playback_limit_max: 3,
             rate_limit_blocks: Vec::new(),
             webhook: WebhookNotifyConfig::default(),
             webhooks: Vec::new(),

@@ -7,7 +7,7 @@ use crate::{
     AppState,
     activity_log::{ActivityKind, ActivityLevel},
     config::Config,
-    error::AppResult,
+    error::{AppResult, safe_error_message},
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -141,7 +141,7 @@ async fn check_server(
     )
     .await
     .map_err(|_| "Emby 连接超时".to_string())
-    .and_then(|result| result.map_err(|err| err.to_string()));
+    .and_then(|result| result.map_err(|err| safe_error_message(&err)));
     let proxy_result = check_proxy_port(config.port, timeout).await;
     let openlist_result = if config.openlist_addr.is_some() {
         Some(
@@ -151,7 +151,7 @@ async fn check_server(
             )
             .await
             .map_err(|_| "OpenList 连接超时".to_string())
-            .and_then(|result| result.map_err(|err| err.to_string())),
+            .and_then(|result| result.map_err(|err| safe_error_message(&err))),
         )
     } else {
         None
@@ -345,7 +345,7 @@ async fn handle_auto_restart(
                 Some(&status.server_id),
                 &status.server_name,
                 "反代自动重启失败",
-                err.to_string(),
+                err.safe_log_message(),
             );
             None
         }

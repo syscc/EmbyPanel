@@ -767,6 +767,11 @@ label span {
   overflow-wrap: anywhere;
 }
 
+.server-config-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
 .server-grid {
   grid-template-columns:
     minmax(140px, 0.7fr) minmax(240px, 1.2fr) minmax(220px, 1fr)
@@ -775,6 +780,7 @@ label span {
 
 .real-ip-grid {
   grid-template-columns: minmax(220px, 0.8fr) minmax(260px, 1.2fr);
+  margin-top: 6px;
 }
 
 .real-ip-grid textarea {
@@ -782,34 +788,61 @@ label span {
 }
 
 .real-ip-help {
-  margin: -4px 0 0;
+  margin: 8px 0 0;
 }
 
 .common-grid {
   margin-top: 16px;
   grid-template-columns: repeat(4, minmax(150px, 1fr));
+  align-items: start;
 }
 
 .health-check-grid {
-  margin-top: 16px;
+  margin-top: 12px;
   grid-template-columns: minmax(190px, 1fr) repeat(3, minmax(140px, 1fr));
+  align-items: start;
+}
+
+.common-grid label,
+.health-check-grid label {
+  gap: 4px;
 }
 
 .setting-check {
-  align-content: center;
+  align-content: start;
+  padding-top: 22px;
 }
 
-.cache-filter-grid {
+.advanced-routing-grid {
+  display: grid;
+  gap: 22px 16px;
   margin-top: 16px;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: 200px minmax(0, 1fr);
+  align-items: start;
 }
 
-.cache-filter-grid textarea {
-  min-height: 112px;
+.cache-filter-domains textarea {
+  min-height: 40px;
 }
 
-.cache-filter-help {
-  margin-top: 8px;
+.head-resolve-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.head-resolve-grid .check {
+  align-items: flex-start;
+  min-height: 0;
+}
+
+.strm-mapping-input {
+  min-height: 40px;
+}
+
+.compact-number-input {
+  width: 80px;
 }
 
 .config-tools {
@@ -1400,7 +1433,7 @@ label span {
 .rate-limit-grid {
   margin-top: 14px;
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) repeat(3, minmax(140px, 0.8fr));
+  grid-template-columns: repeat(auto-fit, 150px);
   gap: 12px;
 }
 
@@ -1508,7 +1541,7 @@ label span {
 .rate-block-table {
   width: 100%;
   border-collapse: collapse;
-  min-width: 720px;
+  min-width: 860px;
 }
 
 .rate-block-table th,
@@ -1523,6 +1556,25 @@ label span {
 .rate-block-table th {
   color: var(--muted);
   font-weight: 800;
+}
+
+.client-rate-block-table {
+  min-width: 760px;
+}
+
+.client-rate-block-table th:nth-child(1),
+.client-rate-block-table td:nth-child(1) {
+  width: 90px;
+}
+
+.client-rate-block-table th:nth-child(2),
+.client-rate-block-table td:nth-child(2) {
+  width: 120px;
+}
+
+.client-rate-block-table th:nth-child(3),
+.client-rate-block-table td:nth-child(3) {
+  width: 80px;
 }
 
 .home-rate-table {
@@ -1563,13 +1615,6 @@ label span {
   padding: 14px;
 }
 
-.client-count {
-  justify-self: end;
-  color: var(--muted);
-  font-size: 13px;
-  font-weight: 600;
-}
-
 .client-filterbar {
   display: flex;
   flex-wrap: wrap;
@@ -1578,6 +1623,14 @@ label span {
   margin-top: 14px;
   padding-top: 14px;
   align-items: center;
+}
+
+.client-filterbar-standalone {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-top: 0;
+  padding: 12px 16px;
+  background: var(--panel-bg);
 }
 
 .filter-button {
@@ -2076,7 +2129,8 @@ textarea:focus {
   .log-config-grid,
   .audit-toolbar,
   .webhook-grid,
-  .cache-filter-grid,
+  .advanced-routing-grid,
+  .head-resolve-grid,
   .client-toolbar,
   .manual-rule-row,
   .log-toolbar,
@@ -2176,10 +2230,6 @@ textarea:focus {
     grid-column: 1 / -1;
     width: 100%;
     margin-left: 0;
-  }
-
-  .client-count {
-    justify-self: start;
   }
 
   .client-table {

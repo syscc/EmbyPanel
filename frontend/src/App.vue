@@ -55,6 +55,7 @@ type PlaybackSession = {
   server_id: string
   server_name: string
   id: string
+  item_id: string
   user_name: string
   client: string
   device_name: string
@@ -245,6 +246,8 @@ type ClientControlConfig = {
   playback_rate_limit_max_requests: number
   playback_rate_limit_block_seconds: number
   playback_rate_limit_action: 'block_ip' | 'disable_user' | 'mixed'
+  concurrent_playback_limit_enabled: boolean
+  concurrent_playback_limit_max: number
   rate_limit_blocks: PlaybackRateBlockRecord[]
   webhook?: WebhookNotifyConfig
   webhooks: WebhookNotifyConfig[]
@@ -360,6 +363,8 @@ const clientControl = reactive<ClientControlConfig>({
   playback_rate_limit_max_requests: 20,
   playback_rate_limit_block_seconds: 1800,
   playback_rate_limit_action: 'block_ip',
+  concurrent_playback_limit_enabled: false,
+  concurrent_playback_limit_max: 3,
   rate_limit_blocks: [],
   webhooks: [{
     id: newWebhookId(),
@@ -377,6 +382,7 @@ const clientControlError = ref('')
 const clientStatusFilter = ref<ClientStatusFilter>('all')
 const clientKeywordFilter = ref('')
 const visibleApiKeyServers = ref<Record<string, boolean>>({})
+const expandedServerCards = ref<Record<string, boolean>>({})
 const backupError = ref('')
 const backupFileInput = ref<HTMLInputElement | null>(null)
 const logConfig = reactive<SystemLogConfig>({
@@ -820,6 +826,15 @@ async function refreshClientControl() {
   }
 }
 
+async function refreshClientControlLiveData() {
+  try {
+    const response = await api<ClientControlConfig>('/api/client-control')
+    applyClientControlLiveData(response)
+  } catch {
+    // Live refresh should not interrupt editing client control settings.
+  }
+}
+
 async function refreshRateLimitStatus() {
   try {
     rateLimitWindows.value = await api<PlaybackRateWindowStatus[]>('/api/client-control/rate-limit/status')
@@ -884,12 +899,19 @@ async function validateSettings() {
 async function exportBackup() {
   backupError.value = ''
   clearNotice()
+  const password = window.prompt('请输入备份密码（至少 4 位），用于加密配置文件')
+  if (password === null) return
+  if (password.trim().length < 4) {
+    backupError.value = '备份密码至少需要 4 位'
+    return
+  }
   try {
     const response = await api<{ backup: string }>('/api/settings/backup/export', {
       method: 'POST',
+      body: JSON.stringify(await encryptPayload('backup_export', { password })),
     })
     downloadTextFile(response.backup, backupFileName())
-    showNotice('配置文件已生成，请在浏览器下载记录中查看')
+    showNotice('加密配置备份已生成，请妥善保存备份密码')
   } catch (err) {
     backupError.value = err instanceof Error ? err.message : String(err)
   }
@@ -926,10 +948,18 @@ async function importBackupText(backupText: string) {
   }
   const confirmed = window.confirm('还原配置文件会覆盖当前配置并重启反代服务，确定继续吗？')
   if (!confirmed) return
+  const encryptedBackup = backup.startsWith('{') && backup.includes('"cipher"')
+  const password = encryptedBackup ? window.prompt('请输入该加密备份的密码') : null
+  if (encryptedBackup && password === null) return
+  const backupPassword = password?.trim() || ''
+  if (encryptedBackup && !backupPassword) {
+    backupError.value = '加密备份密码不能为空'
+    return
+  }
   try {
     const response = await api<Settings>('/api/settings/backup/import', {
       method: 'POST',
-      body: JSON.stringify(await encryptPayload('backup', { backup })),
+      body: JSON.stringify(await encryptPayload('backup', { backup, password: backupPassword || null })),
     })
     Object.assign(settings, response)
     normalizeSettingsServers()
@@ -1047,43 +1077,30 @@ async function toggleProxyServer(server: EmbyServerConfig) {
 }
 
 function buildSettingsPayload() {
-  const servers = settings.servers.map((server) => ({
-    ...server,
-    name: server.name.trim(),
-    emby_host: server.emby_host.trim(),
-    emby_api_key: server.emby_api_key.trim(),
-    port: Number(server.port),
-    real_ip_mode: server.real_ip_mode || 'auto',
-    real_ip_header: server.real_ip_header.trim(),
-  }))
+  const servers = settings.servers
+    .map((server) => ({
+      ...server,
+      name: server.name.trim(),
+      emby_host: server.emby_host.trim(),
+      emby_api_key: server.emby_api_key.trim(),
+      port: Number(server.port),
+      real_ip_mode: server.real_ip_mode || 'auto',
+      real_ip_header: server.real_ip_header.trim(),
+    }))
+    .filter((server) => server.emby_host || server.emby_api_key)
   const primary = servers.find((server) => server.enabled) ?? servers[0]
   return {
-      ...settings,
-      servers,
-      emby_host: primary?.emby_host ?? settings.emby_host,
-      emby_api_key: primary?.emby_api_key ?? settings.emby_api_key,
-      port: primary?.port ?? settings.port,
-      openlist_addr: emptyToNull(settings.openlist_addr),
-      openlist_token: emptyToNull(settings.openlist_token),
-    }
+    ...settings,
+    servers,
+    emby_host: primary?.emby_host ?? '',
+    emby_api_key: primary?.emby_api_key ?? '',
+    port: primary?.port ?? 8096,
+    openlist_addr: emptyToNull(settings.openlist_addr),
+    openlist_token: emptyToNull(settings.openlist_token),
+  }
 }
 
 function normalizeSettingsServers() {
-  if (!settings.servers.length) {
-    settings.servers = [
-      {
-        id: newServerId(),
-        name: '默认服务器',
-        emby_host: settings.emby_host,
-        emby_api_key: settings.emby_api_key,
-        port: settings.port || 8096,
-        enabled: true,
-        real_ip_mode: 'auto',
-        real_ip_header: '',
-      },
-    ]
-    return
-  }
   settings.servers = settings.servers.map((server) => ({
     ...server,
     real_ip_mode: server.real_ip_mode || 'auto',
@@ -1093,16 +1110,20 @@ function normalizeSettingsServers() {
 
 function addServer() {
   const lastPort = settings.servers.at(-1)?.port ?? 8096
-  settings.servers.push({
+  settings.servers.push(newBlankServer(settings.servers.length + 1, lastPort + 1))
+}
+
+function newBlankServer(index: number, port: number): EmbyServerConfig {
+  return {
     id: newServerId(),
-    name: `服务器 ${settings.servers.length + 1}`,
+    name: `服务器 ${index}`,
     emby_host: '',
     emby_api_key: '',
-    port: lastPort + 1,
+    port,
     enabled: true,
     real_ip_mode: 'auto',
     real_ip_header: '',
-  })
+  }
 }
 
 function needsRealIpHeader(server: EmbyServerConfig) {
@@ -1115,16 +1136,25 @@ function updateRealIpMode(server: EmbyServerConfig) {
   }
 }
 
-function removeServer(serverId: string) {
-  if (settings.servers.length <= 1) {
-    error.value = '至少保留一个服务器配置'
-    return
+function isServerExpanded(serverId: string) {
+  return Boolean(expandedServerCards.value[serverId])
+}
+
+function toggleServerExpanded(serverId: string) {
+  expandedServerCards.value = {
+    ...expandedServerCards.value,
+    [serverId]: !expandedServerCards.value[serverId],
   }
+}
+
+function removeServer(serverId: string) {
   const confirmed = window.confirm('确定删除这个服务器配置吗？对应反代端口保存后会停止监听。')
   if (!confirmed) return
   settings.servers = settings.servers.filter((server) => server.id !== serverId)
   const { [serverId]: _removed, ...visibleServers } = visibleApiKeyServers.value
   visibleApiKeyServers.value = visibleServers
+  const { [serverId]: _collapsed, ...expandedServers } = expandedServerCards.value
+  expandedServerCards.value = expandedServers
 }
 
 function newServerId() {
@@ -1189,6 +1219,8 @@ function sanitizeClientControl() {
     playback_rate_limit_max_requests: Number(clientControl.playback_rate_limit_max_requests),
     playback_rate_limit_block_seconds: Number(clientControl.playback_rate_limit_block_seconds),
     playback_rate_limit_action: clientControl.playback_rate_limit_action || 'block_ip',
+    concurrent_playback_limit_enabled: clientControl.concurrent_playback_limit_enabled,
+    concurrent_playback_limit_max: Number(clientControl.concurrent_playback_limit_max),
     webhooks: clientControl.webhooks.map((webhook) => ({
       id: webhook.id || newWebhookId(),
       enabled: webhook.enabled,
@@ -1238,6 +1270,11 @@ function applyClientControlConfig(response: ClientControlConfig) {
   clientControl.webhooks = webhooks.length
     ? webhooks.map(normalizeWebhook)
     : [newWebhookConfig()]
+}
+
+function applyClientControlLiveData(response: ClientControlConfig) {
+  clientControl.records = response.records || []
+  clientControl.rate_limit_blocks = response.rate_limit_blocks || []
 }
 
 function newWebhookConfig(): WebhookNotifyConfig {
@@ -1419,6 +1456,13 @@ function rateLimitBlockIp(record: PlaybackRateBlockRecord) {
   return record.note.match(/(?:IP|ip)\s+([0-9a-fA-F:.]+)/)?.[1] ?? '--'
 }
 
+function rateLimitBlockReason(record: PlaybackRateBlockRecord) {
+  const note = record.note?.trim()
+  if (note.includes('同时播放')) return '同时播放超限'
+  if (note.includes('频率超限') || note.includes('窗口') || note.includes('阈值')) return '播放频率限制'
+  return playbackRateActionLabel(record.action)
+}
+
 function playbackRateActionLabel(action?: string) {
   if (action === 'disable_user') return '禁用用户'
   if (action === 'mixed') return '混合模式'
@@ -1462,12 +1506,19 @@ function logout() {
 }
 
 function storedToken() {
-  return readStorage(localStorage, tokenKey) || readStorage(sessionStorage, tokenKey)
+  const sessionToken = readStorage(sessionStorage, tokenKey)
+  if (sessionToken) return sessionToken
+  const legacyToken = readStorage(localStorage, tokenKey)
+  if (legacyToken) {
+    writeStorage(sessionStorage, tokenKey, legacyToken)
+    removeStorage(localStorage, tokenKey)
+  }
+  return legacyToken
 }
 
 function storeToken(value: string) {
-  writeStorage(localStorage, tokenKey, value)
   writeStorage(sessionStorage, tokenKey, value)
+  removeStorage(localStorage, tokenKey)
 }
 
 function clearStoredToken() {
@@ -1531,7 +1582,7 @@ async function refreshPlaybackSessions() {
   playbackError.value = ''
   try {
     playbackSessions.value = await api<PlaybackSession[]>('/api/monitoring/plays')
-    if (page.value === 'clients') await refreshClientControl()
+    if (page.value === 'clients') await refreshClientControlLiveData()
   } catch (err) {
     playbackSessions.value = []
     playbackError.value = err instanceof Error ? err.message : String(err)
@@ -2362,6 +2413,14 @@ onBeforeUnmount(stopDashboardPolling)
                 <div class="server-actions">
                   <button
                     type="button"
+                    class="secondary"
+                    :aria-expanded="isServerExpanded(server.id)"
+                    @click="toggleServerExpanded(server.id)"
+                  >
+                    {{ isServerExpanded(server.id) ? '收起配置' : '展开配置' }}
+                  </button>
+                  <button
+                    type="button"
                     :class="['server-toggle-button', { disabled: !server.enabled }]"
                     :disabled="saving || restartingServerId === server.id"
                     :aria-pressed="server.enabled"
@@ -2377,7 +2436,7 @@ onBeforeUnmount(stopDashboardPolling)
                   >
                     {{ restartingServerId === server.id ? '重启中' : '重启服务器' }}
                   </button>
-                  <button class="danger-button" :disabled="settings.servers.length <= 1" @click="removeServer(server.id)">
+                  <button class="danger-button" @click="removeServer(server.id)">
                     删除
                   </button>
                 </div>
@@ -2393,74 +2452,81 @@ onBeforeUnmount(stopDashboardPolling)
                   {{ proxyStatusById[server.id]?.last_error }}
                 </span>
               </div>
-              <div class="grid server-grid">
-                <label>
-                  <span>名称</span>
-                  <input v-model="server.name" placeholder="例如：主服务器" />
-                </label>
-                <label>
-                  <span>Emby 地址</span>
-                  <input v-model="server.emby_host" placeholder="http://emby.local:8096" />
-                </label>
-                <label>
-                  <span>Emby API Key</span>
-                  <div class="secret-input">
-                    <input
-                      v-model="server.emby_api_key"
-                      :type="isApiKeyVisible(server.id) ? 'text' : 'password'"
-                      autocomplete="off"
+              <div v-if="isServerExpanded(server.id)" class="server-config-body">
+                <div class="grid server-grid">
+                  <label>
+                    <span>名称</span>
+                    <input v-model="server.name" placeholder="例如：主服务器" />
+                  </label>
+                  <label>
+                    <span>Emby 地址</span>
+                    <input v-model="server.emby_host" placeholder="http://emby.local:8096" />
+                  </label>
+                  <label>
+                    <span>Emby API Key</span>
+                    <div class="secret-input">
+                      <input
+                        v-model="server.emby_api_key"
+                        :type="isApiKeyVisible(server.id) ? 'text' : 'password'"
+                        autocomplete="off"
+                      />
+                      <button
+                        type="button"
+                        class="secret-toggle"
+                        :aria-pressed="isApiKeyVisible(server.id)"
+                        :aria-label="isApiKeyVisible(server.id) ? '隐藏 Emby API Key' : '显示 Emby API Key'"
+                        :title="isApiKeyVisible(server.id) ? '隐藏 Emby API Key' : '显示 Emby API Key'"
+                        @click="toggleApiKeyVisible(server.id)"
+                      >
+                        <span :class="['eye-icon', { off: !isApiKeyVisible(server.id) }]" aria-hidden="true" />
+                      </button>
+                    </div>
+                  </label>
+                  <label>
+                    <span>反代端口</span>
+                    <input v-model.number="server.port" type="number" min="1" max="65535" />
+                  </label>
+                </div>
+                <div class="grid real-ip-grid">
+                  <label>
+                    <span>真实 IP 获取方式</span>
+                    <select v-model="server.real_ip_mode" @change="updateRealIpMode(server)">
+                      <option v-for="option in realIpModeOptions" :key="option.value" :value="option.value">
+                        {{ option.label }}
+                      </option>
+                    </select>
+                    <small v-if="server.real_ip_mode === 'header_list'" class="field-help">
+                      从下列常用 CDN 携带真实 IP 的 HTTP Header 中获取，按顺序取第一个能获取到的值。
+                    </small>
+                  </label>
+                  <label v-if="needsRealIpHeader(server)">
+                    <span>{{ server.real_ip_mode === 'header' ? 'HTTP Header' : 'CDN Headers' }}</span>
+                    <textarea
+                      v-model="server.real_ip_header"
+                      :placeholder="
+                        server.real_ip_mode === 'header'
+                          ? '例如：x-real-ip'
+                          : defaultCdnHeaders
+                      "
                     />
-                    <button
-                      type="button"
-                      class="secret-toggle"
-                      :aria-pressed="isApiKeyVisible(server.id)"
-                      :aria-label="isApiKeyVisible(server.id) ? '隐藏 Emby API Key' : '显示 Emby API Key'"
-                      :title="isApiKeyVisible(server.id) ? '隐藏 Emby API Key' : '显示 Emby API Key'"
-                      @click="toggleApiKeyVisible(server.id)"
-                    >
-                      <span :class="['eye-icon', { off: !isApiKeyVisible(server.id) }]" aria-hidden="true" />
-                    </button>
-                  </div>
-                </label>
-                <label>
-                  <span>反代端口</span>
-                  <input v-model.number="server.port" type="number" min="1" max="65535" />
-                </label>
+                  </label>
+                </div>
+                <p class="muted real-ip-help">
+                  默认使用系统识别。经过 CDN 或多层反代后 IP 不准时再配置，保存后会同步重启对应反代服务。
+                </p>
+                <div class="server-config-actions">
+                  <button class="primary" :disabled="saving" @click="saveSettings">
+                    {{ saving ? '保存中' : '保存配置' }}
+                  </button>
+                </div>
               </div>
-              <div class="grid real-ip-grid">
-                <label>
-                  <span>真实 IP 获取方式</span>
-                  <select v-model="server.real_ip_mode" @change="updateRealIpMode(server)">
-                    <option v-for="option in realIpModeOptions" :key="option.value" :value="option.value">
-                      {{ option.label }}
-                    </option>
-                  </select>
-                  <small v-if="server.real_ip_mode === 'header_list'" class="field-help">
-                    从下列常用 CDN 携带真实 IP 的 HTTP Header 中获取，按顺序取第一个能获取到的值。
-                  </small>
-                </label>
-                <label v-if="needsRealIpHeader(server)">
-                  <span>{{ server.real_ip_mode === 'header' ? 'HTTP Header' : 'CDN Headers' }}</span>
-                  <textarea
-                    v-model="server.real_ip_header"
-                    :placeholder="
-                      server.real_ip_mode === 'header'
-                        ? '例如：x-real-ip'
-                        : defaultCdnHeaders
-                    "
-                  />
-                </label>
-              </div>
-              <p class="muted real-ip-help">
-                默认使用系统识别。经过 CDN 或多层反代后 IP 不准时再配置，保存后会同步重启对应反代服务。
-              </p>
             </article>
           </div>
 
           <div class="grid common-grid">
             <label>
               <span>缓存秒数</span>
-              <input v-model.number="settings.cache_ttl_seconds" type="number" min="0" />
+              <input class="compact-number-input" v-model.number="settings.cache_ttl_seconds" type="number" min="0" />
             </label>
             <label>
               <span>缓存最大条数</span>
@@ -2482,20 +2548,20 @@ onBeforeUnmount(stopDashboardPolling)
             </label>
             <label>
               <span>巡检间隔秒数</span>
-              <input v-model.number="settings.connectivity_check_interval_seconds" type="number" min="10" max="3600" />
+              <input class="compact-number-input" v-model.number="settings.connectivity_check_interval_seconds" type="number" min="10" max="3600" />
             </label>
             <label>
               <span>单项超时秒数</span>
-              <input v-model.number="settings.connectivity_check_timeout_seconds" type="number" min="1" max="60" />
+              <input class="compact-number-input" v-model.number="settings.connectivity_check_timeout_seconds" type="number" min="1" max="60" />
             </label>
             <label>
               <span>反代无响应自动重启秒数</span>
-              <input v-model.number="settings.connectivity_auto_restart_seconds" type="number" min="0" max="86400" />
+              <input class="compact-number-input" v-model.number="settings.connectivity_auto_restart_seconds" type="number" min="0" max="86400" />
               <small class="field-help">填 0 表示不自动重启；只在反代端口连续无响应时触发。</small>
             </label>
           </div>
-          <div class="grid cache-filter-grid">
-            <label>
+          <div class="advanced-routing-grid">
+            <label class="cache-filter-mode">
               <span>缓存过滤模式</span>
               <select v-model="settings.cache_domain_filter_mode">
                 <option value="off">不过滤</option>
@@ -2503,36 +2569,37 @@ onBeforeUnmount(stopDashboardPolling)
                 <option value="blacklist">黑名单：命中不缓存</option>
               </select>
             </label>
-            <label>
+            <label class="cache-filter-domains">
               <span>缓存过滤域名</span>
               <textarea
                 v-model="settings.cache_domain_whitelist"
                 :disabled="settings.cache_domain_filter_mode === 'off'"
                 placeholder="支持多个域名、通配符或关键字；每行一个，例如：*.115cdn.* 或 115"
               />
+              <small class="field-help">
+                只匹配直链域名部分。白名单命中才缓存；黑名单命中不缓存，其他直链正常缓存。
+              </small>
+            </label>
+            <div class="head-resolve-grid">
+              <label class="check">
+                <input v-model="settings.enable_internal_redirect" type="checkbox" />
+                <span>开启内部重定向 HEAD 解析</span>
+              </label>
+              <label>
+                <span>HEAD 超时秒数</span>
+                <input class="compact-number-input" v-model.number="settings.internal_redirect_timeout_seconds" type="number" min="1" />
+              </label>
+            </div>
+            <label class="strm-mapping-field">
+              <span>STRM URL 映射</span>
+              <textarea
+                class="strm-mapping-input"
+                v-model="settings.strm_url_mappings"
+                spellcheck="false"
+                placeholder="每行一个映射：原地址 => 新地址&#10;https://source.example.com => http://media-gateway.local:5244&#10;高级正则：regex:https://source\\.(example|test)\\.com => http://media-gateway.local:5244"
+              />
             </label>
           </div>
-          <p class="muted cache-filter-help">
-            缓存过滤只匹配直链域名部分。白名单模式下命中才缓存；黑名单模式下命中不缓存，其他直链正常缓存。
-          </p>
-          <div class="row">
-            <label class="check">
-              <input v-model="settings.enable_internal_redirect" type="checkbox" />
-              <span>开启内部重定向 HEAD 解析</span>
-            </label>
-            <label class="small">
-              <span>HEAD 超时秒数</span>
-              <input v-model.number="settings.internal_redirect_timeout_seconds" type="number" min="1" />
-            </label>
-          </div>
-          <label class="block">
-            <span>STRM URL 映射</span>
-            <textarea
-              v-model="settings.strm_url_mappings"
-              spellcheck="false"
-              placeholder="每行一个映射：原地址 => 新地址&#10;https://source.example.com => http://media-gateway.local:5244&#10;高级正则：regex:https://source\\.(example|test)\\.com => http://media-gateway.local:5244"
-            />
-          </label>
 
           <section class="config-tools single">
             <div class="tool-block">
@@ -2564,9 +2631,6 @@ onBeforeUnmount(stopDashboardPolling)
                 <p class="muted">自动记录播放设备和 UA，也可以按播放频率临时禁用账号。</p>
               </div>
               <div class="panel-actions">
-                <button class="secondary" @click="clientControl.enabled = !clientControl.enabled">
-                  {{ clientControl.enabled ? '已启用' : '未启用' }}
-                </button>
                 <button class="secondary" @click="refreshClientControl">刷新</button>
                 <button class="primary" :disabled="savingClientControl" @click="saveClientControl">
                   {{ savingClientControl ? '保存中' : '保存' }}
@@ -2583,7 +2647,10 @@ onBeforeUnmount(stopDashboardPolling)
                 <input v-model="clientControl.playback_rate_limit_enabled" type="checkbox" />
                 <span>启用播放频率限制</span>
               </label>
-              <span class="client-count">已记录 {{ clientControl.records.length }} 个客户端</span>
+              <label class="check">
+                <input v-model="clientControl.concurrent_playback_limit_enabled" type="checkbox" />
+                <span>启用同时播放限制</span>
+              </label>
             </div>
             <div class="rate-limit-grid">
               <label>
@@ -2603,19 +2670,26 @@ onBeforeUnmount(stopDashboardPolling)
                 <input v-model.number="clientControl.playback_rate_limit_max_requests" type="number" min="1" />
               </label>
               <label>
-                <span>{{ clientControl.playback_rate_limit_action === 'disable_user' ? '重复拦截冷却（秒）' : '封禁时长（秒）' }}</span>
+                <span>封禁时长（秒）</span>
                 <input v-model.number="clientControl.playback_rate_limit_block_seconds" type="number" min="1" />
               </label>
+              <label>
+                <span>允许同时播放数</span>
+                <input
+                  v-model.number="clientControl.concurrent_playback_limit_max"
+                  type="number"
+                  min="1"
+                  :disabled="!clientControl.concurrent_playback_limit_enabled"
+                />
+              </label>
             </div>
-            <p class="muted rate-limit-help">
-              同一 IP 在窗口内超过次数后，按选择的方式处理：屏蔽 IP 为临时封禁；禁用用户会调用 Emby API 禁用账号；混合模式会同时处理用户和 IP。
-            </p>
             <div class="rate-block-list">
               <div v-if="activeRateLimitBlocks.length" class="rate-block-table-wrap">
-                <table class="rate-block-table">
+                <table class="rate-block-table client-rate-block-table">
                   <thead>
                     <tr>
                       <th>封禁方式</th>
+                      <th>封禁原因</th>
                       <th>服务器</th>
                       <th>IP</th>
                       <th>用户</th>
@@ -2626,6 +2700,7 @@ onBeforeUnmount(stopDashboardPolling)
                   <tbody>
                     <tr v-for="record in activeRateLimitBlocks" :key="record.id">
                       <td>{{ playbackRateActionLabel(record.action) }}</td>
+                      <td>{{ rateLimitBlockReason(record) }}</td>
                       <td>{{ record.server_name }}</td>
                       <td>
                         <strong>{{ rateLimitBlockIp(record) }}</strong>
@@ -2641,38 +2716,6 @@ onBeforeUnmount(stopDashboardPolling)
                 </table>
               </div>
               <div v-else class="empty-state compact">暂无频率限制封禁。</div>
-            </div>
-            <div class="client-filterbar">
-              <button
-                :class="['filter-button', { active: clientStatusFilter === 'all' }]"
-                @click="clientStatusFilter = 'all'"
-              >
-                全部 {{ clientControl.records.length }}
-              </button>
-              <button
-                :class="['filter-button', { active: clientStatusFilter === 'blocked' }]"
-                @click="clientStatusFilter = 'blocked'"
-              >
-                已禁用 {{ blockedClientCount }}
-              </button>
-              <button
-                :class="['filter-button', { active: clientStatusFilter === 'allowed' }]"
-                @click="clientStatusFilter = 'allowed'"
-              >
-                允许播放 {{ allowedClientCount }}
-              </button>
-              <input
-                v-model="clientKeywordFilter"
-                class="client-search"
-                placeholder="搜索 UA"
-              />
-              <button
-                class="secondary"
-                :disabled="clientStatusFilter === 'all' && !clientKeywordFilter"
-                @click="clearClientFilters"
-              >
-                清空筛选
-              </button>
             </div>
           </section>
 
@@ -2723,6 +2766,39 @@ onBeforeUnmount(stopDashboardPolling)
             </div>
             <div v-else class="empty-state compact">当前没有播放频率窗口数据。</div>
           </section>
+
+          <div class="client-filterbar client-filterbar-standalone">
+            <button
+              :class="['filter-button', { active: clientStatusFilter === 'all' }]"
+              @click="clientStatusFilter = 'all'"
+            >
+              全部 {{ clientControl.records.length }}
+            </button>
+            <button
+              :class="['filter-button', { active: clientStatusFilter === 'blocked' }]"
+              @click="clientStatusFilter = 'blocked'"
+            >
+              已禁用 {{ blockedClientCount }}
+            </button>
+            <button
+              :class="['filter-button', { active: clientStatusFilter === 'allowed' }]"
+              @click="clientStatusFilter = 'allowed'"
+            >
+              允许播放 {{ allowedClientCount }}
+            </button>
+            <input
+              v-model="clientKeywordFilter"
+              class="client-search"
+              placeholder="搜索 UA"
+            />
+            <button
+              class="secondary"
+              :disabled="clientStatusFilter === 'all' && !clientKeywordFilter"
+              @click="clearClientFilters"
+            >
+              清空筛选
+            </button>
+          </div>
 
           <section class="panel">
             <div class="panel-head">
@@ -2896,7 +2972,7 @@ onBeforeUnmount(stopDashboardPolling)
                   </div>
                 </div>
                 <p class="muted backup-note">
-                  不包含面板管理员用户名、密码、登录会话、运行日志文件和请求统计数据。
+                  备份文件会使用备份密码加密；不包含面板管理员用户名、密码、登录会话、运行日志文件和请求统计数据。
                 </p>
               </section>
 
@@ -2908,9 +2984,9 @@ onBeforeUnmount(stopDashboardPolling)
                 </div>
                 <div class="backup-drop-hint">
                   <strong>备份</strong>
-                  <span>点击后会自动生成 `embypanel-config-时间.json` 并弹出浏览器下载。</span>
+                  <span>输入备份密码后生成加密的 `embypanel-config-时间.json` 并弹出浏览器下载。</span>
                   <strong>还原</strong>
-                  <span>点击后选择本机配置文件，读取成功后自动还原并重启反代服务。</span>
+                  <span>点击后选择本机配置文件，加密备份需要输入对应密码，读取成功后自动还原并重启反代服务。</span>
                 </div>
               </section>
             </div>

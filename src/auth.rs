@@ -1,9 +1,12 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    net::SocketAddr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use axum::{
     Json,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{HeaderMap, header},
     response::{IntoResponse, Response},
 };
@@ -20,6 +23,8 @@ use crate::{
 };
 
 const SESSION_TTL_SECONDS: i64 = 86400 * 30;
+const LOGIN_FAILURE_WINDOW_SECONDS: i64 = 300;
+const LOGIN_FAILURE_LIMIT: usize = 8;
 pub const TOKEN_COOKIE_NAME: &str = "embypanel_token";
 
 #[derive(Debug, Deserialize)]
@@ -92,18 +97,26 @@ pub async fn setup(
 
 pub async fn login(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Response> {
+    let login_key = peer_addr.ip().to_string();
+    enforce_login_attempt_limit(&state, &login_key).await?;
     let payload: LoginRequest = state.crypto_keys.decrypt_named(&request, "credentials")?;
     let Some(admin) = state
         .settings_store
         .admin_password_hash(payload.username.trim())?
     else {
+        record_login_failure(&state, &login_key).await;
         return Err(AppError::Unauthorized(
             "invalid username or password".to_string(),
         ));
     };
-    verify_password(&payload.password, &admin.password_hash)?;
+    if let Err(err) = verify_password(&payload.password, &admin.password_hash) {
+        record_login_failure(&state, &login_key).await;
+        return Err(err);
+    }
+    clear_login_failures(&state, &login_key).await;
     create_session_response(&state, admin.admin_user_id).await
 }
 
@@ -204,6 +217,41 @@ fn validate_credentials(username: &str, password: &str) -> AppResult<()> {
         return Err(AppError::Validation("password cannot be empty".to_string()));
     }
     Ok(())
+}
+
+async fn enforce_login_attempt_limit(state: &AppState, key: &str) -> AppResult<()> {
+    let now = now_ts();
+    let mut attempts = state.login_failures.lock().await;
+    let failures = attempts.entry(key.to_string()).or_default();
+    while failures
+        .front()
+        .is_some_and(|timestamp| now.saturating_sub(*timestamp) > LOGIN_FAILURE_WINDOW_SECONDS)
+    {
+        failures.pop_front();
+    }
+    if failures.len() >= LOGIN_FAILURE_LIMIT {
+        return Err(AppError::RateLimited(
+            "too many login attempts, please try again later".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn record_login_failure(state: &AppState, key: &str) {
+    let now = now_ts();
+    let mut attempts = state.login_failures.lock().await;
+    let failures = attempts.entry(key.to_string()).or_default();
+    while failures
+        .front()
+        .is_some_and(|timestamp| now.saturating_sub(*timestamp) > LOGIN_FAILURE_WINDOW_SECONDS)
+    {
+        failures.pop_front();
+    }
+    failures.push_back(now);
+}
+
+async fn clear_login_failures(state: &AppState, key: &str) {
+    state.login_failures.lock().await.remove(key);
 }
 
 fn hash_password(password: &str) -> AppResult<String> {

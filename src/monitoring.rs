@@ -14,6 +14,7 @@ use crate::{
     config::Config,
     emby::{MediaOverview, PlaybackSession},
     error::AppResult,
+    error::safe_error_message,
     management_listen_addr, tz_offset_seconds,
 };
 
@@ -93,9 +94,13 @@ pub async fn media_overview(
                     Some(&server_id),
                     &server_name,
                     "读取媒体库总览失败",
-                    err.to_string(),
+                    safe_error_message(&err),
                 );
-                tracing::warn!(server = server_name, error = %err, "failed to fetch media overview");
+                tracing::warn!(
+                    server = server_name,
+                    error = %safe_error_message(&err),
+                    "failed to fetch media overview"
+                );
             }
         }
     }
@@ -137,9 +142,13 @@ pub async fn list_playback_sessions(
                     Some(&server_id),
                     &server_name,
                     "读取播放会话失败",
-                    err.to_string(),
+                    safe_error_message(&err),
                 );
-                tracing::warn!(server = server_name, error = %err, "failed to fetch playback sessions");
+                tracing::warn!(
+                    server = server_name,
+                    error = %safe_error_message(&err),
+                    "failed to fetch playback sessions"
+                );
             }
         }
     }
