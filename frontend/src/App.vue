@@ -401,6 +401,8 @@ const credentials = reactive({
   password: '',
 })
 
+const logoUrl = `${import.meta.env.BASE_URL}logo.svg`
+
 const profile = reactive<Profile>({
   username: '',
 })
@@ -672,6 +674,35 @@ function showNotice(message: string) {
   clearNotice()
   notice.value = message
   noticeTimer = window.setTimeout(clearNotice, 3500)
+}
+
+function isHttpUrl(value: string): boolean {
+  const trimmed = value.trim()
+  return trimmed.startsWith('http://') || trimmed.startsWith('https://')
+}
+
+async function copyText(value: string) {
+  const text = value.trim()
+  if (!text) {
+    return
+  }
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+    } else {
+      const textarea = document.createElement('textarea')
+      textarea.value = text
+      textarea.style.position = 'fixed'
+      textarea.style.opacity = '0'
+      document.body.appendChild(textarea)
+      textarea.select()
+      document.execCommand('copy')
+      document.body.removeChild(textarea)
+    }
+    showNotice('链接已复制')
+  } catch {
+    showNotice('复制失败，请手动复制')
+  }
 }
 
 function setPage(nextPage: Page) {
@@ -2047,7 +2078,7 @@ onBeforeUnmount(stopDashboardPolling)
   <main v-else-if="mode === 'setup' || mode === 'login'" class="auth-shell">
     <section class="auth-card">
       <div class="brand-row">
-        <div class="logo-mark">E</div>
+        <img class="logo-mark" :src="logoUrl" alt="Emby Panel" />
         <div>
           <h1>Emby Panel</h1>
           <p>{{ mode === 'setup' ? '首次初始化' : '管理员登录' }}</p>
@@ -2076,7 +2107,7 @@ onBeforeUnmount(stopDashboardPolling)
   <main v-else class="app-shell" :class="{ dark: darkMode }">
     <aside class="sidebar">
       <div class="brand-row compact">
-        <div class="logo-mark">E</div>
+        <img class="logo-mark" :src="logoUrl" alt="Emby Panel" />
         <button
           class="brand-version"
           :class="{ update: updateCheck?.has_update, error: Boolean(updateCheckError) }"
@@ -2133,9 +2164,15 @@ onBeforeUnmount(stopDashboardPolling)
         </div>
       </header>
 
+      <transition name="toast-fade">
+        <div v-if="notice" class="toast-notice">
+          <span class="toast-icon">✓</span>
+          <span>{{ notice }}</span>
+        </div>
+      </transition>
+
       <div class="content">
         <div v-if="error" class="notice error">{{ error }}</div>
-        <div v-if="notice" class="notice success">{{ notice }}</div>
 
         <section v-if="page === 'home'" class="dashboard">
           <section class="panel media-overview">
@@ -3096,7 +3133,16 @@ onBeforeUnmount(stopDashboardPolling)
                       <span v-if="entry.playback_user" class="user-pill">{{ entry.playback_user }}</span>
                       <span v-if="entry.playback_ip" class="ip-pill">{{ ipWithLocation(entry.playback_ip, entry.ip_location) }}</span>
                     </div>
-                    <p :class="{ 'log-detail': entry.kind === 'playback' }">{{ entry.detail || '暂无详情' }}</p>
+                    <p :class="{ 'log-detail': entry.kind === 'playback' }">
+                      <a
+                        v-if="entry.detail && isHttpUrl(entry.detail)"
+                        class="copy-link"
+                        href="#"
+                        title="点击复制链接"
+                        @click.prevent="copyText(entry.detail)"
+                      >{{ entry.detail }}</a>
+                      <template v-else>{{ entry.detail || '暂无详情' }}</template>
+                    </p>
                   </div>
                 </article>
               </template>

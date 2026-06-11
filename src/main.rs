@@ -1820,7 +1820,7 @@ fn record_playback_redirect(
 ) {
     let (server_id, server_name) = config_server_label(config);
     let message = message.into();
-    let log_detail = sanitized_detail_for_log(redirect_url);
+    let log_detail = redirect_url.to_string();
     state.activity_log.record_playback(PlaybackLogRecord {
         level: ActivityLevel::Success,
         server_id: Some(&server_id),

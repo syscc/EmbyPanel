@@ -1,0 +1,13 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Emby Panel">
+  <defs>
+    <linearGradient id="ep-bg" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3d6df2"/>
+      <stop offset="1" stop-color="#2fbf9b"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="url(#ep-bg)"/>
+  <rect x="16" y="17" width="22" height="6" rx="3" fill="#ffffff"/>
+  <rect x="16" y="29" width="15" height="6" rx="3" fill="#ffffff" fill-opacity="0.92"/>
+  <rect x="16" y="41" width="22" height="6" rx="3" fill="#ffffff"/>
+  <path d="M41 25 L52 32 L41 39 Z" fill="#ffffff"/>
+</svg>
