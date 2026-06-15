@@ -604,7 +604,7 @@ const clientRuleRows = computed(() =>
       if (!keyword) return true
       return record.user_agent.toLowerCase().includes(keyword)
     })
-    .sort((left, right) => Number(right.updated_at) - Number(left.updated_at)),
+    .sort((left, right) => Number(right.created_at) - Number(left.created_at)),
 )
 const blockedClientCount = computed(() => clientControl.records.filter((record) => record.enabled).length)
 const allowedClientCount = computed(() => clientControl.records.length - blockedClientCount.value)
@@ -1972,9 +1972,15 @@ function formatUptime(seconds: number | undefined) {
 }
 
 function formatTimestamp(value: string) {
+  const date = parseUnixTimestamp(value)
+  if (!date) return '--'
+  return date.toLocaleString()
+}
+
+function parseUnixTimestamp(value: string) {
   const timestamp = Number(value)
-  if (!Number.isFinite(timestamp) || timestamp <= 0) return '--'
-  return new Date(timestamp * 1000).toLocaleString()
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return null
+  return new Date(timestamp * 1000)
 }
 
 function formatLogTime(value: number) {
@@ -2057,13 +2063,6 @@ function requestOutcomeClass(row: ProxyRequestDetail) {
 
 function clientKeyword(record: ClientRuleRecord) {
   return record.user_agent || record.client_name || '--'
-}
-
-function clientSubtext(record: ClientRuleRecord) {
-  const keyword = clientKeyword(record).trim().toLowerCase()
-  const client = record.client_name.trim()
-  if (!client || client.toLowerCase() === keyword) return ''
-  return client
 }
 
 onMounted(bootstrap)
@@ -2864,6 +2863,10 @@ onBeforeUnmount(stopDashboardPolling)
           </section>
 
           <section class="panel client-table-panel">
+            <div class="client-date-note">
+              <strong>日期说明</strong>
+              <span>时间为该 UA 第一次出现或手动添加的时间；后台更新时间只在规则状态、备注或客户端信息变化时刷新，同一 UA 重复请求不会每次刷新。</span>
+            </div>
             <div class="client-table-wrap">
               <table class="client-table">
                 <thead>
@@ -2871,27 +2874,28 @@ onBeforeUnmount(stopDashboardPolling)
                     <th>关键字</th>
                     <th>描述</th>
                     <th>状态</th>
-                    <th>创建时间</th>
-                    <th>更新时间</th>
+                    <th>记录时间</th>
                     <th>操作</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr v-for="record in clientRuleRows" :key="record.id">
                     <td>
-                      <strong>{{ clientKeyword(record) }}</strong>
-                      <small v-if="clientSubtext(record)">{{ clientSubtext(record) }}</small>
+                      <strong :title="clientKeyword(record)">{{ clientKeyword(record) }}</strong>
                     </td>
                     <td>
-                      <span>{{ record.note || (record.source === 'auto' ? '自动记录播放设备' : '手动 UA 拦截') }}</span>
+                      <span :title="record.note || (record.source === 'auto' ? '自动记录播放设备' : '手动 UA 拦截')">
+                        {{ record.note || (record.source === 'auto' ? '自动记录播放设备' : '手动 UA 拦截') }}
+                      </span>
                     </td>
                     <td>
                       <span :class="['client-badge', record.enabled ? 'blocked' : 'allowed']">
                         {{ record.enabled ? '已禁用' : '允许播放' }}
                       </span>
                     </td>
-                    <td>{{ formatTimestamp(record.created_at) }}</td>
-                    <td>{{ formatTimestamp(record.updated_at) }}</td>
+                    <td class="client-time-cell">
+                      {{ formatTimestamp(record.created_at) }}
+                    </td>
                     <td>
                       <div class="rule-actions">
                         <button

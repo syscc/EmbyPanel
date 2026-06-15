@@ -1680,14 +1680,32 @@ label span {
   overflow: hidden;
 }
 
+.client-date-note {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: center;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--track-bg);
+  background: var(--panel-soft);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.client-date-note strong {
+  color: var(--text-soft);
+}
+
 .client-table-wrap {
   overflow-x: auto;
 }
 
 .client-table {
   width: 100%;
-  min-width: 900px;
+  min-width: 820px;
   border-collapse: collapse;
+  table-layout: fixed;
 }
 
 .client-table th,
@@ -1713,28 +1731,49 @@ label span {
 .client-table td {
   color: var(--button-text);
   font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .client-table td strong {
   display: block;
-  max-width: 380px;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--text);
   font-size: 13px;
 }
 
-.client-table td small {
-  display: block;
-  max-width: 380px;
-  margin-top: 4px;
-  color: var(--muted);
-  overflow-wrap: anywhere;
+.client-table th:nth-child(1) {
+  width: 28%;
+}
+
+.client-table th:nth-child(2) {
+  width: 24%;
+}
+
+.client-table th:nth-child(3) {
+  width: 96px;
+}
+
+.client-table th:nth-child(4) {
+  width: 170px;
+}
+
+.client-table th:nth-child(5) {
+  width: 150px;
+}
+
+.client-time-cell {
+  white-space: nowrap;
 }
 
 .rule-actions {
   display: flex;
   align-items: center;
   gap: 10px;
+  white-space: nowrap;
 }
 
 .client-badge {
@@ -2288,44 +2327,6 @@ textarea:focus {
     grid-column: 1 / -1;
     width: 100%;
     margin-left: 0;
-  }
-
-  .client-table {
-    min-width: 0;
-  }
-
-  .client-table thead {
-    display: none;
-  }
-
-  .client-table,
-  .client-table tbody,
-  .client-table tr,
-  .client-table td {
-    display: block;
-    width: 100%;
-  }
-
-  .client-table tr {
-    border-bottom: 1px solid var(--track-bg);
-    padding: 10px 12px;
-  }
-
-  .client-table td {
-    border-bottom: 0;
-    padding: 7px 0;
-  }
-
-  .client-table td:nth-child(3),
-  .client-table td:nth-child(4),
-  .client-table td:nth-child(5) {
-    display: inline-block;
-    width: auto;
-    margin-right: 10px;
-  }
-
-  .client-table td:last-child {
-    width: 100%;
   }
 
   .rule-actions {
