@@ -6,6 +6,7 @@
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {
+    "@lucide/vue": "^1.28.0",
     "@types/node-forge": "^1.3.14",
     "@vitejs/plugin-vue": "latest",
     "node-forge": "^1.4.0",

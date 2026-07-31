@@ -1,6 +1,43 @@
 <script setup lang="ts">
 import * as forge from 'node-forge'
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import {
+  Activity,
+  Archive,
+  Bell,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  CircleCheck,
+  Clock3,
+  Database,
+  Download,
+  Eye,
+  EyeOff,
+  FileText,
+  Gauge,
+  LayoutDashboard,
+  Languages,
+  LogOut,
+  Menu as MenuIcon,
+  Moon,
+  PlayCircle,
+  Plus,
+  RefreshCw,
+  RotateCw,
+  Server,
+  Settings2,
+  ShieldCheck,
+  SlidersHorizontal,
+  Sun,
+  Trash2,
+  Upload,
+  UserRound,
+  Users,
+  Webhook,
+  X,
+  Zap,
+} from '@lucide/vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 
 type Settings = {
   emby_host: string
@@ -303,6 +340,7 @@ type Page = 'home' | 'server' | 'clients' | 'notifications' | 'backup' | 'logs' 
 type ClientStatusFilter = 'all' | 'blocked' | 'allowed'
 type LogKindFilter = 'all' | 'playback' | 'general'
 type LogViewFilter = 'playback' | 'blocked' | 'proxy' | 'general'
+type Locale = 'zh-CN' | 'en-US'
 type EncryptionPublicKey =
   | { kind: 'webcrypto'; key: CryptoKey }
   | { kind: 'forge'; key: forge.pki.rsa.PublicKey }
@@ -310,11 +348,18 @@ type EncryptionPublicKey =
 const tokenKey = 'embypanel_token'
 const pageKey = 'embypanel_page'
 const themeKey = 'embypanel_theme'
+const localeKey = 'embypanel_locale'
 const validPages: Page[] = ['home', 'server', 'clients', 'logs', 'notifications', 'backup', 'account']
 const mode = ref<AuthMode>('loading')
 const page = ref<Page>(storedPage())
 const token = ref(storedToken())
 const darkMode = ref(storedTheme() === 'dark')
+const locale = ref<Locale>(storedLocale())
+const localeMenuOpen = ref(false)
+const mobileNavOpen = ref(false)
+const mobileMenuButton = ref<HTMLButtonElement | null>(null)
+const mobileNavCloseButton = ref<HTMLButtonElement | null>(null)
+const mobileSidebar = ref<HTMLElement | null>(null)
 const saving = ref(false)
 const restartingServerId = ref('')
 const changingPassword = ref(false)
@@ -369,7 +414,7 @@ const clientControl = reactive<ClientControlConfig>({
   webhooks: [{
     id: newWebhookId(),
     enabled: false,
-    name: '新建 Webhook',
+    name: 'Webhook',
     url: '',
     secret: '',
   }],
@@ -424,6 +469,368 @@ const appInfo = reactive<AppInfo>({
   ui_path: '/ui/',
 })
 
+const translations: Record<string, string> = {
+  '加载中': 'Loading',
+  '首次初始化': 'First-time setup',
+  '管理员登录': 'Administrator sign in',
+  '用户名': 'Username',
+  '密码': 'Password',
+  '处理中': 'Working',
+  '创建并进入': 'Create and enter',
+  '登录': 'Sign in',
+  '首页': 'Overview',
+  '服务器': 'Servers',
+  '客户端': 'Clients',
+  '日志': 'Logs',
+  '通知': 'Notifications',
+  '备份': 'Backups',
+  '账户': 'Account',
+  '退出登录': 'Sign out',
+  '切换到浅色模式': 'Switch to light mode',
+  '切换到暗夜模式': 'Switch to dark mode',
+  '浅色模式': 'Light mode',
+  '暗夜模式': 'Dark mode',
+  '中文': 'Chinese',
+  '英文': 'English',
+  '简体中文': 'Simplified Chinese',
+  '切换语言': 'Change language',
+  'English': 'English',
+  '检查更新': 'Check for updates',
+  '正在检查更新': 'Checking for updates',
+  '点击检查更新': 'Click to check for updates',
+  '有新版本': 'New version available',
+  '检查失败': 'Update check failed',
+  '版本读取中': 'Reading version',
+  '检查中': 'Checking',
+  '有更新': 'Update available',
+  '最新': 'Up to date',
+  '失败': 'Failed',
+  '媒体库总览': 'Media overview',
+  '在线': 'Online',
+  '电影': 'Movies',
+  '剧集': 'Series',
+  '总集数': 'Episodes',
+  '集数': 'Episodes',
+  '个媒体库': 'libraries',
+  '用户': 'Users',
+  '服务器状态': 'System health',
+  '运行': 'Uptime',
+  '内存': 'Memory',
+  '磁盘': 'Disk',
+  '核': 'cores',
+  '运维概览': 'Operations',
+  '健康检查、反代监听和今日请求统计。': 'Health checks, proxy listeners, and today\'s traffic.',
+  '刷新': 'Refresh',
+  '刷新中': 'Refreshing',
+  '今日请求': 'Requests today',
+  '重定向': 'Redirects',
+  '缓存命中': 'Cache hits',
+  '拦截 / 错误': 'Blocks / errors',
+  '健康': 'Healthy',
+  '待检查': 'Needs check',
+  'STRM 直链': 'STRM direct links',
+  '内存直链缓存': 'In-memory direct-link cache',
+  '今日累计': 'Today total',
+  '端口': 'Port',
+  '最近请求': 'Last request',
+  '最近巡检': 'Last check',
+  '耗时': 'Latency',
+  '反代': 'Proxy',
+  '最近自动重启': 'Last automatic restart',
+  '播放频率限制': 'Playback rate limit',
+  '活跃窗口': 'Active windows',
+  '已封禁': 'Blocked',
+  '最高命中': 'Peak count',
+  '实时播放': 'Live playback',
+  '转码': 'Transcoding',
+  '直放': 'Direct play',
+  '服务器配置': 'Server configuration',
+  '添加服务器': 'Add server',
+  '测试配置': 'Test configuration',
+  '保存配置': 'Save configuration',
+  '保存中': 'Saving',
+  '收起配置': 'Collapse',
+  '展开配置': 'Configure',
+  '关闭服务器': 'Disable server',
+  '开启服务器': 'Enable server',
+  '重启服务器': 'Restart server',
+  '重启中': 'Restarting',
+  '删除': 'Delete',
+  '名称': 'Name',
+  'Emby 地址': 'Emby address',
+  '反代端口': 'Proxy port',
+  '真实 IP 获取方式': 'Client IP strategy',
+  '缓存秒数': 'Cache TTL (seconds)',
+  '缓存最大条数': 'Cache capacity',
+  'OpenList 地址': 'OpenList address',
+  'OpenList Token': 'OpenList token',
+  '客户端管控': 'Client controls',
+  '通知配置': 'Notification settings',
+  '配置备份': 'Configuration backup',
+  '账户资料': 'Profile',
+  '修改密码': 'Change password',
+  '配置审计': 'Configuration audit',
+  '保存': 'Save',
+  '导出 CSV': 'Export CSV',
+  '筛选': 'Filter',
+  '搜索': 'Search',
+  '添加 Webhook': 'Add webhook',
+  '命中通知': 'Match notifications',
+  '启用': 'Enabled',
+  '密钥（可选）': 'Secret (optional)',
+  'Webhook 使用 POST JSON 发送：{ title, text }。命中通知包含播放频率屏蔽和 UA 拦截命中。': 'Webhooks send POST JSON with { title, text } for rate-limit and UA block events.',
+  '例如：企业微信通知': 'e.g. Operations notification',
+  '可选密钥': 'Optional secret',
+  '请求体固定为 {"title":"${title}","text":"${text}"}，密钥会通过 `X-Webhook-Secret` 头发送。': 'The request body is {"title":"${title}","text":"${text}"}; the secret is sent in the X-Webhook-Secret header.',
+  '导出备份': 'Export',
+  '还原': 'Restore',
+  '关闭': 'Close',
+  '成功': 'Success',
+  '警告': 'Warning',
+  '错误': 'Error',
+  '信息': 'Info',
+  '正常': 'Normal',
+  '异常': 'Issue',
+  '未启动': 'Stopped',
+  '未启用': 'Disabled',
+  '监听中': 'Listening',
+  '未监听': 'Not listening',
+  '未巡检': 'Not checked',
+  '未配置': 'Not configured',
+  '无失败': 'No failures',
+  '暂无详情': 'No details',
+  '暂无审计记录。': 'No audit records.',
+  '主导航': 'Primary navigation',
+  '系统在线': 'System online',
+  '打开导航': 'Open navigation',
+  '播放日志': 'Playback logs',
+  '拦截日志': 'Blocked logs',
+  '反代请求': 'Proxy requests',
+  '运行日志': 'Runtime logs',
+  '实时刷新': 'Live refresh',
+  '日志文件配置': 'Log file settings',
+  '系统识别': 'Automatic detection',
+  '从 HTTP Header 中获取': 'Read from an HTTP header',
+  '从 Header 列表中获取': 'Read from a header list',
+  '获取 X-Forwarded-For 的上一级代理地址': 'Use the previous X-Forwarded-For hop',
+  '获取 X-Forwarded-For 的上上一级代理地址': 'Use the second previous X-Forwarded-For hop',
+  '获取 X-Forwarded-For 的上上上一级代理地址': 'Use the third previous X-Forwarded-For hop',
+  '屏蔽 IP': 'Block IP',
+  '禁用用户': 'Disable user',
+  '混合模式': 'Mixed mode',
+  '屏蔽频繁播放的 IP': 'Block high-frequency playback IPs',
+  '通过 API 禁用该用户': 'Disable the user through the API',
+  '同时禁用用户并屏蔽频繁播放的 IP': 'Disable the user and block the IP',
+  '全部级别': 'All levels',
+  '已拦截': 'Blocked',
+  '封禁变更': 'Ban changes',
+  'REDIRECT - 直链/跳转': 'REDIRECT - direct link / redirect',
+  'CACHE - 缓存命中': 'CACHE - cache hit',
+  'WARNING - 警告': 'WARNING - warning',
+  'BLOCKED - 已拦截': 'BLOCKED - blocked',
+  'INFO - 信息': 'INFO - info',
+  'SUCCESS - 成功': 'SUCCESS - success',
+  'ERROR - 错误': 'ERROR - error',
+  'DEBUG - 调试': 'DEBUG - debug',
+  'CRITICAL - 严重': 'CRITICAL - critical',
+  '正在读取媒体库总览': 'Reading media overview',
+  '正在读取服务器状态': 'Reading system health',
+  '首页直接查看当前窗口命中和封禁情况。': 'Monitor active windows and blocks at a glance.',
+  '当前监控中的 IP': 'IPs currently being monitored',
+  '屏蔽 IP / 禁用用户': 'Blocked IPs / disabled users',
+  '当前窗口最大次数': 'Highest count in the current window',
+  '封禁方式': 'Action',
+  '命中': 'Hits',
+  '窗口': 'Window',
+  '状态': 'Status',
+  '条': 'records',
+  '解除封禁': 'Unblock',
+  '观察中': 'Watching',
+  '当前没有播放频率窗口数据。': 'No playback rate windows.',
+  '正在读取 Emby 播放会话': 'Reading Emby sessions',
+  '当前没有正在播放的媒体': 'No media is playing',
+  '每个 Emby 服务器使用独立反代端口，保存后自动监听。': 'Each Emby server uses an independent proxy port and starts listening after save.',
+  '例如：主服务器': 'e.g. Main server',
+  '启动': 'Started',
+  '隐藏 Emby API Key': 'Hide Emby API key',
+  '显示 Emby API Key': 'Show Emby API key',
+  '例如：x-real-ip': 'e.g. x-real-ip',
+  '从下列常用 CDN 携带真实 IP 的 HTTP Header 中获取，按顺序取第一个能获取到的值。': 'Check the common CDN client-IP headers below and use the first available value.',
+  '默认使用系统识别。经过 CDN 或多层反代后 IP 不准时再配置，保存后会同步重启对应反代服务。': 'Use automatic detection by default. Configure this only when a CDN or proxy chain reports the wrong IP.',
+  '可选': 'Optional',
+  '启用服务器连通性巡检': 'Enable connectivity checks',
+  '巡检间隔秒数': 'Check interval (seconds)',
+  '单项超时秒数': 'Check timeout (seconds)',
+  '反代无响应自动重启秒数': 'Proxy auto-restart delay (seconds)',
+  '填 0 表示不自动重启；只在反代端口连续无响应时触发。': 'Use 0 to disable automatic restarts. It only triggers after continuous proxy failures.',
+  '缓存过滤模式': 'Cache filter mode',
+  '不过滤': 'No filter',
+  '白名单：命中才缓存': 'Allowlist: cache matches only',
+  '黑名单：命中不缓存': 'Blocklist: skip matching hosts',
+  '缓存过滤域名': 'Cache host filters',
+  '支持多个域名、通配符或关键字；每行一个，例如：*.115cdn.* 或 115': 'One host, wildcard, or keyword per line, such as *.115cdn.* or 115',
+  '只匹配直链域名部分。白名单命中才缓存；黑名单命中不缓存，其他直链正常缓存。': 'Filters match direct-link hosts only. Allowlist matches are cached; blocklist matches are skipped.',
+  '开启内部重定向 HEAD 解析': 'Resolve internal redirects with HEAD',
+  'HEAD 超时秒数': 'HEAD timeout (seconds)',
+  'STRM URL 映射': 'STRM URL mappings',
+  '配置测试结果': 'Configuration test results',
+  '重新测试': 'Run again',
+  '还没有运行配置测试。': 'No configuration test has run yet.',
+  '自动记录播放设备和 UA，也可以按播放频率临时禁用账号。': 'Track playback devices and user agents, with temporary rate-based blocks.',
+  '启用 UA 拦截': 'Enable UA blocking',
+  '启用播放频率限制': 'Enable playback rate limiting',
+  '启用同时播放限制': 'Enable concurrent playback limit',
+  '屏蔽方式': 'Block action',
+  '封禁原因': 'Block reason',
+  '同时播放超限': 'Concurrent playback limit',
+  '到期时间': 'Expires',
+  '检测时间窗口（秒）': 'Detection window (seconds)',
+  '最大播放次数': 'Maximum play requests',
+  '封禁时长（秒）': 'Block duration (seconds)',
+  '允许同时播放数': 'Concurrent play limit',
+  '当前次数': 'Current count',
+  '阈值': 'Threshold',
+  '剩余': 'Remaining',
+  '重置时间': 'Resets',
+  '暂无频率限制封禁。': 'No active rate-limit blocks.',
+  '播放频率窗口': 'Playback rate windows',
+  '显示当前检测窗口内各 IP 的播放请求计数。': 'Request counts for each IP in the current detection window.',
+  '客户端记录': 'Client records',
+  '手动添加 UA 拦截': 'Add a UA block',
+  '输入 UA 完整内容或关键字，保存后默认进入禁用状态。': 'Enter a full UA or keyword. New rules start in blocked mode.',
+  'UA 关键字': 'UA keyword',
+  '描述': 'Description',
+  '例如：Infuse / Fileball / okhttp': 'e.g. Infuse / Fileball / okhttp',
+  '例如：临时禁用某客户端': 'e.g. Temporarily block a client',
+  '日期说明': 'Date reference',
+  '时间为该 UA 第一次出现或手动添加的时间；后台更新时间只在规则状态、备注或客户端信息变化时刷新，同一 UA 重复请求不会每次刷新。': 'The date is when this UA first appeared or was added. Repeated requests do not continually update it.',
+  '关键字': 'Keyword',
+  '记录时间': 'Recorded at',
+  '操作': 'Actions',
+  '自动记录播放设备': 'Automatically detected playback device',
+  '手动 UA 拦截': 'Manual UA block',
+  '关闭 UA 拦截': 'Disable UA blocking',
+  '开启 UA 拦截': 'Enable UA blocking',
+  '当前筛选没有匹配的客户端。': 'No clients match the current filters.',
+  '暂无客户端记录，开始播放后会自动出现，也可以手动添加 UA 拦截。': 'No client records yet. Playback devices appear automatically, or you can add a UA block.',
+  '添加拦截': 'Add block',
+  '添加中': 'Adding',
+  '搜索 UA': 'Search UA',
+  '清空筛选': 'Clear filters',
+  '全部': 'All',
+  '已禁用': 'Disabled',
+  '允许播放': 'Allowed',
+  '保存通知': 'Save notifications',
+  '测试连接': 'Test connection',
+  '测试中': 'Testing',
+  '配置文件备份 / 还原': 'Backup / restore',
+  '导出配置文件，或从电脑选择配置文件还原运行配置。': 'Export a configuration file or restore one from this device.',
+  '备份范围': 'Backup scope',
+  'Emby 地址、API Key、反代端口、真实 IP、缓存和映射规则': 'Emby address, API key, proxy port, client IP, cache, and mapping rules',
+  'UA 拦截、播放频率限制、封禁列表和客户端规则': 'UA blocks, playback limits, ban lists, and client rules',
+  'Webhook 地址、启用状态和密钥': 'Webhook URLs, enabled state, and secrets',
+  '日志配置': 'Log settings',
+  '日志级别、文件大小、保留数量和格式': 'Log level, file size, retention count, and format',
+  '备份文件会使用备份密码加密；不包含面板管理员用户名、密码、登录会话、运行日志文件和请求统计数据。': 'Backups are encrypted with your password and exclude administrator credentials, sessions, runtime logs, and request statistics.',
+  '输入备份密码后生成加密的 `embypanel-config-时间.json` 并弹出浏览器下载。': 'Enter a password to create and download an encrypted embypanel-config timestamp file.',
+  '点击后选择本机配置文件，加密备份需要输入对应密码，读取成功后自动还原并重启反代服务。': 'Choose a local configuration file. Encrypted backups require their password and restart proxy services after restore.',
+  '日志类型': 'Log type',
+  '单列表查看播放日志、拦截日志、反代请求和运行日志，页面打开时每 3 秒自动刷新。': 'Review playback, blocked, proxy, and runtime logs in one stream with a three-second live refresh.',
+  '级别': 'Level',
+  '全部服务器': 'All servers',
+  '请求类型': 'Request type',
+  '全部请求': 'All requests',
+  '关键词': 'Keyword',
+  '搜索用户 / IP / URL / 信息': 'Search user / IP / URL / message',
+  '开始时间': 'Start time',
+  '结束时间': 'End time',
+  '加载更多': 'Load more',
+  '单次最多': 'Up to',
+  '保留': 'retained for',
+  '天或最近': 'days or the latest',
+  '内存最多保留最近': 'Memory retains the latest',
+  '条可视化日志': 'visual log records',
+  '点击复制链接': 'Click to copy link',
+  '未命中': 'Miss',
+  '已解除': 'Unblocked',
+  '未拦截': 'Not blocked',
+  '已显示': 'Showing',
+  '暂无': 'No',
+  '保存日志配置': 'Save log settings',
+  '日志级别': 'Log level',
+  '单文件最大 MB': 'Maximum file size (MB)',
+  '保留文件数': 'Files to retain',
+  '日志格式': 'Log format',
+  '日志写入 data/logs/embypanel.log，默认 INFO 级别。': 'Logs are written to data/logs/embypanel.log at INFO level by default.',
+  '操作类型': 'Action type',
+  '记录配置、账户、通知、备份恢复等管理操作，不保存敏感明文。': 'Tracks configuration, account, notification, and restore actions without storing sensitive plaintext.',
+  '保存资料': 'Save profile',
+  '修改中': 'Updating',
+  '当前密码': 'Current password',
+  '新密码': 'New password',
+  '确认新密码': 'Confirm new password',
+  '全部操作': 'All actions',
+  '搜索管理员 / 操作 / 摘要': 'Search admin / action / summary',
+  '链接已复制': 'Link copied',
+  '复制失败，请手动复制': 'Copy failed. Copy it manually.',
+  '配置测试通过': 'Configuration test passed',
+  '配置测试完成，请查看警告项': 'Configuration test finished. Review warnings.',
+  '日志配置已保存': 'Log settings saved',
+  '账户资料已更新': 'Profile updated',
+  '客户端管控规则已保存': 'Client control rules saved',
+  'Webhook URL 不能为空': 'Webhook URL is required',
+  'Webhook 测试发送成功': 'Webhook test sent',
+  'EmbyPanel 通知测试': 'EmbyPanel notification test',
+  'Webhook POST 测试成功': 'Webhook POST test succeeded',
+  '新建 Webhook': 'New webhook',
+  'UA 关键字不能为空': 'UA keyword is required',
+  'UA 拦截规则已添加': 'UA block added',
+  '新密码不能为空': 'New password is required',
+  '两次输入的新密码不一致': 'The new passwords do not match',
+  '管理员密码已更新': 'Administrator password updated',
+  'UA 规则已删除': 'UA rule deleted',
+  '登录已过期，请重新登录': 'Your session expired. Sign in again.',
+  '加密请求失败': 'Unable to encrypt the request',
+  '反代服务已重启': 'Proxy service restarted',
+  '已开启': 'enabled',
+  '已关闭': 'disabled',
+  '确定删除这个服务器配置吗？对应反代端口保存后会停止监听。': 'Delete this server configuration? Its proxy port will stop listening after save.',
+  '服务器配置已保存，反代服务已重启': 'Server configuration saved. Proxy services restarted.',
+  '请输入备份密码（至少 4 位），用于加密配置文件': 'Enter a backup password (at least 4 characters).',
+  '备份密码至少需要 4 位': 'Backup passwords need at least 4 characters.',
+  '加密配置备份已生成，请妥善保存备份密码': 'Encrypted backup created. Keep the password safe.',
+  '配置文件内容为空': 'The configuration file is empty.',
+  '还原配置文件会覆盖当前配置并重启反代服务，确定继续吗？': 'Restoring will overwrite the current configuration and restart proxy services. Continue?',
+  '请输入该加密备份的密码': 'Enter the password for this encrypted backup.',
+  '加密备份密码不能为空': 'The encrypted backup password cannot be empty.',
+  '配置文件已还原，反代服务已重启': 'Configuration restored. Proxy services restarted.',
+  '用户封禁已解除': 'User ban lifted',
+  '混合封禁已解除': 'Mixed ban lifted',
+  'IP 屏蔽已解除': 'IP block lifted',
+  '封禁动作': 'Ban action',
+  '封禁': 'Block',
+  '解除封禁动作': 'Unblock action',
+  '缓存': 'Cache',
+  '跳转': 'Redirect',
+  '视频流': 'Video stream',
+  '播放信息': 'Playback info',
+  '系统信息': 'System info',
+  '播放器脚本': 'Player script',
+  '普通代理': 'Standard proxy',
+  '配置': 'Configuration',
+  '本地配置校验通过': 'Local configuration passed',
+  '本地配置校验失败': 'Local configuration failed',
+  '反代端口重复': 'Duplicate proxy port',
+  '反代端口正在由当前服务监听': 'The current service is listening on this proxy port',
+  '反代端口可用': 'Proxy port is available',
+  '反代端口已被占用': 'Proxy port is already in use',
+  'Emby API Key 可用': 'Emby API key is valid',
+  'Emby 连接失败': 'Emby connection failed',
+  'OpenList 连接可用': 'OpenList connection is available',
+  'OpenList 连接失败': 'OpenList connection failed',
+  '未配置，已跳过': 'Not configured; skipped',
+}
+
 const manualClientRule = reactive({
   user_agent: '',
   note: '',
@@ -450,13 +857,13 @@ const settings = reactive<Settings>({
 })
 
 const menu = [
-  { id: 'home' as const, label: '首页', icon: '⌂' },
-  { id: 'server' as const, label: '服务器', icon: '▣' },
-  { id: 'clients' as const, label: '客户端', icon: '◫' },
-  { id: 'logs' as const, label: '日志', icon: '≡' },
-  { id: 'notifications' as const, label: '通知', icon: '◇' },
-  { id: 'backup' as const, label: '备份', icon: '▤' },
-  { id: 'account' as const, label: '账户', icon: '◎' },
+  { id: 'home' as const, label: '首页', icon: LayoutDashboard },
+  { id: 'server' as const, label: '服务器', icon: Server },
+  { id: 'clients' as const, label: '客户端', icon: Users },
+  { id: 'logs' as const, label: '日志', icon: FileText },
+  { id: 'notifications' as const, label: '通知', icon: Bell },
+  { id: 'backup' as const, label: '备份', icon: Archive },
+  { id: 'account' as const, label: '账户', icon: UserRound },
 ]
 
 const activityLogMaxLimit = 800
@@ -508,10 +915,15 @@ const defaultCdnHeaders = [
 ].join('\n')
 
 const activePlayCount = computed(() => playbackSessions.value.length)
+const strmMappingPlaceholder = computed(() =>
+  locale.value === 'en-US'
+    ? 'One mapping per line: source => target\nhttps://source.example.com => http://media-gateway.local:5244\nRegex: regex:https://source\\.(example|test)\\.com => http://media-gateway.local:5244'
+    : '每行一个映射：原地址 => 新地址\nhttps://source.example.com => http://media-gateway.local:5244\n高级正则：regex:https://source\\.(example|test)\\.com => http://media-gateway.local:5244',
+)
 const logServers = computed(() =>
   settings.servers.map((server) => ({
     id: server.id,
-    name: server.name || `端口 ${server.port}`,
+    name: server.name || `${t('端口')} ${server.port}`,
     port: server.port,
     enabled: server.enabled,
   })),
@@ -521,7 +933,7 @@ const generalLogRows = computed(() =>
   activityLogs.value.filter((entry) => entry.kind === 'general'),
 )
 const requestDetailRows = computed(() => proxyRequestDetails.value)
-const selectedLogViewLabel = computed(() => logViewLabels[selectedLogView.value])
+const selectedLogViewLabel = computed(() => t(logViewLabels[selectedLogView.value]))
 const visibleActivityLogRows = computed(() =>
   activityLogs.value.filter((entry) => selectedLogLevel.value === 'all' || entry.level === selectedLogLevel.value),
 )
@@ -699,15 +1111,17 @@ async function copyText(value: string) {
       document.execCommand('copy')
       document.body.removeChild(textarea)
     }
-    showNotice('链接已复制')
+    showNotice(t('链接已复制'))
   } catch {
-    showNotice('复制失败，请手动复制')
+    showNotice(t('复制失败，请手动复制'))
   }
 }
 
 function setPage(nextPage: Page) {
   clearNotice()
   page.value = nextPage
+  closeMobileNav()
+  localeMenuOpen.value = false
   writeStorage(localStorage, pageKey, nextPage)
   if (nextPage === 'logs') void refreshActivityLogs()
 }
@@ -720,6 +1134,66 @@ function resetLogLimits() {
 
 function storedTheme() {
   return readStorage(localStorage, themeKey) || 'light'
+}
+
+function storedLocale(): Locale {
+  return readStorage(localStorage, localeKey) === 'en-US' ? 'en-US' : 'zh-CN'
+}
+
+function t(source: string) {
+  return locale.value === 'en-US' ? translations[source] || source : source
+}
+
+function localizeValidationText(source: string) {
+  if (locale.value !== 'en-US') return source
+  const translated = translations[source]
+  if (translated) return translated
+  const port = source.match(/^端口\s+(.+)$/)
+  return port ? `${translations['端口']} ${port[1]}` : source
+}
+
+function setLocale(nextLocale: Locale) {
+  locale.value = nextLocale
+  writeStorage(localStorage, localeKey, nextLocale)
+  document.documentElement.lang = nextLocale
+  localeMenuOpen.value = false
+}
+
+function toggleLocaleMenu() {
+  localeMenuOpen.value = !localeMenuOpen.value
+}
+
+function closeMobileNav() {
+  const wasOpen = mobileNavOpen.value
+  mobileNavOpen.value = false
+  if (wasOpen && window.matchMedia('(max-width: 980px)').matches) {
+    void nextTick(() => mobileMenuButton.value?.focus())
+  }
+}
+
+function toggleMobileNav() {
+  if (mobileNavOpen.value) {
+    closeMobileNav()
+    return
+  }
+  mobileNavOpen.value = true
+  void nextTick(() => mobileNavCloseButton.value?.focus())
+}
+
+function trapMobileNavFocus(event: KeyboardEvent) {
+  if (event.key !== 'Tab' || !mobileNavOpen.value || !window.matchMedia('(max-width: 980px)').matches) return
+  const focusable = [...(mobileSidebar.value?.querySelectorAll<HTMLElement>('button:not(:disabled), a[href]') || [])]
+    .filter((element) => element.offsetParent !== null)
+  const first = focusable[0]
+  const last = focusable.at(-1)
+  if (!first || !last) return
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault()
+    last.focus()
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault()
+    first.focus()
+  }
 }
 
 function toggleTheme() {
@@ -897,7 +1371,7 @@ async function saveSettings() {
     })
     Object.assign(settings, response)
     normalizeSettingsServers()
-    showNotice('服务器配置已保存，反代服务已重启')
+    showNotice(t('服务器配置已保存，反代服务已重启'))
     await refreshOperationalData()
     await refreshDashboard()
   } catch (err) {
@@ -919,7 +1393,7 @@ async function validateSettings() {
       body: JSON.stringify(await encryptPayload('settings', payload)),
     })
     validationResults.value = response.results
-    showNotice(response.ok ? '配置测试通过' : '配置测试完成，请查看警告项')
+    showNotice(response.ok ? t('配置测试通过') : t('配置测试完成，请查看警告项'))
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -930,10 +1404,10 @@ async function validateSettings() {
 async function exportBackup() {
   backupError.value = ''
   clearNotice()
-  const password = window.prompt('请输入备份密码（至少 4 位），用于加密配置文件')
+  const password = window.prompt(t('请输入备份密码（至少 4 位），用于加密配置文件'))
   if (password === null) return
   if (password.trim().length < 4) {
-    backupError.value = '备份密码至少需要 4 位'
+    backupError.value = t('备份密码至少需要 4 位')
     return
   }
   try {
@@ -942,7 +1416,7 @@ async function exportBackup() {
       body: JSON.stringify(await encryptPayload('backup_export', { password })),
     })
     downloadTextFile(response.backup, backupFileName())
-    showNotice('加密配置备份已生成，请妥善保存备份密码')
+    showNotice(t('加密配置备份已生成，请妥善保存备份密码'))
   } catch (err) {
     backupError.value = err instanceof Error ? err.message : String(err)
   }
@@ -974,17 +1448,17 @@ async function importBackupText(backupText: string) {
   clearNotice()
   const backup = backupText.trim()
   if (!backup) {
-    backupError.value = '配置文件内容为空'
+    backupError.value = t('配置文件内容为空')
     return
   }
-  const confirmed = window.confirm('还原配置文件会覆盖当前配置并重启反代服务，确定继续吗？')
+  const confirmed = window.confirm(t('还原配置文件会覆盖当前配置并重启反代服务，确定继续吗？'))
   if (!confirmed) return
   const encryptedBackup = backup.startsWith('{') && backup.includes('"cipher"')
-  const password = encryptedBackup ? window.prompt('请输入该加密备份的密码') : null
+  const password = encryptedBackup ? window.prompt(t('请输入该加密备份的密码')) : null
   if (encryptedBackup && password === null) return
   const backupPassword = password?.trim() || ''
   if (encryptedBackup && !backupPassword) {
-    backupError.value = '加密备份密码不能为空'
+    backupError.value = t('加密备份密码不能为空')
     return
   }
   try {
@@ -995,7 +1469,7 @@ async function importBackupText(backupText: string) {
     Object.assign(settings, response)
     normalizeSettingsServers()
     await refreshOperationalData()
-    showNotice('配置文件已还原，反代服务已重启')
+    showNotice(t('配置文件已还原，反代服务已重启'))
   } catch (err) {
     backupError.value = err instanceof Error ? err.message : String(err)
   }
@@ -1029,7 +1503,7 @@ async function saveLogConfig() {
       method: 'PUT',
       body: JSON.stringify(await encryptPayload('log_config', { ...logConfig })),
     }))
-    showNotice('日志配置已保存')
+    showNotice(t('日志配置已保存'))
   } catch (err) {
     logsError.value = err instanceof Error ? err.message : String(err)
   }
@@ -1077,7 +1551,7 @@ async function restartProxyServer(server: EmbyServerConfig) {
     })
     Object.assign(settings, response)
     normalizeSettingsServers()
-    showNotice(`${server.name || '服务器'} 反代服务已重启`)
+    showNotice(`${server.name || t('服务器')} ${t('反代服务已重启')}`)
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -1097,7 +1571,7 @@ async function toggleProxyServer(server: EmbyServerConfig) {
     })
     Object.assign(settings, response)
     normalizeSettingsServers()
-    showNotice(`${server.name || '服务器'} 已${nextEnabled ? '开启' : '关闭'}`)
+    showNotice(`${server.name || t('服务器')} ${nextEnabled ? t('已开启') : t('已关闭')}`)
     await refreshOperationalData()
     await refreshDashboard()
   } catch (err) {
@@ -1147,7 +1621,7 @@ function addServer() {
 function newBlankServer(index: number, port: number): EmbyServerConfig {
   return {
     id: newServerId(),
-    name: `服务器 ${index}`,
+    name: `${t('服务器')} ${index}`,
     emby_host: '',
     emby_api_key: '',
     port,
@@ -1179,7 +1653,7 @@ function toggleServerExpanded(serverId: string) {
 }
 
 function removeServer(serverId: string) {
-  const confirmed = window.confirm('确定删除这个服务器配置吗？对应反代端口保存后会停止监听。')
+  const confirmed = window.confirm(t('确定删除这个服务器配置吗？对应反代端口保存后会停止监听。'))
   if (!confirmed) return
   settings.servers = settings.servers.filter((server) => server.id !== serverId)
   const { [serverId]: _removed, ...visibleServers } = visibleApiKeyServers.value
@@ -1215,7 +1689,7 @@ async function saveProfile() {
     })
     Object.assign(profile, response)
     profileForm.username = response.username
-    showNotice('账户资料已更新')
+    showNotice(t('账户资料已更新'))
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -1233,7 +1707,7 @@ async function saveClientControl() {
       body: JSON.stringify(await encryptPayload('client_control', sanitizeClientControl())),
     })
     applyClientControlConfig(response)
-    showNotice('客户端管控规则已保存')
+    showNotice(t('客户端管控规则已保存'))
   } catch (err) {
     clientControlError.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -1267,7 +1741,7 @@ async function testWebhook(webhook: WebhookNotifyConfig) {
   clearNotice()
   const url = webhook.url.trim()
   if (!url) {
-    clientControlError.value = 'Webhook URL 不能为空'
+    clientControlError.value = t('Webhook URL 不能为空')
     return
   }
   testingWebhook.value = true
@@ -1278,12 +1752,12 @@ async function testWebhook(webhook: WebhookNotifyConfig) {
         await encryptPayload('webhook_test', {
           url,
           secret: webhook.secret.trim() || null,
-          title: 'EmbyPanel 通知测试',
-          text: 'Webhook POST 测试成功',
+          title: t('EmbyPanel 通知测试'),
+          text: t('Webhook POST 测试成功'),
         }),
       ),
     })
-    showNotice('Webhook 测试发送成功')
+    showNotice(t('Webhook 测试发送成功'))
   } catch (err) {
     clientControlError.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -1312,7 +1786,7 @@ function newWebhookConfig(): WebhookNotifyConfig {
   return {
     id: newWebhookId(),
     enabled: true,
-    name: '新建 Webhook',
+    name: t('新建 Webhook'),
     url: '',
     secret: '',
   }
@@ -1322,7 +1796,7 @@ function normalizeWebhook(webhook: Partial<WebhookNotifyConfig>): WebhookNotifyC
   return {
     id: webhook.id?.trim() || newWebhookId(),
     enabled: Boolean(webhook.enabled),
-    name: webhook.name?.trim() || '新建 Webhook',
+    name: webhook.name?.trim() || t('新建 Webhook'),
     url: webhook.url?.trim() || '',
     secret: webhook.secret?.trim() || '',
   }
@@ -1350,7 +1824,7 @@ async function addClientRule() {
   clearNotice()
   const userAgent = manualClientRule.user_agent.trim()
   if (!userAgent) {
-    clientControlError.value = 'UA 关键字不能为空'
+    clientControlError.value = t('UA 关键字不能为空')
     return
   }
   addingClientRule.value = true
@@ -1367,7 +1841,7 @@ async function addClientRule() {
     applyClientControlConfig(response)
     manualClientRule.user_agent = ''
     manualClientRule.note = ''
-    showNotice('UA 拦截规则已添加')
+    showNotice(t('UA 拦截规则已添加'))
   } catch (err) {
     clientControlError.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -1427,11 +1901,11 @@ async function changePassword() {
   error.value = ''
   clearNotice()
   if (!passwordForm.new_password) {
-    error.value = '新密码不能为空'
+    error.value = t('新密码不能为空')
     return
   }
   if (passwordForm.new_password !== passwordForm.confirm_password) {
-    error.value = '两次输入的新密码不一致'
+    error.value = t('两次输入的新密码不一致')
     return
   }
   changingPassword.value = true
@@ -1448,7 +1922,7 @@ async function changePassword() {
     passwordForm.current_password = ''
     passwordForm.new_password = ''
     passwordForm.confirm_password = ''
-    showNotice('管理员密码已更新')
+    showNotice(t('管理员密码已更新'))
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -1458,7 +1932,11 @@ async function changePassword() {
 
 async function deleteClientRule(record: ClientRuleRecord) {
   clientControlError.value = ''
-  const confirmed = window.confirm(`确定删除 UA 规则「${clientKeyword(record)}」吗？`)
+  const confirmed = window.confirm(
+    locale.value === 'en-US'
+      ? `Delete the UA rule "${clientKeyword(record)}"?`
+      : `确定删除 UA 规则「${clientKeyword(record)}」吗？`,
+  )
   if (!confirmed) return
   try {
     const response = await api<ClientControlConfig>('/api/client-control/rules', {
@@ -1470,7 +1948,7 @@ async function deleteClientRule(record: ClientRuleRecord) {
       ),
     })
     applyClientControlConfig(response)
-    showNotice('UA 规则已删除')
+    showNotice(t('UA 规则已删除'))
   } catch (err) {
     clientControlError.value = err instanceof Error ? err.message : String(err)
   }
@@ -1489,22 +1967,22 @@ function rateLimitBlockIp(record: PlaybackRateBlockRecord) {
 
 function rateLimitBlockReason(record: PlaybackRateBlockRecord) {
   const note = record.note?.trim()
-  if (note.includes('同时播放')) return '同时播放超限'
-  if (note.includes('频率超限') || note.includes('窗口') || note.includes('阈值')) return '播放频率限制'
+  if (note.includes('同时播放')) return t('同时播放超限')
+  if (note.includes('频率超限') || note.includes('窗口') || note.includes('阈值')) return t('播放频率限制')
   return playbackRateActionLabel(record.action)
 }
 
 function playbackRateActionLabel(action?: string) {
-  if (action === 'disable_user') return '禁用用户'
-  if (action === 'mixed') return '混合模式'
-  if (action === 'block_ip') return '屏蔽 IP'
+  if (action === 'disable_user') return t('禁用用户')
+  if (action === 'mixed') return t('混合模式')
+  if (action === 'block_ip') return t('屏蔽 IP')
   return '--'
 }
 
 function playbackRateUnblockNotice(action?: string) {
-  if (action === 'disable_user') return '用户封禁已解除'
-  if (action === 'mixed') return '混合封禁已解除'
-  return 'IP 屏蔽已解除'
+  if (action === 'disable_user') return t('用户封禁已解除')
+  if (action === 'mixed') return t('混合封禁已解除')
+  return t('IP 屏蔽已解除')
 }
 
 function formatIpLocation(location?: IpLocation) {
@@ -1530,6 +2008,8 @@ function ipWithLocation(ip: string | null | undefined, location?: IpLocation) {
 function logout() {
   token.value = ''
   page.value = 'home'
+  mobileNavOpen.value = false
+  localeMenuOpen.value = false
   clearStoredToken()
   removeStorage(localStorage, pageKey)
   stopDashboardPolling()
@@ -1726,15 +2206,15 @@ function requestLogLevelMatches(row: ProxyRequestDetail, level: string) {
 }
 
 function requestSeverityLabel(row: ProxyRequestDetail) {
-  if (row.event_type === 'block') return '封禁动作'
-  if (row.event_type === 'unblock') return '解除封禁'
+  if (row.event_type === 'block') return t('封禁动作')
+  if (row.event_type === 'unblock') return t('解除封禁动作')
   const severity = requestSeverity(row)
-  if (severity === 'blocked') return '已拦截'
-  if (severity === 'cache') return '缓存'
-  if (severity === 'redirect') return '跳转'
-  if (severity === 'warn') return '警告'
-  if (severity === 'error') return '错误'
-  return '成功'
+  if (severity === 'blocked') return t('已拦截')
+  if (severity === 'cache') return t('缓存')
+  if (severity === 'redirect') return t('跳转')
+  if (severity === 'warn') return t('警告')
+  if (severity === 'error') return t('错误')
+  return t('成功')
 }
 
 function startDashboardPolling() {
@@ -1783,10 +2263,12 @@ function isAuthBootstrapPath(path: string) {
 
 function handleAuthExpired() {
   token.value = ''
+  mobileNavOpen.value = false
+  localeMenuOpen.value = false
   clearStoredToken()
   stopDashboardPolling()
   mode.value = 'login'
-  error.value = '登录已过期，请重新登录'
+  error.value = t('登录已过期，请重新登录')
 }
 
 async function fetchPublicKey() {
@@ -1870,7 +2352,7 @@ function encryptWithForge(
   const cipher = forge.cipher.createCipher('AES-GCM', bytesToBinary(aesKey))
   cipher.start({ iv: bytesToBinary(iv), tagLength: 128 })
   cipher.update(forge.util.createBuffer(bytesToBinary(plaintext)))
-  if (!cipher.finish()) throw new Error('加密请求失败')
+  if (!cipher.finish()) throw new Error(t('加密请求失败'))
   return {
     encryptedKey: binaryToBytes(encryptedKey),
     encrypted: binaryToBytes(cipher.output.getBytes() + cipher.mode.tag.getBytes()),
@@ -1968,13 +2450,16 @@ function formatUptime(seconds: number | undefined) {
   if (!seconds) return '--'
   const days = Math.floor(seconds / 86400)
   const hours = Math.floor((seconds % 86400) / 3600)
+  if (locale.value === 'en-US') {
+    return days > 0 ? `${days}d ${hours}h` : `${hours}h`
+  }
   return days > 0 ? `${days}天${hours}小时` : `${hours}小时`
 }
 
 function formatTimestamp(value: string) {
   const date = parseUnixTimestamp(value)
   if (!date) return '--'
-  return date.toLocaleString()
+  return date.toLocaleString(locale.value)
 }
 
 function parseUnixTimestamp(value: string) {
@@ -1985,12 +2470,12 @@ function parseUnixTimestamp(value: string) {
 
 function formatLogTime(value: number) {
   if (!Number.isFinite(value) || value <= 0) return '--'
-  return new Date(value).toLocaleString()
+  return new Date(value).toLocaleString(locale.value)
 }
 
 function formatTimestampMs(value: number | null | undefined) {
   if (!value || !Number.isFinite(value)) return '--'
-  return new Date(value).toLocaleString()
+  return new Date(value).toLocaleString(locale.value)
 }
 
 function formatServerName(serverId: string) {
@@ -1998,23 +2483,23 @@ function formatServerName(serverId: string) {
 }
 
 function proxyStatusLabel(status: ProxyStatus | undefined) {
-  if (!status) return '未启动'
-  if (!status.enabled) return '未启用'
-  return status.listening ? '监听中' : '未监听'
+  if (!status) return t('未启动')
+  if (!status.enabled) return t('未启用')
+  return status.listening ? t('监听中') : t('未监听')
 }
 
 function connectivityStatusLabel(status: ConnectivityCheckStatus) {
-  if (!status.checked_at_ms) return '未巡检'
-  return status.ok ? '正常' : '异常'
+  if (!status.checked_at_ms) return t('未巡检')
+  return status.ok ? t('正常') : t('异常')
 }
 
 function healthPartLabel(ok: boolean | null) {
-  if (ok === null) return '未配置'
-  return ok ? '正常' : '异常'
+  if (ok === null) return t('未配置')
+  return ok ? t('正常') : t('异常')
 }
 
 function failedDuration(status: ConnectivityCheckStatus) {
-  if (!status.failed_since_ms) return '无失败'
+  if (!status.failed_since_ms) return t('无失败')
   const seconds = Math.max(0, Math.floor((Date.now() - status.failed_since_ms) / 1000))
   if (seconds >= 3600) return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`
   if (seconds >= 60) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`
@@ -2030,24 +2515,24 @@ function validationClass(result: ValidationResult) {
 }
 
 function logLevelLabel(level: ActivityLogEntry['level']) {
-  if (level === 'success') return '成功'
-  if (level === 'error') return '错误'
-  if (level === 'warn') return '警告'
-  return '信息'
+  if (level === 'success') return t('成功')
+  if (level === 'error') return t('错误')
+  if (level === 'warn') return t('警告')
+  return t('信息')
 }
 
 function requestPathTypeLabel(type: string) {
-  if (type === 'rate_limit_action') return '封禁动作'
-  if (type === 'video_stream') return '视频流'
-  if (type === 'playback_info') return '播放信息'
-  if (type === 'system_info') return '系统信息'
-  if (type === 'base_html_player') return '播放器脚本'
-  return '普通代理'
+  if (type === 'rate_limit_action') return t('封禁动作')
+  if (type === 'video_stream') return t('视频流')
+  if (type === 'playback_info') return t('播放信息')
+  if (type === 'system_info') return t('系统信息')
+  if (type === 'base_html_player') return t('播放器脚本')
+  return t('普通代理')
 }
 
 function requestRowTitle(row: ProxyRequestDetail) {
-  if (row.event_type === 'block') return `封禁 ${row.playback_ip || '--'}`
-  if (row.event_type === 'unblock') return `解除封禁 ${row.playback_ip || '--'}`
+  if (row.event_type === 'block') return `${t('封禁')} ${row.playback_ip || '--'}`
+  if (row.event_type === 'unblock') return `${t('解除封禁')} ${row.playback_ip || '--'}`
   return `${row.method} ${row.path}`
 }
 
@@ -2065,31 +2550,119 @@ function clientKeyword(record: ClientRuleRecord) {
   return record.user_agent || record.client_name || '--'
 }
 
-onMounted(bootstrap)
+watch(locale, (nextLocale) => {
+  document.documentElement.lang = nextLocale
+  clearNotice()
+  error.value = ''
+  playbackError.value = ''
+  logsError.value = ''
+  updateCheckError.value = ''
+  overviewError.value = ''
+  healthError.value = ''
+  clientControlError.value = ''
+  backupError.value = ''
+})
+
+onMounted(() => {
+  document.documentElement.lang = locale.value
+  bootstrap()
+})
 onBeforeUnmount(stopDashboardPolling)
 </script>
 
 <template>
-  <main v-if="mode === 'loading'" class="auth-shell">
-    <section class="auth-card">加载中</section>
-  </main>
-
-  <main v-else-if="mode === 'setup' || mode === 'login'" class="auth-shell">
-    <section class="auth-card">
-      <div class="brand-row">
-        <img class="logo-mark" :src="logoUrl" alt="Emby Panel" />
-        <div>
-          <h1>Emby Panel</h1>
-          <p>{{ mode === 'setup' ? '首次初始化' : '管理员登录' }}</p>
+  <main v-if="mode === 'loading'" class="auth-shell" :class="{ dark: darkMode }">
+    <div class="auth-atmosphere" aria-hidden="true" />
+    <div class="auth-utility">
+      <button
+        class="icon-button"
+        type="button"
+        :aria-label="darkMode ? t('切换到浅色模式') : t('切换到暗夜模式')"
+        :title="darkMode ? t('浅色模式') : t('暗夜模式')"
+        @click="toggleTheme"
+      >
+        <Sun v-if="darkMode" :size="17" />
+        <Moon v-else :size="17" />
+      </button>
+      <div class="language-picker">
+        <button
+          class="language-trigger"
+          type="button"
+          :aria-label="t('切换语言')"
+          :aria-expanded="localeMenuOpen"
+          @click="toggleLocaleMenu"
+        >
+          <Languages :size="16" />
+          {{ locale === 'zh-CN' ? t('简体中文') : 'English' }}
+          <ChevronDown :size="14" />
+        </button>
+        <div v-if="localeMenuOpen" class="language-menu">
+          <button type="button" :class="{ selected: locale === 'zh-CN' }" @click="setLocale('zh-CN')">
+            <span>简体中文</span><Check v-if="locale === 'zh-CN'" :size="15" />
+          </button>
+          <button type="button" :class="{ selected: locale === 'en-US' }" @click="setLocale('en-US')">
+            <span>English</span><Check v-if="locale === 'en-US'" :size="15" />
+          </button>
         </div>
       </div>
-      <div v-if="error" class="notice error">{{ error }}</div>
+    </div>
+    <section class="auth-card loading-card">
+      <div class="loading-mark"><Activity :size="22" /></div>
+      <span>{{ t('加载中') }}</span>
+    </section>
+  </main>
+
+  <main v-else-if="mode === 'setup' || mode === 'login'" class="auth-shell" :class="{ dark: darkMode }">
+    <div class="auth-atmosphere" aria-hidden="true" />
+    <div class="auth-utility">
+      <button
+        class="icon-button"
+        type="button"
+        :aria-label="darkMode ? t('切换到浅色模式') : t('切换到暗夜模式')"
+        :title="darkMode ? t('浅色模式') : t('暗夜模式')"
+        @click="toggleTheme"
+      >
+        <Sun v-if="darkMode" :size="17" />
+        <Moon v-else :size="17" />
+      </button>
+      <div class="language-picker">
+        <button
+          class="language-trigger"
+          type="button"
+          :aria-label="t('切换语言')"
+          :aria-expanded="localeMenuOpen"
+          @click="toggleLocaleMenu"
+        >
+          <Languages :size="16" />
+          {{ locale === 'zh-CN' ? t('简体中文') : 'English' }}
+          <ChevronDown :size="14" />
+        </button>
+        <div v-if="localeMenuOpen" class="language-menu">
+          <button type="button" :class="{ selected: locale === 'zh-CN' }" @click="setLocale('zh-CN')">
+            <span>简体中文</span><Check v-if="locale === 'zh-CN'" :size="15" />
+          </button>
+          <button type="button" :class="{ selected: locale === 'en-US' }" @click="setLocale('en-US')">
+            <span>English</span><Check v-if="locale === 'en-US'" :size="15" />
+          </button>
+        </div>
+      </div>
+    </div>
+    <section class="auth-card">
+      <div class="auth-brand">
+        <div class="auth-logo-wrap"><img class="logo-mark" :src="logoUrl" alt="Emby Panel" /></div>
+        <div>
+          <span class="eyebrow">MEDIA CONTROL / 302</span>
+          <h1>Emby Panel</h1>
+          <p>{{ mode === 'setup' ? t('首次初始化') : t('管理员登录') }}</p>
+        </div>
+      </div>
+      <div v-if="error" class="notice error" role="alert">{{ error }}</div>
       <label>
-        <span>用户名</span>
+        <span>{{ t('用户名') }}</span>
         <input v-model="credentials.username" autocomplete="username" />
       </label>
       <label>
-        <span>密码</span>
+        <span>{{ t('密码') }}</span>
         <input
           v-model="credentials.password"
           type="password"
@@ -2098,37 +2671,48 @@ onBeforeUnmount(stopDashboardPolling)
         />
       </label>
       <button class="primary wide" :disabled="saving" @click="mode === 'setup' ? setupAdmin() : login()">
-        {{ saving ? '处理中' : mode === 'setup' ? '创建并进入' : '登录' }}
+        {{ saving ? t('处理中') : mode === 'setup' ? t('创建并进入') : t('登录') }}
       </button>
+      <p class="auth-footnote">EmbyPanel · {{ appInfo.version || '0.2' }} · secure local console</p>
     </section>
   </main>
 
-  <main v-else class="app-shell" :class="{ dark: darkMode }">
-    <aside class="sidebar">
+  <main v-else class="app-shell" :class="{ dark: darkMode, 'mobile-nav-open': mobileNavOpen }" @keydown.esc="closeMobileNav">
+    <div v-if="mobileNavOpen" class="nav-backdrop" aria-hidden="true" @click="closeMobileNav" />
+    <aside
+      id="primary-navigation"
+      ref="mobileSidebar"
+      class="sidebar"
+      :aria-label="t('主导航')"
+      @keydown="trapMobileNavFocus"
+    >
       <div class="brand-row compact">
-        <img class="logo-mark" :src="logoUrl" alt="Emby Panel" />
+        <div class="brand-logo-wrap"><img class="logo-mark" :src="logoUrl" alt="Emby Panel" /></div>
         <button
           class="brand-version"
           :class="{ update: updateCheck?.has_update, error: Boolean(updateCheckError) }"
           :title="
             updateChecking
-              ? '正在检查更新'
+              ? t('正在检查更新')
               : updateCheck?.has_update
-                ? `有新版本：${updateCheck.latest_version}`
+                ? `${t('有新版本')}：${updateCheck.latest_version}`
                 : updateCheckError
-                  ? `检查失败：${updateCheckError}`
-                  : '点击检查更新'
+                  ? `${t('检查失败')}：${updateCheckError}`
+                  : t('点击检查更新')
           "
           @click="refreshUpdateCheck(true)"
         >
           <strong>{{ appInfo.name }}</strong>
           <small>
-            {{ appInfo.version || '版本读取中' }}
-            <span v-if="updateChecking" class="brand-version-badge">检查中</span>
-            <span v-else-if="updateCheck?.has_update" class="brand-version-badge update">有更新</span>
-            <span v-else-if="updateCheck" class="brand-version-badge latest">最新</span>
-            <span v-else-if="updateCheckError" class="brand-version-badge error">失败</span>
+            {{ appInfo.version || t('版本读取中') }}
+            <span v-if="updateChecking" class="brand-version-badge">{{ t('检查中') }}</span>
+            <span v-else-if="updateCheck?.has_update" class="brand-version-badge update">{{ t('有更新') }}</span>
+            <span v-else-if="updateCheck" class="brand-version-badge latest">{{ t('最新') }}</span>
+            <span v-else-if="updateCheckError" class="brand-version-badge error">{{ t('失败') }}</span>
           </small>
+        </button>
+        <button ref="mobileNavCloseButton" class="sidebar-close icon-button" type="button" :aria-label="t('关闭')" @click="closeMobileNav">
+          <X :size="18" />
         </button>
       </div>
 
@@ -2140,76 +2724,133 @@ onBeforeUnmount(stopDashboardPolling)
           :class="{ active: page === item.id }"
           @click="setPage(item.id)"
         >
-          <span>{{ item.icon }}</span>
-          {{ item.label }}
+          <component :is="item.icon" :size="18" :stroke-width="1.8" />
+          <span>{{ t(item.label) }}</span>
+          <ChevronRight class="nav-chevron" :size="14" />
         </button>
       </nav>
 
-      <button class="nav-item logout" @click="logout">退出登录</button>
+      <div class="sidebar-footer">
+        <div class="sidebar-status"><span class="status-orb" /> <span>{{ t('系统在线') }}</span></div>
+        <button class="nav-item logout" @click="logout">
+          <LogOut :size="18" :stroke-width="1.8" />
+          <span>{{ t('退出登录') }}</span>
+        </button>
+      </div>
     </aside>
 
     <section class="workspace">
       <header class="topbar">
-        <button
-          class="icon-button theme-toggle"
-          :aria-label="darkMode ? '切换到浅色模式' : '切换到暗夜模式'"
-          :title="darkMode ? '浅色模式' : '暗夜模式'"
-          @click="toggleTheme"
-        >
-          {{ darkMode ? '☾' : '☼' }}
-        </button>
+        <div class="topbar-leading">
+          <button
+            ref="mobileMenuButton"
+            class="mobile-menu-button icon-button"
+            type="button"
+            aria-controls="primary-navigation"
+            :aria-expanded="mobileNavOpen"
+            :aria-label="t('打开导航')"
+            @click="toggleMobileNav"
+          >
+            <MenuIcon v-if="!mobileNavOpen" :size="19" />
+            <X v-else :size="19" />
+          </button>
+          <div class="breadcrumb">
+            <span class="breadcrumb-root">EmbyPanel</span>
+            <ChevronRight :size="14" />
+            <strong>{{ t(menu.find((item) => item.id === page)?.label || '首页') }}</strong>
+          </div>
+        </div>
         <div class="top-actions">
-          <button class="avatar" @click="setPage('account')">{{ profile.username.slice(0, 1) || 'A' }}</button>
+          <div class="language-picker">
+            <button
+              class="language-trigger"
+              type="button"
+              :aria-label="t('切换语言')"
+              :aria-expanded="localeMenuOpen"
+              :title="locale === 'zh-CN' ? 'English' : '简体中文'"
+              @click="toggleLocaleMenu"
+            >
+              <Languages :size="16" />
+              <span>{{ locale === 'zh-CN' ? '简体中文' : 'English' }}</span>
+            </button>
+            <div v-if="localeMenuOpen" class="language-menu">
+              <button type="button" :class="{ selected: locale === 'zh-CN' }" @click="setLocale('zh-CN')">
+                <span>简体中文</span><Check v-if="locale === 'zh-CN'" :size="15" />
+              </button>
+              <button type="button" :class="{ selected: locale === 'en-US' }" @click="setLocale('en-US')">
+                <span>English</span><Check v-if="locale === 'en-US'" :size="15" />
+              </button>
+            </div>
+          </div>
+          <button
+            class="theme-toggle icon-button"
+            type="button"
+            :aria-label="darkMode ? t('切换到浅色模式') : t('切换到暗夜模式')"
+            :title="darkMode ? t('浅色模式') : t('暗夜模式')"
+            @click="toggleTheme"
+          >
+            <Sun v-if="!darkMode" :size="16" />
+            <Moon v-else :size="16" />
+          </button>
+          <button class="profile-trigger" type="button" :aria-label="`${t('账户')}：${profile.username || 'admin'}`" @click="setPage('account')">
+            <UserRound :size="17" />
+            <span class="profile-name">{{ profile.username || 'admin' }}</span>
+            <ChevronDown :size="14" />
+          </button>
         </div>
       </header>
 
       <transition name="toast-fade">
-        <div v-if="notice" class="toast-notice">
-          <span class="toast-icon">✓</span>
+        <div v-if="notice" class="toast-notice" role="status" aria-live="polite">
+          <span class="toast-icon"><CircleCheck :size="14" /></span>
           <span>{{ notice }}</span>
         </div>
       </transition>
 
       <div class="content">
-        <div v-if="error" class="notice error">{{ error }}</div>
+        <div v-if="error" class="notice error" role="alert">{{ error }}</div>
 
         <section v-if="page === 'home'" class="dashboard">
           <section class="panel media-overview">
             <div class="panel-head">
-              <h2>媒体库总览</h2>
-              <span class="status-dot">在线 {{ mediaOverviews.length }}</span>
+              <div class="panel-title-line"><Database :size="18" /><h2>{{ t('媒体库总览') }}</h2></div>
+              <span class="status-dot">{{ t('在线') }} {{ mediaOverviews.length }}</span>
             </div>
             <div v-if="mediaOverviews.length" class="stat-grid four">
               <div class="stat-card">
-                <span>电影</span>
+                <span>{{ t('电影') }}</span>
                 <strong>{{ mediaOverviewTotals.movie_count.toLocaleString() }}</strong>
                 <small>Movies</small>
               </div>
               <div class="stat-card">
-                <span>剧集</span>
+                <span>{{ t('剧集') }}</span>
                 <strong>{{ mediaOverviewTotals.series_count.toLocaleString() }}</strong>
                 <small>Series</small>
               </div>
               <div class="stat-card">
-                <span>总集数</span>
+                <span>{{ t('总集数') }}</span>
                 <strong>{{ mediaOverviewTotals.episode_count.toLocaleString() }}</strong>
                 <small>Episodes</small>
               </div>
               <div class="stat-card">
-                <span>用户</span>
+                <span>{{ t('用户') }}</span>
                 <strong>{{ mediaOverviewTotals.user_count.toLocaleString() }}</strong>
                 <small>Users</small>
               </div>
             </div>
-            <div v-else class="empty-state">{{ overviewError || '正在读取媒体库总览' }}</div>
-            <div v-if="mediaOverviews.length" class="overview-server-list">
+            <div v-else class="empty-state">{{ overviewError || t('正在读取媒体库总览') }}</div>
+            <div
+              v-if="mediaOverviews.length"
+              class="overview-server-list"
+              :class="{ 'has-multiple-servers': mediaOverviews.length > 1 }"
+            >
               <div v-for="overview in mediaOverviews" :key="overview.server_name" class="overview-server-row">
                 <strong>{{ overview.server_name }}</strong>
-                <span>电影 {{ overview.movie_count.toLocaleString() }}</span>
-                <span>剧集 {{ overview.series_count.toLocaleString() }}</span>
-                <span>集数 {{ overview.episode_count.toLocaleString() }}</span>
-                <span>用户 {{ overview.user_count.toLocaleString() }}</span>
-                <small>Emby {{ overview.version }} · {{ overview.operating_system }} · {{ overview.library_count }} 个媒体库</small>
+                <span>{{ t('电影') }} {{ overview.movie_count.toLocaleString() }}</span>
+                <span>{{ t('剧集') }} {{ overview.series_count.toLocaleString() }}</span>
+                <span>{{ t('集数') }} {{ overview.episode_count.toLocaleString() }}</span>
+                <span>{{ t('用户') }} {{ overview.user_count.toLocaleString() }}</span>
+                <small>Emby {{ overview.version }} · {{ overview.operating_system }} · {{ overview.library_count }} {{ t('个媒体库') }}</small>
               </div>
             </div>
           </section>
@@ -2217,15 +2858,15 @@ onBeforeUnmount(stopDashboardPolling)
           <section class="panel health-panel">
             <div class="panel-head">
               <div>
-                <h2>服务器状态</h2>
-                <small class="health-subtitle">运行 {{ formatUptime(serverHealth?.uptime_seconds) }}</small>
+                <div class="panel-title-line"><Gauge :size="18" /><h2>{{ t('服务器状态') }}</h2></div>
+                <small class="health-subtitle">{{ t('运行') }} {{ formatUptime(serverHealth?.uptime_seconds) }}</small>
               </div>
             </div>
             <div v-if="serverHealth" class="health-lines">
               <div class="health-line">
                 <div>
                   <strong>CPU</strong>
-                  <span>{{ serverHealth.cpu_name }} · {{ serverHealth.cpu_cores }} 核</span>
+                  <span>{{ serverHealth.cpu_name }} · {{ serverHealth.cpu_cores }} {{ t('核') }}</span>
                 </div>
                 <b>{{ serverHealth.cpu_percent }}%</b>
                 <div class="health-track">
@@ -2234,7 +2875,7 @@ onBeforeUnmount(stopDashboardPolling)
               </div>
               <div class="health-line">
                 <div>
-                  <strong>内存</strong>
+                    <strong>{{ t('内存') }}</strong>
                   <span>{{ formatBytes(serverHealth.memory_used_bytes) }} / {{ formatBytes(serverHealth.memory_total_bytes) }}</span>
                 </div>
                 <b>{{ serverHealth.memory_percent }}%</b>
@@ -2244,7 +2885,7 @@ onBeforeUnmount(stopDashboardPolling)
               </div>
               <div class="health-line">
                 <div>
-                  <strong>磁盘</strong>
+                    <strong>{{ t('磁盘') }}</strong>
                   <span>{{ formatBytes(serverHealth.disk_used_bytes) }} / {{ formatBytes(serverHealth.disk_total_bytes) }}</span>
                 </div>
                 <b>{{ serverHealth.disk_percent }}%</b>
@@ -2253,37 +2894,37 @@ onBeforeUnmount(stopDashboardPolling)
                 </div>
               </div>
             </div>
-            <div v-else class="empty-state">{{ healthError || '正在读取服务器状态' }}</div>
+            <div v-else class="empty-state">{{ healthError || t('正在读取服务器状态') }}</div>
           </section>
 
           <section class="panel operations-panel">
             <div class="panel-head">
               <div>
-                <h2>运维概览</h2>
-                <p class="muted">健康检查、反代监听和今日请求统计。</p>
+                <div class="panel-title-line"><Activity :size="18" /><h2>{{ t('运维概览') }}</h2></div>
+                <p class="muted">{{ t('健康检查、反代监听和今日请求统计。') }}</p>
               </div>
-              <button class="secondary" @click="refreshOperationalData">刷新</button>
+              <button class="secondary" @click="refreshOperationalData"><RefreshCw :size="15" />{{ t('刷新') }}</button>
             </div>
             <div class="stat-grid four">
               <div class="stat-card">
-                <span>今日请求</span>
+                <span>{{ t('今日请求') }}</span>
                 <strong>{{ requestStatsTotals.requests.toLocaleString() }}</strong>
-                <small>{{ detailedHealth?.status === 'ok' ? '健康' : '待检查' }}</small>
+                <small>{{ detailedHealth?.status === 'ok' ? t('健康') : t('待检查') }}</small>
               </div>
               <div class="stat-card">
-                <span>重定向</span>
+                <span>{{ t('重定向') }}</span>
                 <strong>{{ requestStatsTotals.redirects.toLocaleString() }}</strong>
-                <small>STRM 直链</small>
+                <small>{{ t('STRM 直链') }}</small>
               </div>
               <div class="stat-card">
-                <span>缓存命中</span>
+                <span>{{ t('缓存命中') }}</span>
                 <strong>{{ requestStatsTotals.cache_hits.toLocaleString() }}</strong>
-                <small>内存直链缓存</small>
+                <small>{{ t('内存直链缓存') }}</small>
               </div>
               <div class="stat-card">
-                <span>拦截 / 错误</span>
+                <span>{{ t('拦截 / 错误') }}</span>
                 <strong>{{ requestStatsTotals.blocks.toLocaleString() }} / {{ requestStatsTotals.errors.toLocaleString() }}</strong>
-                <small>今日累计</small>
+                <small>{{ t('今日累计') }}</small>
               </div>
             </div>
             <div class="connectivity-list">
@@ -2295,24 +2936,24 @@ onBeforeUnmount(stopDashboardPolling)
                 <div>
                   <strong>{{ row.server.name }}</strong>
                   <small>
-                    端口 :{{ row.proxy?.port || row.server.port }} ·
-                    最近请求 {{ formatTimestampMs(row.proxy?.last_request_ms) }} ·
-                    最近巡检 {{ formatTimestampMs(row.connectivity?.checked_at_ms || 0) }}
-                    <template v-if="row.connectivity"> · 耗时 {{ row.connectivity.duration_ms }}ms</template>
+                    {{ t('端口') }} :{{ row.proxy?.port || row.server.port }} ·
+                    {{ t('最近请求') }} {{ formatTimestampMs(row.proxy?.last_request_ms) }} ·
+                    {{ t('最近巡检') }} {{ formatTimestampMs(row.connectivity?.checked_at_ms || 0) }}
+                    <template v-if="row.connectivity"> · {{ t('耗时') }} {{ row.connectivity.duration_ms }}ms</template>
                   </small>
                 </div>
                 <span :class="['client-badge', proxyStatusClass(row.proxy)]">
                   {{ proxyStatusLabel(row.proxy) }}
                 </span>
                 <span :class="['client-badge', row.connectivity?.ok ? 'allowed' : 'blocked']">
-                  {{ row.connectivity ? connectivityStatusLabel(row.connectivity) : '未巡检' }}
+                  {{ row.connectivity ? connectivityStatusLabel(row.connectivity) : t('未巡检') }}
                 </span>
                 <span>Emby {{ healthPartLabel(row.connectivity?.emby_ok ?? null) }}</span>
                 <span>OpenList {{ healthPartLabel(row.connectivity?.openlist_ok ?? null) }}</span>
-                <span>反代 {{ healthPartLabel(row.connectivity?.proxy_ok ?? null) }}</span>
-                <span>{{ row.connectivity ? failedDuration(row.connectivity) : '无失败' }}</span>
+                <span>{{ t('反代') }} {{ healthPartLabel(row.connectivity?.proxy_ok ?? null) }}</span>
+                  <span>{{ row.connectivity ? failedDuration(row.connectivity) : t('无失败') }}</span>
                 <small v-if="row.connectivity?.auto_restarted_at_ms">
-                  最近自动重启 {{ formatTimestampMs(row.connectivity.auto_restarted_at_ms) }}
+                  {{ t('最近自动重启') }} {{ formatTimestampMs(row.connectivity.auto_restarted_at_ms) }}
                 </small>
                 <small v-if="row.connectivity?.last_error" class="server-status-error">{{ row.connectivity.last_error }}</small>
               </div>
@@ -2322,40 +2963,40 @@ onBeforeUnmount(stopDashboardPolling)
           <section class="panel rate-limit-overview">
             <div class="panel-head">
               <div>
-                <h2>播放频率限制</h2>
-                <p class="muted">首页直接查看当前窗口命中和封禁情况。</p>
+                <div class="panel-title-line"><ShieldCheck :size="18" /><h2>{{ t('播放频率限制') }}</h2></div>
+                <p class="muted">{{ t('首页直接查看当前窗口命中和封禁情况。') }}</p>
               </div>
-              <button class="secondary" @click="refreshRateLimitStatus">刷新</button>
+              <button class="secondary" @click="refreshRateLimitStatus"><RefreshCw :size="15" />{{ t('刷新') }}</button>
             </div>
             <div class="stat-grid three">
               <div class="stat-card">
-                <span>活跃窗口</span>
+                <span>{{ t('活跃窗口') }}</span>
                 <strong>{{ rateLimitOverview.active_windows.toLocaleString() }}</strong>
-                <small>当前监控中的 IP</small>
+                <small>{{ t('当前监控中的 IP') }}</small>
               </div>
               <div class="stat-card">
-                <span>已封禁</span>
+                <span>{{ t('已封禁') }}</span>
                 <strong>{{ rateLimitOverview.blocked_windows.toLocaleString() }}</strong>
-                <small>屏蔽 IP / 禁用用户</small>
+                <small>{{ t('屏蔽 IP / 禁用用户') }}</small>
               </div>
               <div class="stat-card">
-                <span>最高命中</span>
+                <span>{{ t('最高命中') }}</span>
                 <strong>{{ rateLimitOverview.highest_count.toLocaleString() }}</strong>
-                <small>当前窗口最大次数</small>
+                <small>{{ t('当前窗口最大次数') }}</small>
               </div>
             </div>
             <div v-if="rateLimitWindows.length" class="rate-block-table-wrap home-rate-table">
               <table class="rate-block-table">
                 <thead>
                   <tr>
-                    <th>封禁方式</th>
-                    <th>服务器</th>
+                    <th>{{ t('封禁方式') }}</th>
+                    <th>{{ t('服务器') }}</th>
                     <th>IP</th>
-                    <th>用户</th>
-                    <th>命中</th>
-                    <th>窗口</th>
-                    <th>状态</th>
-                    <th>{{ rateLimitWindows.length }} 条</th>
+                    <th>{{ t('用户') }}</th>
+                    <th>{{ t('命中') }}</th>
+                    <th>{{ t('窗口') }}</th>
+                    <th>{{ t('状态') }}</th>
+                    <th>{{ rateLimitWindows.length }} {{ t('条') }}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -2371,7 +3012,7 @@ onBeforeUnmount(stopDashboardPolling)
                     <td>{{ row.window_seconds }}s</td>
                     <td>
                       <span :class="['client-badge', row.blocked ? 'blocked' : 'allowed']">
-                        {{ row.blocked ? '已封禁' : '观察中' }}
+                        {{ row.blocked ? t('已封禁') : t('观察中') }}
                       </span>
                     </td>
                     <td>
@@ -2381,23 +3022,23 @@ onBeforeUnmount(stopDashboardPolling)
                         class="secondary"
                         @click="unblockRateLimitWindow(row)"
                       >
-                        解除封禁
+                        {{ t('解除封禁') }}
                       </button>
                     </td>
                   </tr>
                 </tbody>
               </table>
             </div>
-            <div v-else class="empty-state compact">当前没有播放频率窗口数据。</div>
+            <div v-else class="empty-state compact">{{ t('当前没有播放频率窗口数据。') }}</div>
           </section>
 
           <section class="panel playing-panel">
             <div class="panel-head">
-              <h2>实时播放</h2>
+              <div class="panel-title-line"><PlayCircle :size="18" /><h2>{{ t('实时播放') }}</h2></div>
               <div class="panel-actions">
-                <span class="status-dot">在线 {{ activePlayCount }}</span>
+                <span class="status-dot">{{ t('在线') }} {{ activePlayCount }}</span>
                 <button class="secondary" :disabled="playbackLoading" @click="refreshPlaybackSessions">
-                  {{ playbackLoading ? '刷新中' : '刷新' }}
+                  <RefreshCw :size="15" />{{ playbackLoading ? t('刷新中') : t('刷新') }}
                 </button>
               </div>
             </div>
@@ -2417,13 +3058,13 @@ onBeforeUnmount(stopDashboardPolling)
                   </div>
                   <div class="play-footer">
                     <span>{{ formatTicks(session.position_ticks) }} / {{ formatTicks(session.runtime_ticks) }}</span>
-                    <span>{{ session.transcoding ? '转码' : session.play_method || '直放' }}</span>
+                    <span>{{ session.transcoding ? t('转码') : session.play_method || t('直放') }}</span>
                   </div>
                 </div>
               </article>
             </div>
             <div v-else class="empty-state">
-              {{ playbackLoading ? '正在读取 Emby 播放会话' : playbackError || '当前没有正在播放的媒体' }}
+              {{ playbackLoading ? t('正在读取 Emby 播放会话') : playbackError || t('当前没有正在播放的媒体') }}
             </div>
           </section>
         </section>
@@ -2431,21 +3072,21 @@ onBeforeUnmount(stopDashboardPolling)
         <section v-else-if="page === 'server'" class="panel">
           <div class="panel-head">
             <div>
-              <h2>服务器配置</h2>
-              <p class="muted">每个 Emby 服务器使用独立反代端口，保存后自动监听。</p>
+              <div class="panel-title-line"><Server :size="18" /><h2>{{ t('服务器配置') }}</h2></div>
+              <p class="muted">{{ t('每个 Emby 服务器使用独立反代端口，保存后自动监听。') }}</p>
             </div>
             <div class="panel-actions">
-              <button class="secondary" @click="addServer">添加服务器</button>
-              <button class="secondary" :disabled="saving" @click="validateSettings">测试配置</button>
+              <button class="secondary" @click="addServer"><Plus :size="15" />{{ t('添加服务器') }}</button>
+              <button class="secondary" :disabled="saving" @click="validateSettings"><ShieldCheck :size="15" />{{ t('测试配置') }}</button>
               <button class="primary" :disabled="saving" @click="saveSettings">
-                {{ saving ? '保存中' : '保存配置' }}
+                <Check :size="15" />{{ saving ? t('保存中') : t('保存配置') }}
               </button>
             </div>
           </div>
           <div class="server-list">
             <article v-for="(server, index) in settings.servers" :key="server.id" class="server-card">
               <div class="server-card-head">
-                <strong>{{ server.name || `服务器 ${index + 1}` }}</strong>
+                <strong>{{ server.name || `${t('服务器')} ${index + 1}` }}</strong>
                 <div class="server-actions">
                   <button
                     type="button"
@@ -2453,7 +3094,9 @@ onBeforeUnmount(stopDashboardPolling)
                     :aria-expanded="isServerExpanded(server.id)"
                     @click="toggleServerExpanded(server.id)"
                   >
-                    {{ isServerExpanded(server.id) ? '收起配置' : '展开配置' }}
+                    <ChevronDown v-if="!isServerExpanded(server.id)" :size="15" />
+                    <ChevronRight v-else :size="15" />
+                    {{ isServerExpanded(server.id) ? t('收起配置') : t('展开配置') }}
                   </button>
                   <button
                     type="button"
@@ -2462,7 +3105,7 @@ onBeforeUnmount(stopDashboardPolling)
                     :aria-pressed="server.enabled"
                     @click="toggleProxyServer(server)"
                   >
-                    {{ server.enabled ? '关闭服务器' : '开启服务器' }}
+                    <Zap :size="15" />{{ server.enabled ? t('关闭服务器') : t('开启服务器') }}
                   </button>
                   <button
                     type="button"
@@ -2470,10 +3113,10 @@ onBeforeUnmount(stopDashboardPolling)
                     :disabled="saving || restartingServerId === server.id || !server.enabled"
                     @click="restartProxyServer(server)"
                   >
-                    {{ restartingServerId === server.id ? '重启中' : '重启服务器' }}
+                    <RotateCw :size="15" />{{ restartingServerId === server.id ? t('重启中') : t('重启服务器') }}
                   </button>
                   <button class="danger-button" @click="removeServer(server.id)">
-                    删除
+                    <Trash2 :size="15" />{{ t('删除') }}
                   </button>
                 </div>
               </div>
@@ -2481,9 +3124,9 @@ onBeforeUnmount(stopDashboardPolling)
                 <span :class="['client-badge', proxyStatusById[server.id]?.listening ? 'allowed' : 'blocked']">
                   {{ proxyStatusLabel(proxyStatusById[server.id]) }}
                 </span>
-                <span>端口 :{{ proxyStatusById[server.id]?.port || server.port }}</span>
-                <span>启动 {{ formatTimestampMs(proxyStatusById[server.id]?.started_at_ms) }}</span>
-                <span>最近请求 {{ formatTimestampMs(proxyStatusById[server.id]?.last_request_ms) }}</span>
+                <span>{{ t('端口') }} :{{ proxyStatusById[server.id]?.port || server.port }}</span>
+                <span>{{ t('启动') }} {{ formatTimestampMs(proxyStatusById[server.id]?.started_at_ms) }}</span>
+                <span>{{ t('最近请求') }} {{ formatTimestampMs(proxyStatusById[server.id]?.last_request_ms) }}</span>
                 <span v-if="proxyStatusById[server.id]?.last_error" class="server-status-error">
                   {{ proxyStatusById[server.id]?.last_error }}
                 </span>
@@ -2491,11 +3134,11 @@ onBeforeUnmount(stopDashboardPolling)
               <div v-if="isServerExpanded(server.id)" class="server-config-body">
                 <div class="grid server-grid">
                   <label>
-                    <span>名称</span>
-                    <input v-model="server.name" placeholder="例如：主服务器" />
+                    <span>{{ t('名称') }}</span>
+                    <input v-model="server.name" :placeholder="t('例如：主服务器')" />
                   </label>
                   <label>
-                    <span>Emby 地址</span>
+                    <span>{{ t('Emby 地址') }}</span>
                     <input v-model="server.emby_host" placeholder="http://emby.local:8096" />
                   </label>
                   <label>
@@ -2510,29 +3153,30 @@ onBeforeUnmount(stopDashboardPolling)
                         type="button"
                         class="secret-toggle"
                         :aria-pressed="isApiKeyVisible(server.id)"
-                        :aria-label="isApiKeyVisible(server.id) ? '隐藏 Emby API Key' : '显示 Emby API Key'"
-                        :title="isApiKeyVisible(server.id) ? '隐藏 Emby API Key' : '显示 Emby API Key'"
+                        :aria-label="isApiKeyVisible(server.id) ? t('隐藏 Emby API Key') : t('显示 Emby API Key')"
+                        :title="isApiKeyVisible(server.id) ? t('隐藏 Emby API Key') : t('显示 Emby API Key')"
                         @click="toggleApiKeyVisible(server.id)"
                       >
-                        <span :class="['eye-icon', { off: !isApiKeyVisible(server.id) }]" aria-hidden="true" />
+                        <EyeOff v-if="!isApiKeyVisible(server.id)" :size="16" aria-hidden="true" />
+                        <Eye v-else :size="16" aria-hidden="true" />
                       </button>
                     </div>
                   </label>
                   <label>
-                    <span>反代端口</span>
+                    <span>{{ t('反代端口') }}</span>
                     <input v-model.number="server.port" type="number" min="1" max="65535" />
                   </label>
                 </div>
                 <div class="grid real-ip-grid">
                   <label>
-                    <span>真实 IP 获取方式</span>
+                    <span>{{ t('真实 IP 获取方式') }}</span>
                     <select v-model="server.real_ip_mode" @change="updateRealIpMode(server)">
                       <option v-for="option in realIpModeOptions" :key="option.value" :value="option.value">
-                        {{ option.label }}
+                        {{ t(option.label) }}
                       </option>
                     </select>
                     <small v-if="server.real_ip_mode === 'header_list'" class="field-help">
-                      从下列常用 CDN 携带真实 IP 的 HTTP Header 中获取，按顺序取第一个能获取到的值。
+                      {{ t('从下列常用 CDN 携带真实 IP 的 HTTP Header 中获取，按顺序取第一个能获取到的值。') }}
                     </small>
                   </label>
                   <label v-if="needsRealIpHeader(server)">
@@ -2541,18 +3185,18 @@ onBeforeUnmount(stopDashboardPolling)
                       v-model="server.real_ip_header"
                       :placeholder="
                         server.real_ip_mode === 'header'
-                          ? '例如：x-real-ip'
+                          ? t('例如：x-real-ip')
                           : defaultCdnHeaders
                       "
                     />
                   </label>
                 </div>
                 <p class="muted real-ip-help">
-                  默认使用系统识别。经过 CDN 或多层反代后 IP 不准时再配置，保存后会同步重启对应反代服务。
+                  {{ t('默认使用系统识别。经过 CDN 或多层反代后 IP 不准时再配置，保存后会同步重启对应反代服务。') }}
                 </p>
                 <div class="server-config-actions">
                   <button class="primary" :disabled="saving" @click="saveSettings">
-                    {{ saving ? '保存中' : '保存配置' }}
+                    <Check :size="15" />{{ saving ? t('保存中') : t('保存配置') }}
                   </button>
                 </div>
               </div>
@@ -2561,78 +3205,78 @@ onBeforeUnmount(stopDashboardPolling)
 
           <div class="grid common-grid">
             <label>
-              <span>缓存秒数</span>
+              <span>{{ t('缓存秒数') }}</span>
               <input class="compact-number-input" v-model.number="settings.cache_ttl_seconds" type="number" min="0" />
             </label>
             <label>
-              <span>缓存最大条数</span>
+              <span>{{ t('缓存最大条数') }}</span>
               <input v-model.number="settings.cache_max_capacity" type="number" min="1" />
             </label>
             <label>
-              <span>OpenList 地址</span>
-              <input v-model="settings.openlist_addr" placeholder="可选：http://openlist.local:5244" />
+              <span>{{ t('OpenList 地址') }}</span>
+              <input v-model="settings.openlist_addr" :placeholder="`${t('可选')}：http://openlist.local:5244`" />
             </label>
             <label>
               <span>OpenList Token</span>
-              <input v-model="settings.openlist_token" type="password" placeholder="可选" />
+              <input v-model="settings.openlist_token" type="password" :placeholder="t('可选')" />
             </label>
           </div>
           <div class="grid health-check-grid">
             <label class="check setting-check">
               <input v-model="settings.connectivity_check_enabled" type="checkbox" />
-              <span>启用服务器连通性巡检</span>
+              <span>{{ t('启用服务器连通性巡检') }}</span>
             </label>
             <label>
-              <span>巡检间隔秒数</span>
+              <span>{{ t('巡检间隔秒数') }}</span>
               <input class="compact-number-input" v-model.number="settings.connectivity_check_interval_seconds" type="number" min="10" max="3600" />
             </label>
             <label>
-              <span>单项超时秒数</span>
+              <span>{{ t('单项超时秒数') }}</span>
               <input class="compact-number-input" v-model.number="settings.connectivity_check_timeout_seconds" type="number" min="1" max="60" />
             </label>
             <label>
-              <span>反代无响应自动重启秒数</span>
+              <span>{{ t('反代无响应自动重启秒数') }}</span>
               <input class="compact-number-input" v-model.number="settings.connectivity_auto_restart_seconds" type="number" min="0" max="86400" />
-              <small class="field-help">填 0 表示不自动重启；只在反代端口连续无响应时触发。</small>
+              <small class="field-help">{{ t('填 0 表示不自动重启；只在反代端口连续无响应时触发。') }}</small>
             </label>
           </div>
           <div class="advanced-routing-grid">
             <label class="cache-filter-mode">
-              <span>缓存过滤模式</span>
+              <span>{{ t('缓存过滤模式') }}</span>
               <select v-model="settings.cache_domain_filter_mode">
-                <option value="off">不过滤</option>
-                <option value="whitelist">白名单：命中才缓存</option>
-                <option value="blacklist">黑名单：命中不缓存</option>
+                <option value="off">{{ t('不过滤') }}</option>
+                <option value="whitelist">{{ t('白名单：命中才缓存') }}</option>
+                <option value="blacklist">{{ t('黑名单：命中不缓存') }}</option>
               </select>
             </label>
             <label class="cache-filter-domains">
-              <span>缓存过滤域名</span>
+              <span>{{ t('缓存过滤域名') }}</span>
               <textarea
                 v-model="settings.cache_domain_whitelist"
                 :disabled="settings.cache_domain_filter_mode === 'off'"
-                placeholder="支持多个域名、通配符或关键字；每行一个，例如：*.115cdn.* 或 115"
+                :placeholder="t('支持多个域名、通配符或关键字；每行一个，例如：*.115cdn.* 或 115')"
               />
               <small class="field-help">
-                只匹配直链域名部分。白名单命中才缓存；黑名单命中不缓存，其他直链正常缓存。
+                {{ t('只匹配直链域名部分。白名单命中才缓存；黑名单命中不缓存，其他直链正常缓存。') }}
               </small>
             </label>
             <div class="head-resolve-grid">
               <label class="check">
                 <input v-model="settings.enable_internal_redirect" type="checkbox" />
-                <span>开启内部重定向 HEAD 解析</span>
+                <span>{{ t('开启内部重定向 HEAD 解析') }}</span>
               </label>
               <label>
-                <span>HEAD 超时秒数</span>
+                <span>{{ t('HEAD 超时秒数') }}</span>
                 <input class="compact-number-input" v-model.number="settings.internal_redirect_timeout_seconds" type="number" min="1" />
               </label>
             </div>
             <label class="strm-mapping-field">
-              <span>STRM URL 映射</span>
+              <span>{{ t('STRM URL 映射') }}</span>
               <textarea
                 class="strm-mapping-input"
                 v-model="settings.strm_url_mappings"
                 spellcheck="false"
-                placeholder="每行一个映射：原地址 => 新地址&#10;https://source.example.com => http://media-gateway.local:5244&#10;高级正则：regex:https://source\\.(example|test)\\.com => http://media-gateway.local:5244"
+                :placeholder="strmMappingPlaceholder"
               />
             </label>
           </div>
@@ -2640,8 +3284,8 @@ onBeforeUnmount(stopDashboardPolling)
           <section class="config-tools single">
             <div class="tool-block">
               <div class="panel-head compact">
-                <h3>配置测试结果</h3>
-                <button class="secondary" :disabled="saving" @click="validateSettings">重新测试</button>
+                <h3>{{ t('配置测试结果') }}</h3>
+                <button class="secondary" :disabled="saving" @click="validateSettings"><RefreshCw :size="15" />{{ t('重新测试') }}</button>
               </div>
               <div v-if="validationResults.length" class="validation-list">
                 <div
@@ -2649,12 +3293,12 @@ onBeforeUnmount(stopDashboardPolling)
                   :key="`${result.scope}-${result.message}-${result.detail}`"
                   :class="['validation-row', validationClass(result)]"
                 >
-                  <strong>{{ result.scope }}</strong>
-                  <span>{{ result.message }}</span>
-                  <small>{{ result.detail || '--' }}</small>
+                  <strong>{{ localizeValidationText(result.scope) }}</strong>
+                  <span>{{ localizeValidationText(result.message) }}</span>
+                  <small>{{ result.detail ? localizeValidationText(result.detail) : '--' }}</small>
                 </div>
               </div>
-              <div v-else class="empty-state compact">还没有运行配置测试。</div>
+              <div v-else class="empty-state compact">{{ t('还没有运行配置测试。') }}</div>
             </div>
           </section>
         </section>
@@ -2663,54 +3307,54 @@ onBeforeUnmount(stopDashboardPolling)
           <section class="panel">
             <div class="panel-head">
               <div>
-                <h2>客户端管控</h2>
-                <p class="muted">自动记录播放设备和 UA，也可以按播放频率临时禁用账号。</p>
+                <div class="panel-title-line"><Users :size="18" /><h2>{{ t('客户端管控') }}</h2></div>
+                <p class="muted">{{ t('自动记录播放设备和 UA，也可以按播放频率临时禁用账号。') }}</p>
               </div>
               <div class="panel-actions">
-                <button class="secondary" @click="refreshClientControl">刷新</button>
+                <button class="secondary" @click="refreshClientControl"><RefreshCw :size="15" />{{ t('刷新') }}</button>
                 <button class="primary" :disabled="savingClientControl" @click="saveClientControl">
-                  {{ savingClientControl ? '保存中' : '保存' }}
+                  <Check :size="15" />{{ savingClientControl ? t('保存中') : t('保存') }}
                 </button>
               </div>
             </div>
-            <div v-if="clientControlError" class="notice error">{{ clientControlError }}</div>
+            <div v-if="clientControlError" class="notice error" role="alert">{{ clientControlError }}</div>
             <div class="client-toolbar">
               <label class="check">
                 <input v-model="clientControl.enabled" type="checkbox" />
-                <span>启用 UA 拦截</span>
+                <span>{{ t('启用 UA 拦截') }}</span>
               </label>
               <label class="check">
                 <input v-model="clientControl.playback_rate_limit_enabled" type="checkbox" />
-                <span>启用播放频率限制</span>
+                <span>{{ t('启用播放频率限制') }}</span>
               </label>
               <label class="check">
                 <input v-model="clientControl.concurrent_playback_limit_enabled" type="checkbox" />
-                <span>启用同时播放限制</span>
+                <span>{{ t('启用同时播放限制') }}</span>
               </label>
             </div>
             <div class="rate-limit-grid">
               <label>
-                <span>屏蔽方式</span>
+                <span>{{ t('屏蔽方式') }}</span>
                 <select v-model="clientControl.playback_rate_limit_action">
                   <option v-for="option in playbackLimitActionOptions" :key="option.value" :value="option.value">
-                    {{ option.label }}
+                    {{ t(option.label) }}
                   </option>
                 </select>
               </label>
               <label>
-                <span>检测时间窗口（秒）</span>
+                <span>{{ t('检测时间窗口（秒）') }}</span>
                 <input v-model.number="clientControl.playback_rate_limit_window_seconds" type="number" min="1" />
               </label>
               <label>
-                <span>最大播放次数</span>
+                <span>{{ t('最大播放次数') }}</span>
                 <input v-model.number="clientControl.playback_rate_limit_max_requests" type="number" min="1" />
               </label>
               <label>
-                <span>封禁时长（秒）</span>
+                <span>{{ t('封禁时长（秒）') }}</span>
                 <input v-model.number="clientControl.playback_rate_limit_block_seconds" type="number" min="1" />
               </label>
               <label>
-                <span>允许同时播放数</span>
+                <span>{{ t('允许同时播放数') }}</span>
                 <input
                   v-model.number="clientControl.concurrent_playback_limit_max"
                   type="number"
@@ -2724,13 +3368,13 @@ onBeforeUnmount(stopDashboardPolling)
                 <table class="rate-block-table client-rate-block-table">
                   <thead>
                     <tr>
-                      <th>封禁方式</th>
-                      <th>封禁原因</th>
-                      <th>服务器</th>
+                      <th>{{ t('封禁方式') }}</th>
+                      <th>{{ t('封禁原因') }}</th>
+                      <th>{{ t('服务器') }}</th>
                       <th>IP</th>
-                      <th>用户</th>
-                      <th>到期时间</th>
-                      <th>{{ activeRateLimitBlocks.length }} 条</th>
+                      <th>{{ t('用户') }}</th>
+                      <th>{{ t('到期时间') }}</th>
+                      <th>{{ activeRateLimitBlocks.length }} {{ t('条') }}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -2745,37 +3389,37 @@ onBeforeUnmount(stopDashboardPolling)
                       <td>{{ record.user_name || '--' }}</td>
                       <td>{{ formatTimestamp(record.blocked_until) }}</td>
                       <td>
-                        <button class="secondary" @click="unblockRateLimit(record)">解除封禁</button>
+                        <button class="secondary" @click="unblockRateLimit(record)"><ShieldCheck :size="15" />{{ t('解除封禁') }}</button>
                       </td>
                     </tr>
                   </tbody>
                 </table>
               </div>
-              <div v-else class="empty-state compact">暂无频率限制封禁。</div>
+              <div v-else class="empty-state compact">{{ t('暂无频率限制封禁。') }}</div>
             </div>
           </section>
 
           <section class="panel">
             <div class="panel-head">
               <div>
-                <h2>播放频率窗口</h2>
-                <p class="muted">显示当前检测窗口内各 IP 的播放请求计数。</p>
+                <div class="panel-title-line"><Clock3 :size="18" /><h2>{{ t('播放频率窗口') }}</h2></div>
+                <p class="muted">{{ t('显示当前检测窗口内各 IP 的播放请求计数。') }}</p>
               </div>
-              <button class="secondary" @click="refreshRateLimitStatus">刷新</button>
+              <button class="secondary" @click="refreshRateLimitStatus"><RefreshCw :size="15" />{{ t('刷新') }}</button>
             </div>
             <div v-if="rateLimitWindows.length" class="rate-window-table-wrap">
               <table class="rate-window-table">
                 <thead>
                   <tr>
-                    <th>服务器</th>
+                    <th>{{ t('服务器') }}</th>
                     <th>IP</th>
-                    <th>用户</th>
-                    <th>当前次数</th>
-                    <th>阈值</th>
-                    <th>剩余</th>
-                    <th>窗口</th>
-                    <th>重置时间</th>
-                    <th>状态</th>
+                    <th>{{ t('用户') }}</th>
+                    <th>{{ t('当前次数') }}</th>
+                    <th>{{ t('阈值') }}</th>
+                    <th>{{ t('剩余') }}</th>
+                    <th>{{ t('窗口') }}</th>
+                    <th>{{ t('重置时间') }}</th>
+                    <th>{{ t('状态') }}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -2793,14 +3437,14 @@ onBeforeUnmount(stopDashboardPolling)
                     <td>{{ formatTimestamp(row.reset_at) }}</td>
                     <td>
                       <span :class="['client-badge', row.blocked ? 'blocked' : 'allowed']">
-                        {{ row.blocked ? '已封禁' : '观察中' }}
+                        {{ row.blocked ? t('已封禁') : t('观察中') }}
                       </span>
                     </td>
                   </tr>
                 </tbody>
               </table>
             </div>
-            <div v-else class="empty-state compact">当前没有播放频率窗口数据。</div>
+            <div v-else class="empty-state compact">{{ t('当前没有播放频率窗口数据。') }}</div>
           </section>
 
           <div class="client-filterbar client-filterbar-standalone">
@@ -2808,74 +3452,74 @@ onBeforeUnmount(stopDashboardPolling)
               :class="['filter-button', { active: clientStatusFilter === 'all' }]"
               @click="clientStatusFilter = 'all'"
             >
-              全部 {{ clientControl.records.length }}
+              {{ t('全部') }} {{ clientControl.records.length }}
             </button>
             <button
               :class="['filter-button', { active: clientStatusFilter === 'blocked' }]"
               @click="clientStatusFilter = 'blocked'"
             >
-              已禁用 {{ blockedClientCount }}
+              {{ t('已禁用') }} {{ blockedClientCount }}
             </button>
             <button
               :class="['filter-button', { active: clientStatusFilter === 'allowed' }]"
               @click="clientStatusFilter = 'allowed'"
             >
-              允许播放 {{ allowedClientCount }}
+              {{ t('允许播放') }} {{ allowedClientCount }}
             </button>
             <input
               v-model="clientKeywordFilter"
               class="client-search"
-              placeholder="搜索 UA"
+              :placeholder="t('搜索 UA')"
             />
             <button
               class="secondary"
               :disabled="clientStatusFilter === 'all' && !clientKeywordFilter"
               @click="clearClientFilters"
             >
-              清空筛选
+              {{ t('清空筛选') }}
             </button>
           </div>
 
           <section class="panel">
             <div class="panel-head">
               <div>
-                <h2>手动添加 UA 拦截</h2>
-                <p class="muted">输入 UA 完整内容或关键字，保存后默认进入禁用状态。</p>
+                <div class="panel-title-line"><Plus :size="18" /><h2>{{ t('手动添加 UA 拦截') }}</h2></div>
+                <p class="muted">{{ t('输入 UA 完整内容或关键字，保存后默认进入禁用状态。') }}</p>
               </div>
             </div>
             <div class="manual-rule-row">
               <label>
-                <span>UA 关键字</span>
+                <span>{{ t('UA 关键字') }}</span>
                 <input
                   v-model="manualClientRule.user_agent"
-                  placeholder="例如：Infuse / Fileball / okhttp"
+                  :placeholder="t('例如：Infuse / Fileball / okhttp')"
                   @keyup.enter="addClientRule"
                 />
               </label>
               <label>
-                <span>描述</span>
-                <input v-model="manualClientRule.note" placeholder="例如：临时禁用某客户端" @keyup.enter="addClientRule" />
+                <span>{{ t('描述') }}</span>
+                <input v-model="manualClientRule.note" :placeholder="t('例如：临时禁用某客户端')" @keyup.enter="addClientRule" />
               </label>
               <button class="primary" :disabled="addingClientRule" @click="addClientRule">
-                {{ addingClientRule ? '添加中' : '添加拦截' }}
+                <Plus :size="15" />{{ addingClientRule ? t('添加中') : t('添加拦截') }}
               </button>
             </div>
           </section>
 
           <section class="panel client-table-panel">
             <div class="client-date-note">
-              <strong>日期说明</strong>
-              <span>时间为该 UA 第一次出现或手动添加的时间；后台更新时间只在规则状态、备注或客户端信息变化时刷新，同一 UA 重复请求不会每次刷新。</span>
+              <strong>{{ t('日期说明') }}</strong>
+              <span>{{ t('时间为该 UA 第一次出现或手动添加的时间；后台更新时间只在规则状态、备注或客户端信息变化时刷新，同一 UA 重复请求不会每次刷新。') }}</span>
             </div>
             <div class="client-table-wrap">
               <table class="client-table">
                 <thead>
                   <tr>
-                    <th>关键字</th>
-                    <th>描述</th>
-                    <th>状态</th>
-                    <th>记录时间</th>
-                    <th>操作</th>
+                    <th>{{ t('关键字') }}</th>
+                    <th>{{ t('描述') }}</th>
+                    <th>{{ t('状态') }}</th>
+                    <th>{{ t('记录时间') }}</th>
+                    <th>{{ t('操作') }}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -2884,13 +3528,13 @@ onBeforeUnmount(stopDashboardPolling)
                       <strong :title="clientKeyword(record)">{{ clientKeyword(record) }}</strong>
                     </td>
                     <td>
-                      <span :title="record.note || (record.source === 'auto' ? '自动记录播放设备' : '手动 UA 拦截')">
-                        {{ record.note || (record.source === 'auto' ? '自动记录播放设备' : '手动 UA 拦截') }}
+                      <span :title="record.note || (record.source === 'auto' ? t('自动记录播放设备') : t('手动 UA 拦截'))">
+                        {{ record.note || (record.source === 'auto' ? t('自动记录播放设备') : t('手动 UA 拦截')) }}
                       </span>
                     </td>
                     <td>
                       <span :class="['client-badge', record.enabled ? 'blocked' : 'allowed']">
-                        {{ record.enabled ? '已禁用' : '允许播放' }}
+                        {{ record.enabled ? t('已禁用') : t('允许播放') }}
                       </span>
                     </td>
                     <td class="client-time-cell">
@@ -2902,13 +3546,13 @@ onBeforeUnmount(stopDashboardPolling)
                           type="button"
                           :class="['switch-button', { active: record.enabled }]"
                           :aria-pressed="record.enabled"
-                          :aria-label="record.enabled ? '关闭 UA 拦截' : '开启 UA 拦截'"
+                          :aria-label="record.enabled ? t('关闭 UA 拦截') : t('开启 UA 拦截')"
                           @click="toggleClientRule(record)"
                         >
                           <span />
                         </button>
                         <button type="button" class="danger-button" @click="deleteClientRule(record)">
-                          删除
+                          <Trash2 :size="15" />{{ t('删除') }}
                         </button>
                       </div>
                     </td>
@@ -2916,7 +3560,7 @@ onBeforeUnmount(stopDashboardPolling)
                 </tbody>
               </table>
               <div v-if="!clientRuleRows.length" class="empty-state">
-                {{ clientControl.records.length ? '当前筛选没有匹配的客户端。' : '暂无客户端记录，开始播放后会自动出现，也可以手动添加 UA 拦截。' }}
+                {{ clientControl.records.length ? t('当前筛选没有匹配的客户端。') : t('暂无客户端记录，开始播放后会自动出现，也可以手动添加 UA 拦截。') }}
               </div>
             </div>
           </section>
@@ -2926,52 +3570,52 @@ onBeforeUnmount(stopDashboardPolling)
           <section class="panel webhook-panel">
             <div class="panel-head">
               <div>
-                <h2>通知配置</h2>
-                <p class="muted">Webhook 使用 POST JSON 发送：{ title, text }。命中通知包含播放频率屏蔽和 UA 拦截命中。</p>
+                <div class="panel-title-line"><Bell :size="18" /><h2>{{ t('通知配置') }}</h2></div>
+                <p class="muted">{{ t('Webhook 使用 POST JSON 发送：{ title, text }。命中通知包含播放频率屏蔽和 UA 拦截命中。') }}</p>
               </div>
               <div class="panel-actions">
                 <label class="check compact-check">
                   <input v-model="clientControl.notify_enabled" type="checkbox" />
-                  <span>命中通知</span>
+                  <span>{{ t('命中通知') }}</span>
                 </label>
-                <button class="secondary" @click="addWebhook">添加 Webhook</button>
+                <button class="secondary" @click="addWebhook"><Plus :size="15" />{{ t('添加 Webhook') }}</button>
                 <button class="primary" :disabled="savingClientControl" @click="saveClientControl">
-                  {{ savingClientControl ? '保存中' : '保存通知' }}
+                  <Check :size="15" />{{ savingClientControl ? t('保存中') : t('保存通知') }}
                 </button>
               </div>
             </div>
-            <div v-if="clientControlError" class="notice error">{{ clientControlError }}</div>
+            <div v-if="clientControlError" class="notice error" role="alert">{{ clientControlError }}</div>
             <div class="webhook-list">
               <article v-for="(webhook, index) in clientControl.webhooks" :key="webhook.id" class="webhook-item">
                 <div class="webhook-item-head">
                   <label class="check compact-check">
                     <input v-model="webhook.enabled" type="checkbox" />
-                    <span>启用</span>
+                    <span>{{ t('启用') }}</span>
                   </label>
                   <div class="rule-actions">
                     <button class="secondary" :disabled="testingWebhook" @click="testWebhook(webhook)">
-                      {{ testingWebhook ? '测试中' : '测试连接' }}
+                      <Webhook :size="15" />{{ testingWebhook ? t('测试中') : t('测试连接') }}
                     </button>
-                    <button class="danger-button" @click="removeWebhook(index)">删除</button>
+                    <button class="danger-button" @click="removeWebhook(index)"><Trash2 :size="15" />{{ t('删除') }}</button>
                   </div>
                 </div>
                 <div class="grid webhook-grid">
                   <label>
-                    <span>名称</span>
-                    <input v-model="webhook.name" placeholder="例如：企业微信通知" />
+                    <span>{{ t('名称') }}</span>
+                    <input v-model="webhook.name" :placeholder="t('例如：企业微信通知')" />
                   </label>
                   <label>
                     <span>Webhook URL</span>
                     <input v-model="webhook.url" placeholder="https://example.com/webhook" />
                   </label>
                   <label>
-                    <span>密钥（可选）</span>
-                    <input v-model="webhook.secret" type="password" placeholder="可选密钥" />
+                    <span>{{ t('密钥（可选）') }}</span>
+                    <input v-model="webhook.secret" type="password" :placeholder="t('可选密钥')" />
                   </label>
                 </div>
               </article>
             </div>
-            <p class="muted rate-limit-help">请求体固定为 {"title":"${title}","text":"${text}"}，密钥会通过 `X-Webhook-Secret` 头发送。</p>
+            <p class="muted rate-limit-help">{{ t('请求体固定为 {"title":"${title}","text":"${text}"}，密钥会通过 `X-Webhook-Secret` 头发送。') }}</p>
           </section>
         </section>
 
@@ -2979,8 +3623,8 @@ onBeforeUnmount(stopDashboardPolling)
           <section class="panel">
             <div class="panel-head">
               <div>
-                <h2>配置备份</h2>
-                <p class="muted">导出配置文件，或从电脑选择配置文件还原运行配置。</p>
+                <div class="panel-title-line"><Archive :size="18" /><h2>{{ t('配置备份') }}</h2></div>
+                <p class="muted">{{ t('导出配置文件，或从电脑选择配置文件还原运行配置。') }}</p>
               </div>
             </div>
             <input
@@ -2990,44 +3634,44 @@ onBeforeUnmount(stopDashboardPolling)
               accept=".json,application/json,text/plain"
               @change="handleBackupFileSelected"
             />
-            <div v-if="backupError" class="notice error">{{ backupError }}</div>
+            <div v-if="backupError" class="notice error" role="alert">{{ backupError }}</div>
             <div class="backup-layout">
               <section class="backup-card">
-                <h3>备份范围</h3>
+                <h3>{{ t('备份范围') }}</h3>
                 <div class="backup-scope-grid">
                   <div>
-                    <strong>服务器配置</strong>
-                    <span>Emby 地址、API Key、反代端口、真实 IP、缓存和映射规则</span>
+                    <strong>{{ t('服务器配置') }}</strong>
+                    <span>{{ t('Emby 地址、API Key、反代端口、真实 IP、缓存和映射规则') }}</span>
                   </div>
                   <div>
-                    <strong>客户端管控</strong>
-                    <span>UA 拦截、播放频率限制、封禁列表和客户端规则</span>
+                    <strong>{{ t('客户端管控') }}</strong>
+                    <span>{{ t('UA 拦截、播放频率限制、封禁列表和客户端规则') }}</span>
                   </div>
                   <div>
-                    <strong>通知配置</strong>
-                    <span>Webhook 地址、启用状态和密钥</span>
+                    <strong>{{ t('通知配置') }}</strong>
+                    <span>{{ t('Webhook 地址、启用状态和密钥') }}</span>
                   </div>
                   <div>
-                    <strong>日志配置</strong>
-                    <span>日志级别、文件大小、保留数量和格式</span>
+                    <strong>{{ t('日志配置') }}</strong>
+                    <span>{{ t('日志级别、文件大小、保留数量和格式') }}</span>
                   </div>
                 </div>
                 <p class="muted backup-note">
-                  备份文件会使用备份密码加密；不包含面板管理员用户名、密码、登录会话、运行日志文件和请求统计数据。
+                  {{ t('备份文件会使用备份密码加密；不包含面板管理员用户名、密码、登录会话、运行日志文件和请求统计数据。') }}
                 </p>
               </section>
 
               <section class="backup-card">
-                <h3>配置文件备份 / 还原</h3>
+                <h3>{{ t('配置文件备份 / 还原') }}</h3>
                 <div class="backup-actions text-actions">
-                  <button class="secondary" @click="exportBackup">备份</button>
-                  <button class="primary" @click="importBackup">还原</button>
+                  <button class="secondary" @click="exportBackup"><Download :size="15" />{{ t('导出备份') }}</button>
+                  <button class="primary" @click="importBackup"><Upload :size="15" />{{ t('还原') }}</button>
                 </div>
                 <div class="backup-drop-hint">
-                  <strong>备份</strong>
-                  <span>输入备份密码后生成加密的 `embypanel-config-时间.json` 并弹出浏览器下载。</span>
-                  <strong>还原</strong>
-                  <span>点击后选择本机配置文件，加密备份需要输入对应密码，读取成功后自动还原并重启反代服务。</span>
+                  <strong>{{ t('导出备份') }}</strong>
+                  <span>{{ t('输入备份密码后生成加密的 `embypanel-config-时间.json` 并弹出浏览器下载。') }}</span>
+                  <strong>{{ t('还原') }}</strong>
+                  <span>{{ t('点击后选择本机配置文件，加密备份需要输入对应密码，读取成功后自动还原并重启反代服务。') }}</span>
                 </div>
               </section>
             </div>
@@ -3038,73 +3682,73 @@ onBeforeUnmount(stopDashboardPolling)
           <section class="panel log-console-panel">
             <div class="panel-head">
               <div>
-                <h2>日志</h2>
+                <div class="panel-title-line"><FileText :size="18" /><h2>{{ t('日志') }}</h2></div>
                 <p class="muted">
-                  单列表查看播放日志、拦截日志、反代请求和运行日志，页面打开时每 3 秒自动刷新。
+                  {{ t('单列表查看播放日志、拦截日志、反代请求和运行日志，页面打开时每 3 秒自动刷新。') }}
                 </p>
               </div>
               <div class="panel-actions">
-                <span class="status-dot">{{ logsLoading ? '刷新中' : '实时刷新' }}</span>
+                <span class="status-dot">{{ logsLoading ? t('刷新中') : t('实时刷新') }}</span>
                 <button class="secondary" :disabled="logsLoading" @click="refreshActivityLogs">
-                  {{ logsLoading ? '刷新中' : '刷新' }}
+                  <RefreshCw :size="15" />{{ logsLoading ? t('刷新中') : t('刷新') }}
                 </button>
-                <button v-if="!isRequestDetailLogView" class="secondary" @click="exportLogs">导出 CSV</button>
+                <button v-if="!isRequestDetailLogView" class="secondary" @click="exportLogs"><Download :size="15" />{{ t('导出 CSV') }}</button>
               </div>
             </div>
-            <div v-if="logsError" class="notice error">{{ logsError }}</div>
+            <div v-if="logsError" class="notice error" role="alert">{{ logsError }}</div>
             <div :class="['log-toolbar', 'compact', { proxy: isRequestDetailLogView }]">
               <label>
-                <span>日志类型</span>
+                <span>{{ t('日志类型') }}</span>
                 <select v-model="selectedLogView" @change="handleLogViewChange">
-                  <option value="playback">播放日志</option>
-                  <option value="blocked">拦截日志</option>
-                  <option value="proxy">反代请求</option>
-                  <option value="general">运行日志</option>
+                  <option value="playback">{{ t('播放日志') }}</option>
+                  <option value="blocked">{{ t('拦截日志') }}</option>
+                  <option value="proxy">{{ t('反代请求') }}</option>
+                  <option value="general">{{ t('运行日志') }}</option>
                 </select>
               </label>
               <label v-if="showLogLevelFilter">
-                <span>级别</span>
+                <span>{{ t('级别') }}</span>
                 <select v-model="selectedLogLevel" @change="refreshLogsWithReset">
                   <option v-for="option in logLevelOptions" :key="option.value" :value="option.value">
-                    {{ option.label }}
+                    {{ t(option.label) }}
                   </option>
                 </select>
               </label>
               <label>
-                <span>服务器</span>
+                <span>{{ t('服务器') }}</span>
                 <select v-model="selectedLogServer" @change="refreshLogsWithReset">
-                  <option value="all">全部服务器</option>
+                  <option value="all">{{ t('全部服务器') }}</option>
                   <option v-for="server in logServers" :key="server.id" :value="server.id">
                     {{ server.name }} · :{{ server.port }}
                   </option>
                 </select>
               </label>
               <label v-if="isRequestDetailLogView">
-                <span>请求类型</span>
+                <span>{{ t('请求类型') }}</span>
                 <select v-model="selectedRequestPathType" @change="refreshLogsWithReset">
-                  <option value="all">全部请求</option>
-                  <option value="video_stream">视频流</option>
-                  <option value="playback_info">播放信息</option>
-                  <option value="system_info">系统信息</option>
-                  <option value="base_html_player">播放器脚本</option>
-                  <option v-if="selectedLogView === 'blocked'" value="rate_limit_action">封禁动作</option>
-                  <option value="proxy">普通代理</option>
+                  <option value="all">{{ t('全部请求') }}</option>
+                  <option value="video_stream">{{ t('视频流') }}</option>
+                  <option value="playback_info">{{ t('播放信息') }}</option>
+                  <option value="system_info">{{ t('系统信息') }}</option>
+                  <option value="base_html_player">{{ t('播放器脚本') }}</option>
+                  <option v-if="selectedLogView === 'blocked'" value="rate_limit_action">{{ t('封禁动作') }}</option>
+                  <option value="proxy">{{ t('普通代理') }}</option>
                 </select>
               </label>
               <label class="log-search-field">
-                <span>关键词</span>
-                <input v-model="logKeywordFilter" placeholder="搜索用户 / IP / URL / 信息" @keyup.enter="refreshLogsWithReset" />
+                <span>{{ t('关键词') }}</span>
+                <input v-model="logKeywordFilter" :placeholder="t('搜索用户 / IP / URL / 信息')" @keyup.enter="refreshLogsWithReset" />
               </label>
               <label>
-                <span>开始时间</span>
+                <span>{{ t('开始时间') }}</span>
                 <input v-model="logSince" type="datetime-local" @change="refreshLogsWithReset" />
               </label>
               <label>
-                <span>结束时间</span>
+                <span>{{ t('结束时间') }}</span>
                 <input v-model="logUntil" type="datetime-local" @change="refreshLogsWithReset" />
               </label>
               <div class="log-filter-actions">
-                <button class="primary" @click="refreshLogsWithReset">筛选</button>
+                <button class="primary" @click="refreshLogsWithReset"><SlidersHorizontal :size="15" />{{ t('筛选') }}</button>
               </div>
             </div>
 
@@ -3112,9 +3756,9 @@ onBeforeUnmount(stopDashboardPolling)
               <span>{{ selectedLogViewLabel }}</span>
               <strong>{{ visibleLogCount }}</strong>
               <span v-if="isRequestDetailLogView">
-                单次最多 {{ requestDetailDisplayMax }} 条，保留 {{ requestDetailPersistDays }} 天或最近 {{ requestDetailPersistMax }} 条
+                {{ t('单次最多') }} {{ requestDetailDisplayMax }} {{ t('条') }}，{{ t('保留') }} {{ requestDetailPersistDays }} {{ t('天或最近') }} {{ requestDetailPersistMax }} {{ t('条') }}
               </span>
-              <span v-else>内存最多保留最近 {{ activityLogMaxLimit }} 条可视化日志</span>
+              <span v-else>{{ t('内存最多保留最近') }} {{ activityLogMaxLimit }} {{ t('条可视化日志') }}</span>
             </div>
 
             <div
@@ -3142,10 +3786,10 @@ onBeforeUnmount(stopDashboardPolling)
                         v-if="entry.detail && isHttpUrl(entry.detail)"
                         class="copy-link"
                         href="#"
-                        title="点击复制链接"
+                        :title="t('点击复制链接')"
                         @click.prevent="copyText(entry.detail)"
                       >{{ entry.detail }}</a>
-                      <template v-else>{{ entry.detail || '暂无详情' }}</template>
+                      <template v-else>{{ entry.detail || t('暂无详情') }}</template>
                     </p>
                   </div>
                 </article>
@@ -3174,8 +3818,8 @@ onBeforeUnmount(stopDashboardPolling)
                     <span>{{ requestPathTypeLabel(row.path_type) }}</span>
                     <span v-if="row.event_type !== 'block' && row.event_type !== 'unblock'">HTTP {{ row.status_code }}</span>
                     <span v-if="row.event_type !== 'block' && row.event_type !== 'unblock'">{{ row.duration_ms }}ms</span>
-                    <span v-if="row.event_type !== 'block' && row.event_type !== 'unblock'">{{ row.cache_hit ? '缓存命中' : '未命中' }}</span>
-                    <span>{{ row.event_type === 'unblock' ? '已解除' : row.blocked ? '已拦截' : '未拦截' }}</span>
+                    <span v-if="row.event_type !== 'block' && row.event_type !== 'unblock'">{{ row.cache_hit ? t('缓存命中') : t('未命中') }}</span>
+                    <span>{{ row.event_type === 'unblock' ? t('已解除') : row.blocked ? t('已拦截') : t('未拦截') }}</span>
                   </div>
                 </article>
               </template>
@@ -3186,42 +3830,42 @@ onBeforeUnmount(stopDashboardPolling)
                 :disabled="logsLoading"
                 @click="loadMoreSelectedLogs"
               >
-                {{ logsLoading ? '加载中' : `加载更多${selectedLogViewLabel}` }}
+                {{ logsLoading ? t('加载中') : `${t('加载更多')} ${selectedLogViewLabel}` }}
               </button>
-              <div v-else class="log-limit-note">已显示 {{ visibleLogCount }} 条{{ selectedLogViewLabel }}</div>
+              <div v-else class="log-limit-note">{{ t('已显示') }} {{ visibleLogCount }} {{ t('条') }} {{ selectedLogViewLabel }}</div>
             </div>
-            <div v-else class="empty-state">暂无{{ selectedLogViewLabel }}。</div>
+            <div v-else class="empty-state">{{ t('暂无') }} {{ selectedLogViewLabel }}</div>
           </section>
 
           <section class="panel">
             <div class="panel-head">
               <div>
-                <h2>日志文件配置</h2>
-                <p class="muted">日志写入 data/logs/embypanel.log，默认 INFO 级别。</p>
+                <div class="panel-title-line"><Settings2 :size="18" /><h2>{{ t('日志文件配置') }}</h2></div>
+                <p class="muted">{{ t('日志写入 data/logs/embypanel.log，默认 INFO 级别。') }}</p>
               </div>
-              <button class="primary" @click="saveLogConfig">保存日志配置</button>
+              <button class="primary" @click="saveLogConfig"><Check :size="15" />{{ t('保存日志配置') }}</button>
             </div>
             <div class="grid log-config-grid">
               <label>
-                <span>日志级别</span>
+                <span>{{ t('日志级别') }}</span>
                 <select v-model="logConfig.level">
-                  <option value="debug">DEBUG - 调试</option>
-                  <option value="info">INFO - 信息</option>
-                  <option value="warning">WARNING - 警告</option>
-                  <option value="error">ERROR - 错误</option>
-                  <option value="critical">CRITICAL - 严重</option>
+                  <option value="debug">{{ t('DEBUG - 调试') }}</option>
+                  <option value="info">{{ t('INFO - 信息') }}</option>
+                  <option value="warning">{{ t('WARNING - 警告') }}</option>
+                  <option value="error">{{ t('ERROR - 错误') }}</option>
+                  <option value="critical">{{ t('CRITICAL - 严重') }}</option>
                 </select>
               </label>
               <label>
-                <span>单文件最大 MB</span>
+                <span>{{ t('单文件最大 MB') }}</span>
                 <input v-model.number="logConfig.max_size_mb" type="number" min="1" max="1024" />
               </label>
               <label>
-                <span>保留文件数</span>
+                <span>{{ t('保留文件数') }}</span>
                 <input v-model.number="logConfig.max_backups" type="number" min="1" max="99" />
               </label>
               <label class="log-format-field">
-                <span>日志格式</span>
+                <span>{{ t('日志格式') }}</span>
                 <input v-model="logConfig.format" />
               </label>
             </div>
@@ -3231,32 +3875,32 @@ onBeforeUnmount(stopDashboardPolling)
         <section v-else class="account-grid">
           <section class="panel">
             <div class="panel-head">
-              <h2>账户资料</h2>
+              <div class="panel-title-line"><UserRound :size="18" /><h2>{{ t('账户资料') }}</h2></div>
               <button class="primary" :disabled="savingProfile" @click="saveProfile">
-                {{ savingProfile ? '保存中' : '保存资料' }}
+                <Check :size="15" />{{ savingProfile ? t('保存中') : t('保存资料') }}
               </button>
             </div>
             <label>
-              <span>用户名</span>
+              <span>{{ t('用户名') }}</span>
               <input v-model="profileForm.username" autocomplete="username" />
             </label>
           </section>
 
           <section class="panel">
             <div class="panel-head">
-              <h2>修改密码</h2>
+              <div class="panel-title-line"><ShieldCheck :size="18" /><h2>{{ t('修改密码') }}</h2></div>
             </div>
             <div class="grid">
               <label>
-                <span>当前密码</span>
+                <span>{{ t('当前密码') }}</span>
                 <input v-model="passwordForm.current_password" type="password" autocomplete="current-password" />
               </label>
               <label>
-                <span>新密码</span>
+                <span>{{ t('新密码') }}</span>
                 <input v-model="passwordForm.new_password" type="password" autocomplete="new-password" />
               </label>
               <label>
-                <span>确认新密码</span>
+                <span>{{ t('确认新密码') }}</span>
                 <input
                   v-model="passwordForm.confirm_password"
                   type="password"
@@ -3267,7 +3911,7 @@ onBeforeUnmount(stopDashboardPolling)
             </div>
             <div class="form-actions">
               <button class="primary" :disabled="changingPassword" @click="changePassword">
-                {{ changingPassword ? '修改中' : '修改密码' }}
+                <ShieldCheck :size="15" />{{ changingPassword ? t('修改中') : t('修改密码') }}
               </button>
             </div>
           </section>
@@ -3275,23 +3919,23 @@ onBeforeUnmount(stopDashboardPolling)
           <section class="panel">
             <div class="panel-head">
               <div>
-                <h2>配置审计</h2>
-                <p class="muted">记录配置、账户、通知、备份恢复等管理操作，不保存敏感明文。</p>
+                <div class="panel-title-line"><FileText :size="18" /><h2>{{ t('配置审计') }}</h2></div>
+                <p class="muted">{{ t('记录配置、账户、通知、备份恢复等管理操作，不保存敏感明文。') }}</p>
               </div>
-              <button class="secondary" @click="refreshAuditLogs">刷新</button>
+              <button class="secondary" @click="refreshAuditLogs"><RefreshCw :size="15" />{{ t('刷新') }}</button>
             </div>
             <div class="audit-toolbar">
               <label>
-                <span>操作类型</span>
+                <span>{{ t('操作类型') }}</span>
                 <select v-model="selectedAuditAction" @change="refreshAuditLogs">
                   <option v-for="action in auditActionOptions" :key="action" :value="action">
-                    {{ action === 'all' ? '全部操作' : action }}
+                    {{ action === 'all' ? t('全部操作') : action }}
                   </option>
                 </select>
               </label>
               <label>
-                <span>关键词</span>
-                <input v-model="auditKeywordFilter" placeholder="搜索管理员 / 操作 / 摘要" @keyup.enter="refreshAuditLogs" />
+                <span>{{ t('关键词') }}</span>
+                <input v-model="auditKeywordFilter" :placeholder="t('搜索管理员 / 操作 / 摘要')" @keyup.enter="refreshAuditLogs" />
               </label>
             </div>
             <div v-if="auditLogs.length" class="audit-list">
@@ -3303,7 +3947,7 @@ onBeforeUnmount(stopDashboardPolling)
                 <small>{{ entry.admin_username || '--' }} · {{ entry.result }} · {{ formatTimestampMs(entry.timestamp_ms) }}</small>
               </article>
             </div>
-            <div v-else class="empty-state compact">暂无审计记录。</div>
+            <div v-else class="empty-state compact">{{ t('暂无审计记录。') }}</div>
           </section>
         </section>
       </div>
