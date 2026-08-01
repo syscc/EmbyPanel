@@ -140,7 +140,15 @@ pub async fn change_password(
             "invalid or expired session".to_string(),
         ));
     };
-    verify_password(&payload.current_password, &admin.password_hash)?;
+    match verify_password(&payload.current_password, &admin.password_hash) {
+        Ok(()) => {}
+        Err(AppError::Unauthorized(_)) => {
+            return Err(AppError::Validation(
+                "current password is incorrect".to_string(),
+            ));
+        }
+        Err(err) => return Err(err),
+    }
     let password_hash = hash_password(&payload.new_password)?;
     state
         .settings_store
@@ -175,7 +183,11 @@ pub async fn update_profile(
     let payload: UpdateProfileRequest = state.crypto_keys.decrypt_named(&request, "profile")?;
     let username = payload.username.trim();
     if username.is_empty() {
-        return Err(AppError::Validation("username cannot be empty".to_string()));
+        let username = state
+            .settings_store
+            .admin_username_by_id(admin_user_id)?
+            .ok_or_else(|| AppError::Unauthorized("invalid or expired session".to_string()))?;
+        return Ok(Json(ProfileResponse { username }));
     }
     state
         .settings_store

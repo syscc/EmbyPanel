@@ -86,6 +86,7 @@ pub struct PlaybackSession {
 
 #[derive(Debug, Serialize)]
 pub struct MediaOverview {
+    pub server_id: String,
     pub movie_count: i64,
     pub series_count: i64,
     pub episode_count: i64,
@@ -520,6 +521,11 @@ pub async fn get_media_overview(
     let library_count = get_library_count(client, config).await.unwrap_or_default();
 
     Ok(MediaOverview {
+        server_id: config
+            .servers
+            .first()
+            .map(|server| server.id.clone())
+            .unwrap_or_else(|| "default".to_string()),
         movie_count: counts.movie_count,
         series_count: counts.series_count,
         episode_count: counts.episode_count,

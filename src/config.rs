@@ -187,10 +187,19 @@ impl Config {
             return Ok(());
         }
 
+        let mut ids = std::collections::HashSet::new();
         let mut ports = std::collections::HashSet::new();
         for (index, server) in self.servers.iter_mut().enumerate() {
             if server.id.trim().is_empty() {
                 server.id = format!("server-{}", index + 1);
+            } else {
+                server.id = server.id.trim().to_string();
+            }
+            if !ids.insert(server.id.clone()) {
+                return Err(AppError::Config(format!(
+                    "server id {} is configured more than once",
+                    server.id
+                )));
             }
             if server.name.trim().is_empty() {
                 server.name = format!("服务器 {}", index + 1);

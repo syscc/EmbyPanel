@@ -82,7 +82,8 @@ pub async fn media_overview(
     for config in configs {
         match crate::emby::get_media_overview(&state.client, &config).await {
             Ok(mut overview) => {
-                let (_, server_name) = server_label(&config);
+                let (server_id, server_name) = server_label(&config);
+                overview.server_id = server_id;
                 overview.server_name = server_name;
                 overviews.push(overview);
             }
