@@ -193,6 +193,6 @@ mod tests {
         assert!(is_private_or_local_ip(&"172.16.0.1".parse().unwrap()));
         assert!(is_private_or_local_ip(&"127.0.0.1".parse().unwrap()));
         assert!(is_private_or_local_ip(&"fc00::1".parse().unwrap()));
-        assert!(!is_private_or_local_ip(&"8.8.8.8".parse().unwrap()));
+        assert!(!is_private_or_local_ip(&"192.0.2.1".parse().unwrap()));
     }
 }

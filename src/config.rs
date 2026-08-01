@@ -598,7 +598,7 @@ mod tests {
             cache_domain_blacklist: String::new(),
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
-            strm_url_mappings: "https://openlist\\.yyej\\.com => http://localhost:5244".to_string(),
+            strm_url_mappings: "https://openlist.example.test => http://localhost:5244".to_string(),
             connectivity_check_enabled: true,
             connectivity_check_interval_seconds: 60,
             connectivity_check_timeout_seconds: 5,

@@ -94,10 +94,10 @@ mod tests {
     #[test]
     fn supports_explicit_regex_rules() {
         let rules = parse_rules(
-            "regex:https://source\\.(example|test)\\.com => http://media-gateway.local:5244",
+            "regex:https://(source|mirror)\\.example\\.test => http://media-gateway.local:5244",
         )
         .unwrap();
-        let mapped = apply_rules("https://source.test.com/d/videos/movie.mkv", &rules);
+        let mapped = apply_rules("https://mirror.example.test/d/videos/movie.mkv", &rules);
 
         assert_eq!(mapped, "http://media-gateway.local:5244/d/videos/movie.mkv");
     }

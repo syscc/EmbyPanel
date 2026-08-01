@@ -200,14 +200,17 @@ mod tests {
                 "RemoteAddresses": ["https://example.com:8920"]
             }),
             8097,
-            "http://panel.lan:8097",
+            "http://panel.test:8097",
         );
 
         assert_eq!(patched["HttpServerPortNumber"], 8097);
         assert_eq!(patched["WebSocketPortNumber"], 8097);
-        assert_eq!(patched["LocalAddress"], "http://panel.lan:8097");
-        assert_eq!(patched["LocalAddresses"], json!(["http://panel.lan:8097"]));
-        assert_eq!(patched["RemoteAddresses"], json!(["http://panel.lan:8097"]));
+        assert_eq!(patched["LocalAddress"], "http://panel.test:8097");
+        assert_eq!(patched["LocalAddresses"], json!(["http://panel.test:8097"]));
+        assert_eq!(
+            patched["RemoteAddresses"],
+            json!(["http://panel.test:8097"])
+        );
     }
 
     #[test]

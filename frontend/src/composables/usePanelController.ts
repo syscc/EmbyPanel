@@ -648,8 +648,8 @@ export function usePanelController() {
   const activePlayCount = computed(() => playbackSessions.value.length)
   const strmMappingPlaceholder = computed(() =>
     locale.value === 'en-US'
-      ? 'One mapping per line: source => target\nhttps://source.example.com => http://media-gateway.local:5244\nRegex: regex:https://source\\.(example|test)\\.com => http://media-gateway.local:5244'
-      : '每行一个映射：原地址 => 新地址\nhttps://source.example.com => http://media-gateway.local:5244\n高级正则：regex:https://source\\.(example|test)\\.com => http://media-gateway.local:5244',
+      ? 'One mapping per line: source => target\nhttps://source.example.com => http://media-gateway.local:5244\nRegex: regex:https://(source|mirror)\\.example\\.test => http://media-gateway.local:5244'
+      : '每行一个映射：原地址 => 新地址\nhttps://source.example.com => http://media-gateway.local:5244\n高级正则：regex:https://(source|mirror)\\.example\\.test => http://media-gateway.local:5244',
   )
   const logServers = computed(() =>
     settings.servers.map((server) => ({

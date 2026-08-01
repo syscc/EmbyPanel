@@ -2626,7 +2626,7 @@ mod tests {
         config.cache_domain_whitelist = "*.115cdn.*".to_string();
         assert!(should_cache_direct_link(
             &config,
-            "https://video.115cdn.com/path/file.mkv"
+            "https://video.115cdn.example.test/path/file.mkv"
         ));
         assert!(!should_cache_direct_link(
             &config,
@@ -2637,7 +2637,7 @@ mod tests {
         config.cache_domain_whitelist = "sharepoint\n115".to_string();
         assert!(!should_cache_direct_link(
             &config,
-            "https://hope.sharepoint.cn/download.aspx"
+            "https://files.sharepoint.example.test/download.aspx"
         ));
         assert!(should_cache_direct_link(
             &config,
