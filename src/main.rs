@@ -22,8 +22,11 @@ mod url_mapping;
 use std::{
     collections::{HashMap, VecDeque},
     env, fmt,
-    net::SocketAddr,
-    sync::Arc,
+    net::{IpAddr, SocketAddr},
+    sync::{
+        Arc, Mutex as StdMutex, RwLock as StdRwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -37,12 +40,12 @@ use axum::{
 use bytes::Bytes;
 use config::Config;
 use crypto_api::CryptoKeys;
-use db::{ProxyRequestDetailInsert, RequestStatKind, SettingsStore};
+use db::{ProxyRequestDetailWrite, RequestStatKind, SettingsStore, TelemetryWriteQueue};
 use error::{AppError, AppResult, safe_error_message};
 use serde::Serialize;
 use tokio::{
-    sync::{Mutex, RwLock, oneshot},
-    task::JoinHandle,
+    sync::{Mutex, RwLock, Semaphore, oneshot},
+    task::{JoinHandle, JoinSet},
 };
 use tower_http::services::{ServeDir, ServeFile};
 use tracing_subscriber::{
@@ -58,6 +61,19 @@ use block_log::BlockLogStore;
 use file_log::FileLogStore;
 
 const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_POOL_MAX_IDLE_PER_HOST: usize = 16;
+const PROXY_RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const PROXY_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const PROXY_REBIND_TIMEOUT: Duration = Duration::from_secs(2);
+const PASSWORD_TASK_CONCURRENCY_LIMIT: usize = 4;
+const PLAYBACK_PATH_STATE_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+const PLAYBACK_PATH_STATE_CAPACITY: usize = 256;
+const PLAYBACK_USER_CACHE_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+const PLAYBACK_USER_CACHE_CAPACITY: u64 = 1024;
+pub(crate) const PLAYBACK_MODE_DIRECT_LINK: &str = "direct_link";
+pub(crate) const PLAYBACK_MODE_SERVER_PROXY: &str = "server_proxy";
 pub(crate) const PROJECT_NAME: &str = "EmbyPanel";
 const PROJECT_URL: &str = "https://github.com/syscc/EmbyPanel";
 
@@ -166,9 +182,14 @@ fn parse_utc_offset(value: &str) -> Option<i32> {
 #[derive(Clone)]
 struct AppState {
     config: Arc<RwLock<Config>>,
+    config_updates: Arc<Mutex<()>>,
     client: reqwest::Client,
+    proxy_client: reqwest::Client,
     cache: Arc<RwLock<DirectLinkCache>>,
     settings_store: SettingsStore,
+    telemetry_writes: TelemetryWriteQueue,
+    client_control_cache: Arc<StdRwLock<Option<(u64, client_control::ClientControlConfig)>>>,
+    password_tasks: Arc<Semaphore>,
     crypto_keys: CryptoKeys,
     activity_log: Arc<ActivityLogStore>,
     file_log: Arc<FileLogStore>,
@@ -177,7 +198,9 @@ struct AppState {
     connectivity: Arc<connectivity::ConnectivityMonitor>,
     proxy_manager: Option<Arc<ProxyManager>>,
     proxy_server_id: Option<String>,
-    playback_users: Arc<Mutex<HashMap<String, String>>>,
+    proxy_metrics: Option<Arc<ProxyRuntimeMetrics>>,
+    playback_paths: Arc<Mutex<PlaybackPathState>>,
+    playback_users: moka::future::Cache<String, String>,
     playback_rate_hits: Arc<Mutex<HashMap<String, VecDeque<client_control::PlaybackRateHit>>>>,
     playback_rate_recent_events: Arc<Mutex<HashMap<String, u64>>>,
     playback_rate_bans: Arc<Mutex<HashMap<String, u64>>>,
@@ -186,18 +209,181 @@ struct AppState {
     update_check: Arc<Mutex<Option<(u128, UpdateCheckResponse)>>>,
 }
 
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+struct PlaybackPathKey {
+    server_id: String,
+    item_id: String,
+    device_id: Option<String>,
+    media_source_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PlaybackPathEntry {
+    mode: &'static str,
+    recorded_at: Instant,
+    sequence: u64,
+}
+
+#[derive(Debug, Default)]
+struct PlaybackPathState {
+    entries: HashMap<PlaybackPathKey, PlaybackPathEntry>,
+    next_sequence: u64,
+}
+
+impl PlaybackPathState {
+    fn record(
+        &mut self,
+        server_id: &str,
+        item_id: &str,
+        device_id: Option<&str>,
+        media_source_id: Option<&str>,
+        mode: &'static str,
+    ) {
+        let now = Instant::now();
+        self.prune_expired(now);
+        let key = playback_path_key(server_id, item_id, device_id, media_source_id);
+        if !self.entries.contains_key(&key) && self.entries.len() >= PLAYBACK_PATH_STATE_CAPACITY {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.sequence)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        self.entries.insert(
+            key,
+            PlaybackPathEntry {
+                mode,
+                recorded_at: now,
+                sequence: self.next_sequence,
+            },
+        );
+    }
+
+    fn lookup(
+        &mut self,
+        server_id: &str,
+        item_id: &str,
+        device_id: Option<&str>,
+        media_source_id: Option<&str>,
+    ) -> Option<&'static str> {
+        let now = Instant::now();
+        self.prune_expired(now);
+        let exact_key = playback_path_key(server_id, item_id, device_id, media_source_id);
+        if self.entries.contains_key(&exact_key) {
+            return self.touch(&exact_key, now);
+        }
+
+        let mut mode = None;
+        let mut latest = None;
+        for (key, entry) in &self.entries {
+            if key.server_id != server_id || key.item_id != item_id {
+                continue;
+            }
+            if device_id.is_some() && key.device_id.as_deref() != device_id {
+                continue;
+            }
+            if media_source_id.is_some() && key.media_source_id.as_deref() != media_source_id {
+                continue;
+            }
+            if mode.is_some_and(|candidate| candidate != entry.mode) {
+                return None;
+            }
+            mode = Some(entry.mode);
+            if latest
+                .as_ref()
+                .is_none_or(|(_, sequence)| entry.sequence > *sequence)
+            {
+                latest = Some((key.clone(), entry.sequence));
+            }
+        }
+
+        self.touch(&latest?.0, now)
+    }
+
+    fn touch(&mut self, key: &PlaybackPathKey, now: Instant) -> Option<&'static str> {
+        let next_sequence = self.next_sequence.wrapping_add(1);
+        let entry = self.entries.get_mut(key)?;
+        self.next_sequence = next_sequence;
+        entry.recorded_at = now;
+        entry.sequence = next_sequence;
+        Some(entry.mode)
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        self.entries
+            .retain(|_, entry| now.duration_since(entry.recorded_at) <= PLAYBACK_PATH_STATE_TTL);
+    }
+}
+
+fn playback_path_key(
+    server_id: &str,
+    item_id: &str,
+    device_id: Option<&str>,
+    media_source_id: Option<&str>,
+) -> PlaybackPathKey {
+    PlaybackPathKey {
+        server_id: server_id.to_string(),
+        item_id: item_id.to_string(),
+        device_id: device_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        media_source_id: media_source_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+    }
+}
+
 pub(crate) struct ProxyManager {
     running: Mutex<HashMap<String, ProxyTask>>,
+    draining: Mutex<JoinSet<()>>,
+    lifecycle: Mutex<()>,
 }
 
 struct ProxyTask {
     port: u16,
     server_name: String,
     started_at_ms: u128,
-    last_request_ms: Option<u128>,
-    last_error: Option<String>,
+    metrics: Arc<ProxyRuntimeMetrics>,
     shutdown: oneshot::Sender<()>,
     handle: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct ProxyRuntimeMetrics {
+    last_request_ms: AtomicU64,
+    last_error: StdMutex<Option<String>>,
+}
+
+impl ProxyRuntimeMetrics {
+    fn record_request(&self) {
+        self.last_request_ms
+            .store(now_ms().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
+    }
+
+    fn record_error(&self, error: String) {
+        *self
+            .last_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+    }
+
+    fn last_request_ms(&self) -> Option<u128> {
+        let value = self.last_request_ms.load(Ordering::Relaxed);
+        (value != 0).then_some(u128::from(value))
+    }
+
+    fn last_error(&self) -> Option<String> {
+        self.last_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -216,83 +402,96 @@ impl ProxyManager {
     fn new() -> Self {
         Self {
             running: Mutex::new(HashMap::new()),
+            draining: Mutex::new(JoinSet::new()),
+            lifecycle: Mutex::new(()),
         }
     }
 
-    async fn ensure_running(&self, state: AppState) -> AppResult<()> {
+    pub(crate) async fn ensure_running(&self, state: AppState) -> AppResult<()> {
+        let _lifecycle = self.lifecycle.lock().await;
         let servers = state.config.read().await.proxy_configs();
-        let mut running = self.running.lock().await;
         let desired_ids = servers
             .iter()
             .filter_map(|server| server.servers.first().map(|entry| entry.id.clone()))
             .collect::<std::collections::HashSet<_>>();
-        let stale_ids = running
-            .keys()
-            .filter(|id| !desired_ids.contains(*id))
-            .cloned()
-            .collect::<Vec<_>>();
-        for id in stale_ids {
-            if let Some(task) = running.remove(&id) {
-                let _ = task.shutdown.send(());
-                task.handle.abort();
-            }
+        let desired_ports = servers
+            .iter()
+            .filter_map(|config| {
+                config
+                    .servers
+                    .first()
+                    .map(|server| (server.id.clone(), config.port))
+            })
+            .collect::<HashMap<_, _>>();
+        let tasks_to_drain = {
+            let mut running = self.running.lock().await;
+            let stale_ids = running
+                .iter()
+                .filter_map(|(id, task)| {
+                    let desired_port = desired_ports.get(id);
+                    (!desired_ids.contains(id)
+                        || desired_port.is_some_and(|port| *port != task.port)
+                        || task.handle.is_finished())
+                    .then_some(id.clone())
+                })
+                .collect::<Vec<_>>();
+            stale_ids
+                .into_iter()
+                .filter_map(|id| running.remove(&id).map(|task| (id, task)))
+                .collect::<Vec<_>>()
+        };
+        for (server_id, task) in tasks_to_drain {
+            self.begin_proxy_drain(server_id, task).await;
         }
 
+        let mut first_error = None;
         for config in servers {
             let Some(server) = config.servers.first() else {
                 continue;
             };
             let server_id = server.id.clone();
-            let port = config.port;
-            if running
-                .get(&server_id)
-                .is_some_and(|task| task.port == port)
-            {
+            let (already_running, finished_task) = {
+                let mut running = self.running.lock().await;
+                if running
+                    .get(&server_id)
+                    .is_some_and(|task| task.handle.is_finished())
+                {
+                    (false, running.remove(&server_id))
+                } else if let Some(task) = running.get_mut(&server_id) {
+                    task.server_name = server.name.clone();
+                    (true, None)
+                } else {
+                    (false, None)
+                }
+            };
+            if let Some(task) = finished_task {
+                self.begin_proxy_drain(server_id.clone(), task).await;
+            }
+            if already_running {
                 continue;
             }
 
-            let addr = SocketAddr::from(([0, 0, 0, 0], port));
-            let listener = tokio::net::TcpListener::bind(addr).await.map_err(|err| {
-                AppError::Config(format!("failed to bind Emby proxy port {port}: {err}"))
-            })?;
-
-            if let Some(task) = running.remove(&server_id) {
-                let _ = task.shutdown.send(());
-                task.handle.abort();
+            if let Err(err) = self.start_server(state.clone(), server).await {
+                tracing::error!(
+                    server_id,
+                    port = server.port,
+                    error = %err.safe_log_message(),
+                    "failed to start Emby proxy"
+                );
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
             }
-
-            let mut proxy_state = state.clone();
-            proxy_state.proxy_server_id = Some(server_id.clone());
-            let (shutdown, receiver) = oneshot::channel();
-            let handle = tokio::spawn(run_proxy_server(proxy_state, listener, receiver));
-            running.insert(
-                server_id,
-                ProxyTask {
-                    port,
-                    server_name: server.name.clone(),
-                    started_at_ms: now_ms(),
-                    last_request_ms: None,
-                    last_error: None,
-                    shutdown,
-                    handle,
-                },
-            );
         }
 
+        if let Some(err) = first_error {
+            return Err(err);
+        }
         Ok(())
     }
 
-    async fn restart_all(&self, state: AppState) -> AppResult<()> {
-        let tasks = self.running.lock().await.drain().collect::<Vec<_>>();
-        for (_, task) in tasks {
-            let _ = task.shutdown.send(());
-            task.handle.abort();
-        }
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        self.ensure_running(state).await
-    }
-
     pub(crate) async fn restart_server(&self, state: AppState, server_id: &str) -> AppResult<()> {
+        let _lifecycle = self.lifecycle.lock().await;
         let config = state
             .config
             .read()
@@ -312,22 +511,26 @@ impl ProxyManager {
             })?;
 
         if let Some(task) = self.running.lock().await.remove(server_id) {
-            let _ = task.shutdown.send(());
-            task.handle.abort();
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            self.begin_proxy_drain(server_id.to_string(), task).await;
         }
 
         let Some(server) = config.servers.first() else {
             return Err(AppError::Config(format!("server {server_id} is invalid")));
         };
-        let port = config.port;
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|err| {
-            AppError::Config(format!("failed to bind Emby proxy port {port}: {err}"))
-        })?;
+        self.start_server(state, server).await
+    }
 
+    async fn start_server(
+        &self,
+        state: AppState,
+        server: &config::EmbyServerConfig,
+    ) -> AppResult<()> {
+        let port = server.port;
+        let listener = bind_proxy_listener(port).await?;
         let mut proxy_state = state.clone();
         proxy_state.proxy_server_id = Some(server.id.clone());
+        let metrics = Arc::new(ProxyRuntimeMetrics::default());
+        proxy_state.proxy_metrics = Some(metrics.clone());
         let (shutdown, receiver) = oneshot::channel();
         let handle = tokio::spawn(run_proxy_server(proxy_state, listener, receiver));
         self.running.lock().await.insert(
@@ -336,32 +539,12 @@ impl ProxyManager {
                 port,
                 server_name: server.name.clone(),
                 started_at_ms: now_ms(),
-                last_request_ms: None,
-                last_error: None,
+                metrics,
                 shutdown,
                 handle,
             },
         );
         Ok(())
-    }
-
-    pub(crate) async fn stop_server(&self, server_id: &str) {
-        if let Some(task) = self.running.lock().await.remove(server_id) {
-            let _ = task.shutdown.send(());
-            task.handle.abort();
-        }
-    }
-
-    async fn record_request(&self, server_id: &str) {
-        if let Some(task) = self.running.lock().await.get_mut(server_id) {
-            task.last_request_ms = Some(now_ms());
-        }
-    }
-
-    async fn record_error(&self, server_id: &str, error: String) {
-        if let Some(task) = self.running.lock().await.get_mut(server_id) {
-            task.last_error = Some(error);
-        }
     }
 
     pub(crate) async fn statuses(&self, config: &Config) -> Vec<ProxyStatusEntry> {
@@ -378,19 +561,85 @@ impl ProxyManager {
                         .unwrap_or_else(|| server.name.clone()),
                     enabled: server.enabled,
                     port: server.port,
-                    listening: task.is_some_and(|task| task.port == server.port),
+                    listening: task
+                        .is_some_and(|task| task.port == server.port && !task.handle.is_finished()),
                     started_at_ms: task.map(|task| task.started_at_ms),
-                    last_request_ms: task.and_then(|task| task.last_request_ms),
-                    last_error: task.and_then(|task| task.last_error.clone()),
+                    last_request_ms: task.and_then(|task| task.metrics.last_request_ms()),
+                    last_error: task.and_then(|task| task.metrics.last_error()),
                 }
             })
             .collect()
     }
 
     async fn shutdown(&self) {
-        for (_, task) in self.running.lock().await.drain() {
+        let _lifecycle = self.lifecycle.lock().await;
+        let tasks = self.running.lock().await.drain().collect::<Vec<_>>();
+        let mut drains = self.draining.lock().await;
+        reap_completed_proxy_drains(&mut drains);
+        for (server_id, task) in tasks {
             let _ = task.shutdown.send(());
-            task.handle.abort();
+            drains.spawn(wait_for_proxy_drain(server_id, task.port, task.handle));
+        }
+        while let Some(result) = drains.join_next().await {
+            if let Err(err) = result {
+                tracing::warn!(error = %err, "proxy drain task failed");
+            }
+        }
+    }
+
+    async fn begin_proxy_drain(&self, server_id: String, task: ProxyTask) {
+        let _ = task.shutdown.send(());
+        let mut drains = self.draining.lock().await;
+        reap_completed_proxy_drains(&mut drains);
+        drains.spawn(wait_for_proxy_drain(server_id, task.port, task.handle));
+    }
+}
+
+async fn bind_proxy_listener(port: u16) -> AppResult<tokio::net::TcpListener> {
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let started = Instant::now();
+    loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::AddrInUse
+                    && started.elapsed() < PROXY_REBIND_TIMEOUT =>
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(err) => {
+                return Err(AppError::Config(format!(
+                    "failed to bind Emby proxy port {port}: {err}"
+                )));
+            }
+        }
+    }
+}
+
+fn reap_completed_proxy_drains(drains: &mut JoinSet<()>) {
+    while let Some(result) = drains.try_join_next() {
+        if let Err(err) = result {
+            tracing::warn!(error = %err, "proxy drain task failed");
+        }
+    }
+}
+
+async fn wait_for_proxy_drain(server_id: String, port: u16, mut handle: JoinHandle<()>) {
+    match tokio::time::timeout(PROXY_DRAIN_TIMEOUT, &mut handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) if err.is_cancelled() => {}
+        Ok(Err(err)) => {
+            tracing::warn!(server_id, port, error = %err, "proxy task exited during drain");
+        }
+        Err(_) => {
+            tracing::warn!(
+                server_id,
+                port,
+                timeout_seconds = PROXY_DRAIN_TIMEOUT.as_secs(),
+                "proxy drain timed out; aborting server task"
+            );
+            handle.abort();
+            let _ = handle.await;
         }
     }
 }
@@ -409,23 +658,28 @@ async fn main() -> AppResult<()> {
     let settings_store = SettingsStore::open_default()?;
     let config = settings_store.load_or_default_config()?;
     let file_log = Arc::new(FileLogStore::new(&settings_store));
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
+    let client = build_http_client()?;
+    let proxy_client = build_proxy_http_client()?;
     let block_log = Arc::new(BlockLogStore::new());
     block_log.bootstrap_from_proxy_logs(&settings_store);
     let ip_location = Arc::new(ip_location::IpLocationStore::new());
-    if let Err(err) = ip_location.initialize(&client).await {
-        tracing::warn!(error = %err, "failed to initialize IP database");
-        file_log.write("warning", "IP 数据库初始化失败", &err.safe_log_message());
-    }
-    let cache = DirectLinkCache::new(config.cache_ttl_seconds, config.cache_max_capacity);
+    let cache = DirectLinkCache::new(
+        config.cache_enabled,
+        config.cache_ttl_seconds,
+        config.cache_max_capacity,
+    );
     let proxy_manager = Arc::new(ProxyManager::new());
+    let telemetry_writes = TelemetryWriteQueue::start(settings_store.clone())?;
     let state = AppState {
         config: Arc::new(RwLock::new(config)),
+        config_updates: Arc::new(Mutex::new(())),
         client,
+        proxy_client,
         cache: Arc::new(RwLock::new(cache)),
         settings_store,
+        telemetry_writes,
+        client_control_cache: Arc::new(StdRwLock::new(None)),
+        password_tasks: Arc::new(Semaphore::new(PASSWORD_TASK_CONCURRENCY_LIMIT)),
         crypto_keys: CryptoKeys::generate()?,
         activity_log: Arc::new(ActivityLogStore::new(800)),
         file_log,
@@ -434,7 +688,9 @@ async fn main() -> AppResult<()> {
         connectivity: Arc::new(connectivity::ConnectivityMonitor::new()),
         proxy_manager: Some(proxy_manager.clone()),
         proxy_server_id: None,
-        playback_users: Arc::new(Mutex::new(HashMap::new())),
+        proxy_metrics: None,
+        playback_paths: Arc::new(Mutex::new(PlaybackPathState::default())),
+        playback_users: playback_user_cache(),
         playback_rate_hits: Arc::new(Mutex::new(HashMap::new())),
         playback_rate_recent_events: Arc::new(Mutex::new(HashMap::new())),
         playback_rate_bans: Arc::new(Mutex::new(HashMap::new())),
@@ -457,13 +713,7 @@ async fn main() -> AppResult<()> {
     state.file_log.write("info", "项目版本", &app_version());
     state.file_log.write("info", "项目地址", PROJECT_URL);
 
-    if state.settings_store.has_admin()? && !state.config.read().await.proxy_configs().is_empty() {
-        proxy_manager.ensure_running(state.clone()).await?;
-    }
-    let connectivity_task = connectivity::start_connectivity_monitor(state.clone());
-
     let listen_addr = management_listen_addr()?;
-    let app = build_management_app(state.clone());
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     state.activity_log.record(
         ActivityKind::General,
@@ -480,6 +730,38 @@ async fn main() -> AppResult<()> {
         &format!("http://{}/ui/", listener.local_addr()?),
     );
 
+    let ip_location_task = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(err) = state.ip_location.initialize(&state.client).await {
+                tracing::warn!(error = %err, "failed to initialize IP database");
+                state
+                    .file_log
+                    .write("warning", "IP 数据库初始化失败", &err.safe_log_message());
+            }
+        })
+    };
+
+    if state.settings_store.has_admin()? && !state.config.read().await.proxy_configs().is_empty() {
+        if let Err(err) = proxy_manager.ensure_running(state.clone()).await {
+            let detail = err.safe_log_message();
+            tracing::error!(error = %detail, "one or more Emby proxy listeners failed to start");
+            state.activity_log.record(
+                ActivityKind::General,
+                ActivityLevel::Error,
+                None,
+                PROJECT_NAME,
+                "部分反代监听器启动失败",
+                &detail,
+            );
+            state
+                .file_log
+                .write("error", "部分反代监听器启动失败", &detail);
+        }
+    }
+    let connectivity_task = connectivity::start_connectivity_monitor(state.clone());
+
+    let app = build_management_app(state.clone());
     let result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -487,15 +769,26 @@ async fn main() -> AppResult<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .map_err(|err| AppError::Internal(format!("server error: {err}")));
+    ip_location_task.abort();
+    let _ = ip_location_task.await;
     connectivity_task.abort();
+    let _ = connectivity_task.await;
     proxy_manager.shutdown().await;
-    result
+    let telemetry_writes = state.telemetry_writes.clone();
+    let telemetry_result = tokio::task::spawn_blocking(move || telemetry_writes.shutdown())
+        .await
+        .map_err(|err| AppError::Internal(format!("telemetry shutdown task failed: {err}")))
+        .and_then(|result| result);
+    if let Err(err) = &telemetry_result {
+        tracing::error!(error = %err.safe_log_message(), "failed to flush telemetry during shutdown");
+    }
+    result.and(telemetry_result)
 }
 
 async fn healthcheck_command() -> AppResult<()> {
     let addr = management_listen_addr()?;
     let url = format!("http://127.0.0.1:{}/healthz", addr.port());
-    let response = reqwest::get(url).await?;
+    let response = build_http_client()?.get(url).send().await?;
     if response.status().is_success() {
         Ok(())
     } else {
@@ -504,6 +797,35 @@ async fn healthcheck_command() -> AppResult<()> {
             response.status()
         )))
     }
+}
+
+fn build_http_client() -> AppResult<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+        .tcp_nodelay(true)
+        .build()
+        .map_err(Into::into)
+}
+
+fn build_proxy_http_client() -> AppResult<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .read_timeout(PROXY_RESPONSE_BODY_IDLE_TIMEOUT)
+        .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+        .tcp_nodelay(true)
+        .build()
+        .map_err(Into::into)
+}
+
+fn playback_user_cache() -> moka::future::Cache<String, String> {
+    moka::future::Cache::builder()
+        .max_capacity(PLAYBACK_USER_CACHE_CAPACITY)
+        .time_to_idle(PLAYBACK_USER_CACHE_TTL)
+        .build()
 }
 
 async fn run_proxy_server(
@@ -560,24 +882,68 @@ async fn handle_request(
     let method = parts.method;
     let uri = parts.uri;
     let headers = parts.headers;
-    let body = axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES)
-        .await
-        .map_err(|err| {
-            if err
-                .to_string()
-                .to_ascii_lowercase()
-                .contains("length limit")
-            {
-                AppError::PayloadTooLarge("request body is too large".to_string())
-            } else {
-                AppError::Internal(format!("failed to read request body: {err}"))
-            }
-        })?;
     let path = uri.path();
 
     if !state.settings_store.has_admin()? {
         return Ok(proxy::redirect_response("/ui/".to_string()));
     }
+    let request_config = proxy_config(&state).await?;
+
+    if should_block_web_ui(&request_config, path)? {
+        record_incoming_proxy_request(&state, &request_config);
+        let client_ip = proxy::real_ip_for_log(&request_config, &headers, peer_addr.ip());
+        record_proxy_request(
+            &state,
+            ActivityLevel::Warn,
+            "Emby Web UI 已拦截",
+            format!("{} {}", method, path),
+        )
+        .await;
+        record_stat(&state, &request_config, RequestStatKind::Block);
+        record_proxy_request_detail(
+            &state,
+            &request_config,
+            ProxyRequestDetailInput {
+                method: method.as_str(),
+                uri: &uri,
+                path_type: "proxy",
+                status_code: StatusCode::FORBIDDEN.as_u16(),
+                outcome: "Web UI 拦截",
+                started_at_ms: timing.started_at_ms,
+                duration_ms: timing.started.elapsed().as_millis(),
+                playback_user: "--",
+                playback_ip: &client_ip,
+                cache_hit: false,
+                blocked: true,
+                detail: "Emby Web UI",
+            },
+        )
+        .await;
+        return Ok((
+            StatusCode::FORBIDDEN,
+            "Emby Web UI is disabled by EmbyPanel",
+        )
+            .into_response());
+    }
+
+    let body = if method == Method::GET || method == Method::HEAD {
+        Bytes::new()
+    } else {
+        axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES)
+            .await
+            .map_err(|err| {
+                if err
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("length limit")
+                {
+                    AppError::PayloadTooLarge("request body is too large".to_string())
+                } else {
+                    AppError::Internal(format!("failed to read request body: {err}"))
+                }
+            })?
+    };
+    record_incoming_proxy_request(&state, &request_config);
 
     let client_control_path = rewrite::is_playback_info(path) || rewrite::is_video_stream(path);
     if client_control_path {
@@ -585,11 +951,8 @@ async fn handle_request(
             tracing::warn!(error = %err, "failed to record client control event");
         }
         if let Some(rule) = client_control::matched_block_rule(&state, &headers)? {
-            let config = proxy_config(&state).await;
-            let (server_id, server_name) = config_server_label(&config);
-            let playback_ip = proxy::real_ip_for_log(&config, &headers)
-                .or_else(|| Some(peer_addr.ip().to_string()))
-                .unwrap_or_else(|| "--".to_string());
+            let (server_id, server_name) = config_server_label(&request_config);
+            let playback_ip = proxy::real_ip_for_log(&request_config, &headers, peer_addr.ip());
             client_control::notify_client_rule_hit(
                 &state,
                 &rule,
@@ -607,10 +970,10 @@ async fn handle_request(
                 format!("{} {} 命中 UA 拦截规则", method, path),
             )
             .await;
-            record_stat(&state, &config, RequestStatKind::Block).await;
+            record_stat(&state, &request_config, RequestStatKind::Block);
             record_proxy_request_detail(
                 &state,
-                &config,
+                &request_config,
                 ProxyRequestDetailInput {
                     method: method.as_str(),
                     uri: &uri,
@@ -632,14 +995,21 @@ async fn handle_request(
     }
 
     if rewrite::is_base_html_player(path) {
-        let result =
-            handle_base_html_player(&state, method.clone(), uri.clone(), headers, body).await;
+        let result = handle_base_html_player(
+            &state,
+            &request_config,
+            method.clone(),
+            uri.clone(),
+            headers,
+            body,
+            peer_addr.ip(),
+        )
+        .await;
         if let Ok(response) = &result {
             let status = response.status();
-            let config = proxy_config(&state).await;
             record_proxy_request_detail(
                 &state,
-                &config,
+                &request_config,
                 ProxyRequestDetailInput {
                     method: method.as_str(),
                     uri: &uri,
@@ -661,13 +1031,21 @@ async fn handle_request(
     }
 
     if rewrite::is_system_info(path) {
-        let result = handle_system_info(&state, method.clone(), uri.clone(), headers, body).await;
+        let result = handle_system_info(
+            &state,
+            &request_config,
+            method.clone(),
+            uri.clone(),
+            headers,
+            body,
+            peer_addr.ip(),
+        )
+        .await;
         if let Ok(response) = &result {
             let status = response.status();
-            let config = proxy_config(&state).await;
             record_proxy_request_detail(
                 &state,
-                &config,
+                &request_config,
                 ProxyRequestDetailInput {
                     method: method.as_str(),
                     uri: &uri,
@@ -689,31 +1067,47 @@ async fn handle_request(
     }
 
     if rewrite::is_playback_info(path) {
-        return handle_playback_info(&state, method, uri, headers, body, Some(peer_addr), timing)
-            .await;
+        return handle_playback_info(
+            &state,
+            &request_config,
+            method,
+            uri,
+            headers,
+            body,
+            peer_addr,
+            timing,
+        )
+        .await;
     }
 
     if rewrite::is_video_stream(path) {
-        return handle_video_stream(&state, method, uri, headers, body, Some(peer_addr), timing)
-            .await;
+        return handle_video_stream(
+            &state,
+            &request_config,
+            method,
+            uri,
+            headers,
+            body,
+            peer_addr,
+            timing,
+        )
+        .await;
     }
 
-    let config = proxy_config(&state).await;
     proxy_to_emby_recorded(
         &state,
-        &config,
+        &request_config,
         method,
         &uri,
         &headers,
         body,
+        peer_addr.ip(),
         Some(ProxyRequestTrace {
             started_at_ms: timing.started_at_ms,
             started: timing.started,
             path_type: request_path_type(path),
             playback_user: "--".to_string(),
-            playback_ip: proxy::real_ip_for_log(&config, &headers)
-                .or_else(|| Some(peer_addr.ip().to_string()))
-                .unwrap_or_else(|| "--".to_string()),
+            playback_ip: proxy::real_ip_for_log(&request_config, &headers, peer_addr.ip()),
         }),
     )
     .await
@@ -732,6 +1126,7 @@ fn build_management_app(state: AppState) -> Router {
         .route("/api/public-key", get(crypto_api::public_key))
         .route("/api/setup", axum::routing::post(auth::setup))
         .route("/api/login", axum::routing::post(auth::login))
+        .route("/api/logout", axum::routing::post(auth::logout))
         .route(
             "/api/change-password",
             axum::routing::post(auth::change_password),
@@ -743,6 +1138,10 @@ fn build_management_app(state: AppState) -> Router {
         .route(
             "/api/monitoring/plays",
             get(monitoring::list_playback_sessions),
+        )
+        .route(
+            "/api/monitoring/playback-image",
+            get(monitoring::playback_image),
         )
         .route("/api/monitoring/overview", get(monitoring::media_overview))
         .route("/api/monitoring/health", get(monitoring::server_health))
@@ -797,6 +1196,10 @@ fn build_management_app(state: AppState) -> Router {
             get(settings_api::get_settings).put(settings_api::update_settings),
         )
         .route(
+            "/api/settings/servers/{server_id}/api-key",
+            axum::routing::post(settings_api::reveal_emby_api_key),
+        )
+        .route(
             "/api/settings/restart-proxy",
             axum::routing::post(settings_api::restart_proxy_server),
         )
@@ -842,12 +1245,21 @@ fn build_app(state: AppState) -> Router {
     )))))
 }
 
-async fn proxy_config(state: &AppState) -> Config {
-    state
-        .config
-        .read()
-        .await
-        .proxy_config_for_server(state.proxy_server_id.as_deref())
+async fn proxy_config(state: &AppState) -> AppResult<Config> {
+    let config = state.config.read().await;
+    let Some(server_id) = state.proxy_server_id.as_deref() else {
+        return Ok(config.proxy_config_for_server(None));
+    };
+    let server = config
+        .servers
+        .iter()
+        .find(|server| server.id == server_id)
+        .ok_or_else(|| {
+            AppError::BadGateway(format!(
+                "proxy server configuration {server_id} is no longer active"
+            ))
+        })?;
+    Ok(config.for_server_for_validation(server))
 }
 
 async fn record_proxy_request(
@@ -856,7 +1268,9 @@ async fn record_proxy_request(
     message: impl Into<String>,
     detail: impl Into<String>,
 ) {
-    let config = proxy_config(state).await;
+    let Ok(config) = proxy_config(state).await else {
+        return;
+    };
     let (server_id, server_name) = config_server_label(&config);
     let message = message.into();
     let detail = detail.into();
@@ -868,9 +1282,6 @@ async fn record_proxy_request(
         &message,
         &detail,
     );
-    if let Some(proxy_manager) = state.proxy_manager.as_ref() {
-        proxy_manager.record_request(&server_id).await;
-    }
     state.file_log.write(
         match level {
             ActivityLevel::Success | ActivityLevel::Info => "info",
@@ -880,15 +1291,20 @@ async fn record_proxy_request(
         &message,
         &detail,
     );
-    record_stat(state, &config, RequestStatKind::Request).await;
 }
 
-async fn record_stat(state: &AppState, config: &Config, kind: RequestStatKind) {
+fn record_incoming_proxy_request(state: &AppState, config: &Config) {
+    if let Some(metrics) = state.proxy_metrics.as_ref() {
+        metrics.record_request();
+    }
+    record_stat(state, config, RequestStatKind::Request);
+}
+
+fn record_stat(state: &AppState, config: &Config, kind: RequestStatKind) {
     let (server_id, server_name) = config_server_label(config);
-    let _ =
-        state
-            .settings_store
-            .increment_request_stats(&server_id, &server_name, config.port, kind);
+    state
+        .telemetry_writes
+        .request_stat(server_id, server_name, config.port, kind);
 }
 
 struct ProxyRequestTrace {
@@ -928,24 +1344,24 @@ async fn record_proxy_request_detail(
     let (server_id, server_name) = config_server_label(config);
     let path = sanitized_uri_for_log(input.uri);
     let detail = sanitized_detail_for_log(input.detail);
-    let _ = state
-        .settings_store
-        .record_proxy_request_detail(ProxyRequestDetailInsert {
+    state
+        .telemetry_writes
+        .proxy_request_detail(ProxyRequestDetailWrite {
             timestamp_ms: input.started_at_ms,
-            server_id: &server_id,
-            server_name: &server_name,
+            server_id: server_id.clone(),
+            server_name: server_name.clone(),
             port: config.port,
-            method: input.method,
-            path: &path,
-            path_type: input.path_type,
+            method: input.method.to_string(),
+            path: path.clone(),
+            path_type: input.path_type.to_string(),
             status_code: input.status_code,
-            outcome: input.outcome,
+            outcome: input.outcome.to_string(),
             duration_ms: input.duration_ms,
-            playback_user: input.playback_user,
-            playback_ip: input.playback_ip,
+            playback_user: input.playback_user.to_string(),
+            playback_ip: input.playback_ip.to_string(),
             cache_hit: input.cache_hit,
             blocked: input.blocked,
-            detail: &detail,
+            detail: detail.clone(),
         });
     if input.blocked {
         let ip_location_text = state
@@ -987,6 +1403,29 @@ fn request_path_type(path: &str) -> &'static str {
     } else {
         "proxy"
     }
+}
+
+fn should_block_web_ui(config: &Config, path: &str) -> AppResult<bool> {
+    if !config
+        .servers
+        .first()
+        .is_some_and(|server| server.block_web_ui)
+    {
+        return Ok(false);
+    }
+    let upstream_url = config.emby_url(path)?;
+    if rewrite::is_web_ui_path(upstream_url.path()) {
+        return Ok(true);
+    }
+    let Ok(decoded_path) = urlencoding::decode(upstream_url.path()) else {
+        return Ok(false);
+    };
+    if decoded_path.as_ref() == upstream_url.path() {
+        return Ok(false);
+    }
+    Ok(rewrite::is_web_ui_path(
+        config.emby_url(decoded_path.as_ref())?.path(),
+    ))
 }
 
 fn response_outcome(status: StatusCode) -> &'static str {
@@ -1137,10 +1576,20 @@ async fn proxy_to_emby_recorded(
     uri: &Uri,
     headers: &axum::http::HeaderMap,
     body: Bytes,
+    peer_ip: IpAddr,
     trace: Option<ProxyRequestTrace>,
 ) -> AppResult<Response> {
     let method_label = method.as_str().to_string();
-    let result = proxy::proxy_to_emby(&state.client, config, method, uri, headers, body).await;
+    let result = proxy::proxy_to_emby(
+        &state.proxy_client,
+        config,
+        method,
+        uri,
+        headers,
+        body,
+        peer_ip,
+    )
+    .await;
     match &result {
         Ok(response) => {
             if let Some(trace) = trace {
@@ -1182,11 +1631,9 @@ async fn proxy_to_emby_recorded(
         Err(err) => {
             let (server_id, server_name) = config_server_label(config);
             let error_detail = sanitized_detail_for_log(&err.safe_log_message());
-            record_stat(state, config, RequestStatKind::Error).await;
-            if let Some(proxy_manager) = state.proxy_manager.as_ref() {
-                proxy_manager
-                    .record_error(&server_id, error_detail.clone())
-                    .await;
+            record_stat(state, config, RequestStatKind::Error);
+            if let Some(metrics) = state.proxy_metrics.as_ref() {
+                metrics.record_error(error_detail.clone());
             }
             state.activity_log.record(
                 ActivityKind::General,
@@ -1306,14 +1753,23 @@ fn config_server_label(config: &Config) -> (String, String) {
 
 async fn handle_base_html_player(
     state: &AppState,
+    config: &Config,
     method: Method,
     uri: Uri,
     headers: axum::http::HeaderMap,
     body: Bytes,
+    peer_ip: IpAddr,
 ) -> AppResult<Response> {
-    let config = proxy_config(state).await;
-    let (status, response_headers, text) =
-        proxy::proxy_text(&state.client, &config, method, &uri, &headers, body).await?;
+    let (status, response_headers, text) = proxy::proxy_text(
+        &state.client,
+        &config,
+        method,
+        &uri,
+        &headers,
+        body,
+        peer_ip,
+    )
+    .await?;
     if !status.is_success() {
         return proxy::body_response(status, response_headers, text);
     }
@@ -1333,14 +1789,23 @@ async fn handle_base_html_player(
 
 async fn handle_system_info(
     state: &AppState,
+    config: &Config,
     method: Method,
     uri: Uri,
     headers: axum::http::HeaderMap,
     body: Bytes,
+    peer_ip: IpAddr,
 ) -> AppResult<Response> {
-    let config = proxy_config(state).await;
-    let (status, response_headers, text) =
-        proxy::proxy_text(&state.client, &config, method, &uri, &headers, body).await?;
+    let (status, response_headers, text) = proxy::proxy_text(
+        &state.client,
+        &config,
+        method,
+        &uri,
+        &headers,
+        body,
+        peer_ip,
+    )
+    .await?;
     if !status.is_success() {
         return proxy::body_response(status, response_headers, text);
     }
@@ -1348,7 +1813,7 @@ async fn handle_system_info(
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
         return proxy::body_response(status, response_headers, text);
     };
-    let gateway_url = proxy_base_url(&headers, config.port);
+    let gateway_url = proxy_base_url(&config, &headers, peer_ip);
     let modified = rewrite::patch_system_info(value, config.port, &gateway_url);
 
     proxy::body_response(
@@ -1360,14 +1825,14 @@ async fn handle_system_info(
 
 async fn handle_playback_info(
     state: &AppState,
+    config: &Config,
     method: Method,
     uri: Uri,
     headers: axum::http::HeaderMap,
     body: Bytes,
-    peer_addr: Option<SocketAddr>,
+    peer_addr: SocketAddr,
     timing: RequestTiming,
 ) -> AppResult<Response> {
-    let config = proxy_config(state).await;
     let path = uri.path().to_string();
     let query = uri.query().map(str::to_string);
     let method_label = method.as_str().to_string();
@@ -1379,12 +1844,18 @@ async fn handle_playback_info(
         state,
     )
     .await;
-    let playback_ip = proxy::real_ip_for_log(&config, &headers)
-        .or_else(|| peer_addr.map(|addr| addr.ip().to_string()))
-        .unwrap_or_else(|| "--".to_string());
+    let playback_ip = proxy::real_ip_for_log(&config, &headers, peer_addr.ip());
     remember_playback_user(state, &config, query.as_deref().unwrap_or(""), &headers).await;
-    let (status, response_headers, text) =
-        proxy::proxy_text(&state.client, &config, method, &uri, &headers, body).await?;
+    let (status, response_headers, text) = proxy::proxy_text(
+        &state.client,
+        &config,
+        method,
+        &uri,
+        &headers,
+        body,
+        peer_addr.ip(),
+    )
+    .await?;
     if !status.is_success() {
         record_proxy_request_detail(
             state,
@@ -1461,14 +1932,14 @@ async fn handle_playback_info(
 
 async fn handle_video_stream(
     state: &AppState,
+    config: &Config,
     method: Method,
     uri: Uri,
     headers: axum::http::HeaderMap,
     body: Bytes,
-    peer_addr: Option<SocketAddr>,
+    peer_addr: SocketAddr,
     timing: RequestTiming,
 ) -> AppResult<Response> {
-    let config = proxy_config(state).await;
     let Some(item_id) = rewrite::parse_item_id(uri.path()) else {
         record_proxy_request_detail(
             state,
@@ -1494,15 +1965,14 @@ async fn handle_video_stream(
 
     let method_label = method.as_str().to_string();
     let query = uri.query().unwrap_or("");
+    let device_id = playback_device_id(query, &headers);
     let media_source_id = query_param(query, "MediaSourceId");
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     let playback_user = playback_user_name(&state.client, &config, query, &headers, state).await;
-    let playback_ip = proxy::real_ip_for_log(&config, &headers)
-        .or_else(|| peer_addr.map(|addr| addr.ip().to_string()))
-        .unwrap_or_else(|| "--".to_string());
+    let playback_ip = proxy::real_ip_for_log(&config, &headers, peer_addr.ip());
     let (server_id, server_name) = config_server_label(&config);
     let concurrent_limited = method != Method::HEAD
         && client_control::enforce_concurrent_playback_limit(
@@ -1518,7 +1988,7 @@ async fn handle_video_stream(
         )
         .await?;
     if concurrent_limited {
-        record_stat(state, &config, RequestStatKind::Block).await;
+        record_stat(state, &config, RequestStatKind::Block);
         record_proxy_request_detail(
             state,
             &config,
@@ -1561,7 +2031,7 @@ async fn handle_video_stream(
         )
         .await?;
     if rate_limited {
-        record_stat(state, &config, RequestStatKind::Block).await;
+        record_stat(state, &config, RequestStatKind::Block);
         record_proxy_request_detail(
             state,
             &config,
@@ -1594,7 +2064,8 @@ async fn handle_video_stream(
     );
 
     let cache = state.cache.read().await.clone();
-    if let Some(cached) = cache.get(&cache_key).await
+    if config.cache_enabled
+        && let Some(cached) = cache.get(&cache_key).await
         && should_cache_direct_link(&config, &cached)
     {
         record_playback_redirect(
@@ -1629,60 +2100,91 @@ async fn handle_video_stream(
             },
         )
         .await;
+        record_playback_path(
+            state,
+            &server_id,
+            &item_id,
+            device_id.as_deref(),
+            media_source_id.as_deref(),
+            PLAYBACK_MODE_DIRECT_LINK,
+        )
+        .await;
         return Ok(proxy::redirect_response(cached));
     }
 
-    let media_path =
-        match emby::get_media_path(&state.client, &config, &item_id, media_source_id.as_deref())
-            .await
-        {
-            Ok(Some(path)) => path,
-            Ok(None) => {
-                tracing::info!(item = item_id, "media source not found; proxying to Emby");
-                return proxy_to_emby_recorded(
+    let media_path = match emby::get_media_path(
+        &state.client,
+        &config,
+        &item_id,
+        media_source_id.as_deref(),
+        user_agent,
+    )
+    .await
+    {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            tracing::info!(item = item_id, "media source not found; proxying to Emby");
+            let result = proxy_to_emby_recorded(
+                state,
+                &config,
+                method,
+                &uri,
+                &headers,
+                body,
+                peer_addr.ip(),
+                Some(ProxyRequestTrace {
+                    started_at_ms: timing.started_at_ms,
+                    started: timing.started,
+                    path_type: "video_stream",
+                    playback_user,
+                    playback_ip,
+                }),
+            )
+            .await;
+            if let Ok(response) = &result
+                && let Some(mode) = playback_mode_for_proxy_response(response)
+            {
+                record_playback_path(
                     state,
-                    &config,
-                    method,
-                    &uri,
-                    &headers,
-                    body,
-                    Some(ProxyRequestTrace {
-                        started_at_ms: timing.started_at_ms,
-                        started: timing.started,
-                        path_type: "video_stream",
-                        playback_user,
-                        playback_ip,
-                    }),
+                    &server_id,
+                    &item_id,
+                    device_id.as_deref(),
+                    media_source_id.as_deref(),
+                    mode,
                 )
                 .await;
             }
-            Err(err) => {
-                record_proxy_request_detail(
-                    state,
-                    &config,
-                    ProxyRequestDetailInput {
-                        method: &method_label,
-                        uri: &uri,
-                        path_type: "video_stream",
-                        status_code: StatusCode::BAD_GATEWAY.as_u16(),
-                        outcome: "读取媒体失败",
-                        started_at_ms: timing.started_at_ms,
-                        duration_ms: timing.started.elapsed().as_millis(),
-                        playback_user: &playback_user,
-                        playback_ip: &playback_ip,
-                        cache_hit: false,
-                        blocked: false,
-                        detail: &err.safe_log_message(),
-                    },
-                )
-                .await;
-                return Err(err);
-            }
-        };
+            return result;
+        }
+        Err(err) => {
+            record_proxy_request_detail(
+                state,
+                &config,
+                ProxyRequestDetailInput {
+                    method: &method_label,
+                    uri: &uri,
+                    path_type: "video_stream",
+                    status_code: StatusCode::BAD_GATEWAY.as_u16(),
+                    outcome: "读取媒体失败",
+                    started_at_ms: timing.started_at_ms,
+                    duration_ms: timing.started.elapsed().as_millis(),
+                    playback_user: &playback_user,
+                    playback_ip: &playback_ip,
+                    cache_hit: false,
+                    blocked: false,
+                    detail: &err.safe_log_message(),
+                },
+            )
+            .await;
+            return Err(err);
+        }
+    };
     let media_path = apply_strm_url_mappings(&config, &media_path);
 
     if is_direct_url(&media_path) && config.openlist_addr.is_none() {
-        let redirect_url = maybe_resolve_internal_redirect(&config, &media_path, user_agent).await;
+        let redirect_url =
+            maybe_resolve_internal_redirect(&state.proxy_client, &config, &media_path, user_agent)
+                .await;
         let should_cache = should_cache_direct_link(&config, &redirect_url);
         if should_cache {
             let cache = state.cache.read().await.clone();
@@ -1724,6 +2226,15 @@ async fn handle_video_stream(
             },
         )
         .await;
+        record_playback_path(
+            state,
+            &server_id,
+            &item_id,
+            device_id.as_deref(),
+            media_source_id.as_deref(),
+            PLAYBACK_MODE_DIRECT_LINK,
+        )
+        .await;
         return Ok(proxy::redirect_response(redirect_url));
     }
 
@@ -1733,13 +2244,14 @@ async fn handle_video_stream(
             path = media_path,
             "media path is not a direct URL or OpenList /d URL; proxying to Emby"
         );
-        return proxy_to_emby_recorded(
+        let result = proxy_to_emby_recorded(
             state,
             &config,
             method,
             &uri,
             &headers,
             body,
+            peer_addr.ip(),
             Some(ProxyRequestTrace {
                 started_at_ms: timing.started_at_ms,
                 started: timing.started,
@@ -1749,12 +2261,27 @@ async fn handle_video_stream(
             }),
         )
         .await;
+        if let Ok(response) = &result
+            && let Some(mode) = playback_mode_for_proxy_response(response)
+        {
+            record_playback_path(
+                state,
+                &server_id,
+                &item_id,
+                device_id.as_deref(),
+                media_source_id.as_deref(),
+                mode,
+            )
+            .await;
+        }
+        return result;
     };
 
     let mut raw_url = openlist::ensure_raw_url(
         openlist::fs_get(&state.client, &config, &openlist_path, user_agent).await?,
     )?;
-    raw_url = maybe_resolve_internal_redirect(&config, &raw_url, user_agent).await;
+    raw_url =
+        maybe_resolve_internal_redirect(&state.proxy_client, &config, &raw_url, user_agent).await;
     let should_cache = should_cache_direct_link(&config, &raw_url);
     if should_cache {
         let cache = state.cache.read().await.clone();
@@ -1797,7 +2324,41 @@ async fn handle_video_stream(
         },
     )
     .await;
+    record_playback_path(
+        state,
+        &server_id,
+        &item_id,
+        device_id.as_deref(),
+        media_source_id.as_deref(),
+        PLAYBACK_MODE_DIRECT_LINK,
+    )
+    .await;
     Ok(proxy::redirect_response(raw_url))
+}
+
+async fn record_playback_path(
+    state: &AppState,
+    server_id: &str,
+    item_id: &str,
+    device_id: Option<&str>,
+    media_source_id: Option<&str>,
+    mode: &'static str,
+) {
+    state
+        .playback_paths
+        .lock()
+        .await
+        .record(server_id, item_id, device_id, media_source_id, mode);
+}
+
+fn playback_mode_for_proxy_response(response: &Response) -> Option<&'static str> {
+    if response.status().is_success() {
+        return Some(PLAYBACK_MODE_SERVER_PROXY);
+    }
+    response
+        .status()
+        .is_redirection()
+        .then_some(PLAYBACK_MODE_DIRECT_LINK)
 }
 
 fn query_param(query: &str, key: &str) -> Option<String> {
@@ -1808,6 +2369,12 @@ fn query_param(query: &str, key: &str) -> Option<String> {
 
 fn is_direct_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
+}
+
+pub(crate) fn media_path_uses_direct_link(config: &Config, media_path: &str) -> bool {
+    let media_path = apply_strm_url_mappings(config, media_path);
+    (is_direct_url(&media_path) && config.openlist_addr.is_none())
+        || openlist::extract_openlist_path(&media_path).is_some()
 }
 
 fn record_playback_redirect(
@@ -1838,10 +2405,9 @@ fn record_playback_redirect(
     } else {
         RequestStatKind::Redirect
     };
-    let _ =
-        state
-            .settings_store
-            .increment_request_stats(&server_id, &server_name, config.port, kind);
+    state
+        .telemetry_writes
+        .request_stat(server_id, server_name, config.port, kind);
 }
 
 fn cache_ttl_label(seconds: u64) -> String {
@@ -1942,9 +2508,8 @@ async fn remember_playback_user(
 
     state
         .playback_users
-        .lock()
-        .await
-        .insert(playback_user_key(config, &device_id), user_name);
+        .insert(playback_user_key(config, &device_id), user_name)
+        .await;
 }
 
 async fn remembered_playback_user(
@@ -1954,10 +2519,8 @@ async fn remembered_playback_user(
 ) -> Option<String> {
     state
         .playback_users
-        .lock()
-        .await
         .get(&playback_user_key(config, device_id))
-        .cloned()
+        .await
 }
 
 fn playback_user_key(config: &Config, device_id: &str) -> String {
@@ -2098,7 +2661,7 @@ fn header_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
 }
 
 fn should_cache_direct_link(config: &Config, redirect_url: &str) -> bool {
-    if config.cache_ttl_seconds == 0 {
+    if !config.cache_enabled || config.cache_ttl_seconds == 0 {
         return false;
     }
     let Some(host) = url::Url::parse(redirect_url)
@@ -2169,14 +2732,39 @@ fn wildcard_match(value: &str, pattern: &str) -> bool {
     pattern.ends_with('*') || parts.last().is_none_or(|last| value.ends_with(last))
 }
 
-fn proxy_base_url(headers: &axum::http::HeaderMap, fallback_port: u16) -> String {
-    let proto = forwarded_header_value(headers, "x-forwarded-proto").unwrap_or("http");
-    let host = forwarded_header_value(headers, "x-forwarded-host")
-        .or_else(|| forwarded_header_value(headers, "host"))
+fn proxy_base_url(config: &Config, headers: &axum::http::HeaderMap, peer_ip: IpAddr) -> String {
+    let trusted_forwarder = config
+        .servers
+        .first()
+        .is_some_and(|server| server.is_trusted_proxy(peer_ip));
+    let proto = trusted_forwarder
+        .then(|| forwarded_header_value(headers, "x-forwarded-proto"))
+        .flatten()
+        .and_then(normalized_proxy_scheme)
+        .unwrap_or("http");
+    let host = trusted_forwarder
+        .then(|| authority_header_value(headers, "x-forwarded-host"))
+        .flatten()
+        .or_else(|| authority_header_value(headers, "host"))
         .map(str::to_string)
-        .unwrap_or_else(|| format!("127.0.0.1:{fallback_port}"));
+        .unwrap_or_else(|| format!("127.0.0.1:{}", config.port));
 
     format!("{proto}://{host}")
+}
+
+fn normalized_proxy_scheme(value: &str) -> Option<&'static str> {
+    if value.eq_ignore_ascii_case("https") {
+        Some("https")
+    } else if value.eq_ignore_ascii_case("http") {
+        Some("http")
+    } else {
+        None
+    }
+}
+
+fn authority_header_value<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+    forwarded_header_value(headers, name)
+        .filter(|value| value.parse::<axum::http::uri::Authority>().is_ok())
 }
 
 fn forwarded_header_value<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
@@ -2189,6 +2777,9 @@ fn forwarded_header_value<'a>(headers: &'a axum::http::HeaderMap, name: &str) ->
 }
 
 fn apply_strm_url_mappings(config: &Config, media_path: &str) -> String {
+    if !config.strm_url_mapping_enabled {
+        return media_path.to_string();
+    }
     let mapped = url_mapping::apply_rules(media_path, &config.strm_url_mapping_rules);
     if mapped != media_path {
         tracing::info!(
@@ -2200,12 +2791,18 @@ fn apply_strm_url_mappings(config: &Config, media_path: &str) -> String {
     mapped
 }
 
-async fn maybe_resolve_internal_redirect(config: &Config, url: &str, user_agent: &str) -> String {
+async fn maybe_resolve_internal_redirect(
+    client: &reqwest::Client,
+    config: &Config,
+    url: &str,
+    user_agent: &str,
+) -> String {
     if !config.enable_internal_redirect {
         return url.to_string();
     }
 
     match internal_redirect::resolve_redirect_location(
+        client,
         url,
         config.internal_redirect_timeout_seconds,
         user_agent,
@@ -2283,12 +2880,14 @@ mod tests {
             port,
             cache_ttl_seconds: 180,
             cache_max_capacity: 10_000,
+            cache_enabled: true,
             cache_domain_filter_mode: "off".to_string(),
             cache_domain_whitelist: String::new(),
             cache_domain_blacklist: String::new(),
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            strm_url_mapping_enabled: true,
             connectivity_check_enabled: true,
             connectivity_check_interval_seconds: 60,
             connectivity_check_timeout_seconds: 5,
@@ -2297,17 +2896,38 @@ mod tests {
         }
     }
 
+    fn with_trusted_proxy(mut config: Config) -> Config {
+        config.servers = vec![config::EmbyServerConfig {
+            id: "server-1".to_string(),
+            name: "Server 1".to_string(),
+            emby_host: config.emby_host.clone(),
+            emby_api_key: config.emby_api_key.clone(),
+            port: config.port,
+            enabled: true,
+            block_web_ui: false,
+            real_ip_mode: "auto".to_string(),
+            real_ip_header: String::new(),
+            trusted_proxy_cidrs: "192.0.2.0/24".to_string(),
+            trusted_proxy_networks: vec!["192.0.2.0/24".parse().unwrap()],
+        }];
+        config
+    }
+
     fn test_state(config: Config, settings_store: SettingsStore) -> AppState {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
+        let client = build_http_client().unwrap();
+        let proxy_client = build_proxy_http_client().unwrap();
+        let telemetry_writes = TelemetryWriteQueue::start(settings_store.clone()).unwrap();
         AppState {
             config: Arc::new(RwLock::new(config)),
+            config_updates: Arc::new(Mutex::new(())),
             client,
-            cache: Arc::new(RwLock::new(DirectLinkCache::new(180, 10_000))),
+            proxy_client,
+            cache: Arc::new(RwLock::new(DirectLinkCache::new(true, 180, 10_000))),
             file_log: Arc::new(FileLogStore::new(&settings_store)),
             settings_store,
+            telemetry_writes,
+            client_control_cache: Arc::new(StdRwLock::new(None)),
+            password_tasks: Arc::new(Semaphore::new(PASSWORD_TASK_CONCURRENCY_LIMIT)),
             crypto_keys: CryptoKeys::generate().unwrap(),
             activity_log: Arc::new(ActivityLogStore::new(100)),
             block_log: Arc::new(BlockLogStore::new()),
@@ -2315,7 +2935,9 @@ mod tests {
             connectivity: Arc::new(connectivity::ConnectivityMonitor::new()),
             proxy_manager: None,
             proxy_server_id: None,
-            playback_users: Arc::new(Mutex::new(HashMap::new())),
+            proxy_metrics: None,
+            playback_paths: Arc::new(Mutex::new(PlaybackPathState::default())),
+            playback_users: playback_user_cache(),
             playback_rate_hits: Arc::new(Mutex::new(HashMap::new())),
             playback_rate_recent_events: Arc::new(Mutex::new(HashMap::new())),
             playback_rate_bans: Arc::new(Mutex::new(HashMap::new())),
@@ -2331,6 +2953,86 @@ mod tests {
             query_param("MediaSourceId=abc&DeviceId=d", "mediasourceid").as_deref(),
             Some("abc")
         );
+    }
+
+    #[test]
+    fn playback_path_state_isolates_devices_and_conflicting_sources() {
+        let mut state = PlaybackPathState::default();
+        state.record(
+            "server-1",
+            "item-1",
+            Some("device-1"),
+            Some("source-1"),
+            PLAYBACK_MODE_DIRECT_LINK,
+        );
+        state.record(
+            "server-1",
+            "item-1",
+            Some("device-2"),
+            Some("source-2"),
+            PLAYBACK_MODE_SERVER_PROXY,
+        );
+
+        let direct_key =
+            playback_path_key("server-1", "item-1", Some("device-1"), Some("source-1"));
+        let sequence_before_lookup = state.entries[&direct_key].sequence;
+        assert_eq!(
+            state.lookup("server-1", "item-1", Some("device-1"), Some("source-1")),
+            Some(PLAYBACK_MODE_DIRECT_LINK)
+        );
+        assert!(state.entries[&direct_key].sequence > sequence_before_lookup);
+        assert_eq!(
+            state.lookup("server-1", "item-1", Some("device-1"), None),
+            Some(PLAYBACK_MODE_DIRECT_LINK)
+        );
+        assert_eq!(state.lookup("server-1", "item-1", None, None), None);
+        assert_eq!(
+            state.lookup(
+                "server-1",
+                "item-1",
+                Some("device-1"),
+                Some("missing-source")
+            ),
+            None
+        );
+        assert_eq!(state.lookup("server-2", "item-1", None, None), None);
+    }
+
+    #[test]
+    fn proxy_playback_mode_classifies_success_and_redirects() {
+        let success = Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            playback_mode_for_proxy_response(&success),
+            Some(PLAYBACK_MODE_SERVER_PROXY)
+        );
+
+        let redirect = Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, "https://media.example.test/video.mkv")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            playback_mode_for_proxy_response(&redirect),
+            Some(PLAYBACK_MODE_DIRECT_LINK)
+        );
+
+        let redirect_without_location = Response::builder()
+            .status(StatusCode::FOUND)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            playback_mode_for_proxy_response(&redirect_without_location),
+            Some(PLAYBACK_MODE_DIRECT_LINK)
+        );
+
+        let failure = Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(playback_mode_for_proxy_response(&failure), None);
     }
 
     #[test]
@@ -2366,10 +3068,60 @@ mod tests {
     }
 
     #[test]
+    fn playback_device_id_falls_back_to_emby_headers() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-emby-device-id",
+            axum::http::HeaderValue::from_static("device-header"),
+        );
+        assert_eq!(
+            playback_device_id("", &headers).as_deref(),
+            Some("device-header")
+        );
+
+        headers.remove("x-emby-device-id");
+        headers.insert(
+            "x-emby-authorization",
+            axum::http::HeaderValue::from_static(
+                r#"MediaBrowser Client="Emby Web", DeviceId="device-auth""#,
+            ),
+        );
+        assert_eq!(
+            playback_device_id("", &headers).as_deref(),
+            Some("device-auth")
+        );
+    }
+
+    #[test]
     fn direct_url_detection_accepts_http_and_https_only() {
         assert!(is_direct_url("http://cdn.example.test/a.mkv"));
         assert!(is_direct_url("https://cdn.example.test/a.mkv"));
         assert!(!is_direct_url("/media/a.mkv"));
+    }
+
+    #[test]
+    fn media_path_direct_link_inference_matches_stream_routing() {
+        let config = test_config("http://127.0.0.1:8096", "http://127.0.0.1:5244", 8096);
+        assert!(media_path_uses_direct_link(
+            &config,
+            "http://openlist.example.test/d/videos/movie.mkv"
+        ));
+        assert!(!media_path_uses_direct_link(
+            &config,
+            "https://cdn.example.test/movie.mkv"
+        ));
+
+        let mut without_openlist = config;
+        without_openlist.openlist_addr = None;
+        without_openlist.openlist_token = None;
+        assert!(media_path_uses_direct_link(
+            &without_openlist,
+            "https://cdn.example.test/movie.mkv"
+        ));
+        assert!(!media_path_uses_direct_link(
+            &without_openlist,
+            "/media/movie.mkv"
+        ));
     }
 
     #[tokio::test]
@@ -2643,6 +3395,26 @@ mod tests {
             &config,
             "https://cdn.example.com/a.mkv"
         ));
+
+        config.cache_enabled = false;
+        assert!(!should_cache_direct_link(
+            &config,
+            "https://cdn.example.com/a.mkv"
+        ));
+    }
+
+    #[test]
+    fn disabled_strm_url_mapping_preserves_media_path() {
+        let mut config = test_config("http://emby.test", "http://openlist.test", 18096);
+        config.strm_url_mapping_rules =
+            url_mapping::parse_rules("https://source.example.test => http://openlist.test/d")
+                .unwrap();
+        config.strm_url_mapping_enabled = false;
+
+        assert_eq!(
+            apply_strm_url_mappings(&config, "https://source.example.test/movie.mkv"),
+            "https://source.example.test/movie.mkv"
+        );
     }
 
     #[test]
@@ -2673,7 +3445,45 @@ mod tests {
     }
 
     #[test]
-    fn proxy_base_url_uses_forwarded_headers_first() {
+    fn web_ui_block_uses_upstream_path_normalization() {
+        let mut config = test_config(
+            "http://emby.example.test",
+            "http://openlist.example.test",
+            18096,
+        );
+        config.validate_for_storage().unwrap();
+        config.servers[0].block_web_ui = true;
+
+        for path in [
+            "/web",
+            "/WEB/index.html",
+            "//web/index.html",
+            "/x/../web/index.html",
+            "/x/%2e%2e/web/index.html",
+            "/%77eb/index.html",
+            "/web%2Findex.html",
+            "/x%2F..%2Fweb/index.html",
+        ] {
+            assert!(should_block_web_ui(&config, path).unwrap(), "{path}");
+        }
+        for path in [
+            "/webhook",
+            "/emby/web",
+            "/web/../Items",
+            "/web/%2e%2e/Items",
+            "/web%2F..%2FItems",
+        ] {
+            assert!(!should_block_web_ui(&config, path).unwrap(), "{path}");
+        }
+    }
+
+    #[test]
+    fn proxy_base_url_uses_forwarded_headers_from_trusted_proxy() {
+        let config = with_trusted_proxy(test_config(
+            "http://emby.example.test",
+            "http://openlist.example.test",
+            8096,
+        ));
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             "host",
@@ -2688,18 +3498,37 @@ mod tests {
             axum::http::HeaderValue::from_static("https"),
         );
 
-        assert_eq!(proxy_base_url(&headers, 8096), "https://media.example.com");
+        assert_eq!(
+            proxy_base_url(&config, &headers, "192.0.2.10".parse().unwrap()),
+            "https://media.example.com"
+        );
     }
 
     #[test]
-    fn proxy_base_url_falls_back_to_host_header() {
+    fn proxy_base_url_ignores_forwarded_headers_from_untrusted_peer() {
+        let config = with_trusted_proxy(test_config(
+            "http://emby.example.test",
+            "http://openlist.example.test",
+            8096,
+        ));
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             "host",
             axum::http::HeaderValue::from_static("10.0.0.74:8096"),
         );
+        headers.insert(
+            "x-forwarded-host",
+            axum::http::HeaderValue::from_static("media.example.com"),
+        );
+        headers.insert(
+            "x-forwarded-proto",
+            axum::http::HeaderValue::from_static("https"),
+        );
 
-        assert_eq!(proxy_base_url(&headers, 8096), "http://10.0.0.74:8096");
+        assert_eq!(
+            proxy_base_url(&config, &headers, "198.51.100.10".parse().unwrap()),
+            "http://10.0.0.74:8096"
+        );
     }
 
     #[tokio::test]
@@ -2751,19 +3580,31 @@ mod tests {
 
     #[tokio::test]
     async fn video_stream_redirects_to_openlist_raw_url() {
-        let emby = spawn_mock_server(|request| async move {
-            if request.uri().path() == "/Items" {
-                return response_json(json!({
-                    "Items": [{
-                        "MediaSources": [{
-                            "Id": "source1",
-                            "Path": "http://openlist.local/d/movie/%E6%B5%8B%E8%AF%95.mkv"
+        let seen_user_agent = Arc::new(std::sync::Mutex::new(String::new()));
+        let seen_user_agent_for_server = seen_user_agent.clone();
+        let emby = spawn_mock_server(move |request| {
+            let seen_user_agent = seen_user_agent_for_server.clone();
+            async move {
+                if request.uri().path() == "/Items" {
+                    if let Some(user_agent) = request
+                        .headers()
+                        .get(header::USER_AGENT)
+                        .and_then(|value| value.to_str().ok())
+                    {
+                        *seen_user_agent.lock().unwrap() = user_agent.to_string();
+                    }
+                    return response_json(json!({
+                        "Items": [{
+                            "MediaSources": [{
+                                "Id": "source1",
+                                "Path": "http://openlist.local/d/movie/%E6%B5%8B%E8%AF%95.mkv"
+                            }]
                         }]
-                    }]
-                }));
-            }
+                    }));
+                }
 
-            response_text(StatusCode::NOT_FOUND, "not found")
+                response_text(StatusCode::NOT_FOUND, "not found")
+            }
         })
         .await;
         let openlist = spawn_mock_server(|request| async move {
@@ -2795,6 +3636,7 @@ mod tests {
             response.headers().get(header::LOCATION).unwrap(),
             "https://cdn.example.test/movie.mkv"
         );
+        assert_eq!(seen_user_agent.lock().unwrap().as_str(), "test-player");
     }
 
     #[tokio::test]
@@ -3096,9 +3938,10 @@ mod tests {
         })
         .await;
         let media_url = format!("{media_server}/direct.mkv");
+        let client = build_proxy_http_client().unwrap();
 
         assert_eq!(
-            internal_redirect::resolve_redirect_location(&media_url, 15, "test-player")
+            internal_redirect::resolve_redirect_location(&client, &media_url, 15, "test-player")
                 .await
                 .unwrap(),
             redirect_target
@@ -3133,11 +3976,16 @@ mod tests {
         })
         .await;
         let media_url = format!("{media_server}/direct.mkv");
+        let client = build_proxy_http_client().unwrap();
 
-        let resolved =
-            internal_redirect::resolve_redirect_location(&media_url, 15, "Emby Web Test/1.0")
-                .await
-                .unwrap();
+        let resolved = internal_redirect::resolve_redirect_location(
+            &client,
+            &media_url,
+            15,
+            "Emby Web Test/1.0",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(resolved, "https://cdn.example.test/final.mkv");
         assert_eq!(
@@ -3310,12 +4158,14 @@ mod tests {
             port,
             cache_ttl_seconds: 180,
             cache_max_capacity: 10_000,
+            cache_enabled: true,
             cache_domain_filter_mode: "off".to_string(),
             cache_domain_whitelist: String::new(),
             cache_domain_blacklist: String::new(),
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            strm_url_mapping_enabled: true,
             connectivity_check_enabled: true,
             connectivity_check_interval_seconds: 60,
             connectivity_check_timeout_seconds: 5,
@@ -3335,12 +4185,14 @@ mod tests {
             port,
             cache_ttl_seconds: 180,
             cache_max_capacity: 10_000,
+            cache_enabled: true,
             cache_domain_filter_mode: "off".to_string(),
             cache_domain_whitelist: String::new(),
             cache_domain_blacklist: String::new(),
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            strm_url_mapping_enabled: true,
             connectivity_check_enabled: true,
             connectivity_check_interval_seconds: 60,
             connectivity_check_timeout_seconds: 5,
@@ -3364,12 +4216,14 @@ mod tests {
             port,
             cache_ttl_seconds: 180,
             cache_max_capacity: 10_000,
+            cache_enabled: true,
             cache_domain_filter_mode: "off".to_string(),
             cache_domain_whitelist: String::new(),
             cache_domain_blacklist: String::new(),
             enable_internal_redirect,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            strm_url_mapping_enabled: true,
             connectivity_check_enabled: true,
             connectivity_check_interval_seconds: 60,
             connectivity_check_timeout_seconds: 5,
@@ -3393,12 +4247,14 @@ mod tests {
             port,
             cache_ttl_seconds: 180,
             cache_max_capacity: 10_000,
+            cache_enabled: true,
             cache_domain_filter_mode: "off".to_string(),
             cache_domain_whitelist: String::new(),
             cache_domain_blacklist: String::new(),
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: mappings.to_string(),
+            strm_url_mapping_enabled: true,
             connectivity_check_enabled: true,
             connectivity_check_interval_seconds: 60,
             connectivity_check_timeout_seconds: 5,

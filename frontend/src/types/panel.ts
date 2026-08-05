@@ -9,11 +9,13 @@ export type Settings = {
   port: number
   cache_ttl_seconds: number
   cache_max_capacity: number
+  cache_enabled: boolean
   cache_domain_filter_mode: 'off' | 'whitelist' | 'blacklist'
   cache_domain_whitelist: string
   enable_internal_redirect: boolean
   internal_redirect_timeout_seconds: number
   strm_url_mappings: string
+  strm_url_mapping_enabled: boolean
   connectivity_check_enabled: boolean
   connectivity_check_interval_seconds: number
   connectivity_check_timeout_seconds: number
@@ -29,8 +31,10 @@ export type EmbyServerConfig = {
   emby_api_key: string
   port: number
   enabled: boolean
+  block_web_ui: boolean
   real_ip_mode: RealIpMode
   real_ip_header: string
+  trusted_proxy_cidrs: string
 }
 
 export type PublicKeyResponse = {
@@ -54,6 +58,8 @@ export type PlaybackSession = {
   server_name: string
   id: string
   item_id: string
+  series_id: string | null
+  media_source_id: string | null
   user_name: string
   client: string
   device_name: string
@@ -62,10 +68,14 @@ export type PlaybackSession = {
   ip_location?: IpLocation
   item_name: string
   series_name: string | null
+  item_type: string | null
+  season_number: number | null
+  episode_number: number | null
   position_ticks: number | null
   runtime_ticks: number | null
   percent: number | null
   play_method: string | null
+  playback_mode: 'direct_link' | 'server_proxy' | 'transcode' | 'emby_direct_play' | 'emby_direct_stream' | 'unknown'
   transcoding: boolean
 }
 

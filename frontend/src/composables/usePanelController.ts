@@ -131,6 +131,8 @@ export function usePanelController() {
   const clientStatusFilter = ref<ClientStatusFilter>('all')
   const clientKeywordFilter = ref('')
   const visibleApiKeyServers = ref<Record<string, boolean>>({})
+  const revealedApiKeys = ref<Record<string, string>>({})
+  const revealingApiKeyServers = ref<Record<string, boolean>>({})
   const expandedServerCards = ref<Record<string, boolean>>({})
   const backupError = ref('')
   const backupFileInput = ref<HTMLInputElement | null>(null)
@@ -148,7 +150,12 @@ export function usePanelController() {
   let logRequestId = 0
   let auditRequestId = 0
   let dataSession = 0
+  let apiKeyRevealGeneration = 0
+  let persistedServerIds = new Set<string>()
   let accountSaveOperation = 0
+  let passwordChangeToken = ''
+  let deferredAuthExpiredToken = ''
+  let logoutInProgress = false
   let settingsLoaded = false
   let clientControlLoaded = false
   let logConfigLoaded = false
@@ -261,6 +268,12 @@ export function usePanelController() {
     '实时播放': 'Live playback',
     '转码': 'Transcoding',
     '直放': 'Direct play',
+    '直链播放': 'Direct link',
+    '服务器代理播放': 'Server proxy',
+    '服务器转码': 'Server transcoding',
+    'Emby 直接播放': 'Emby direct play',
+    'Emby 直接串流': 'Emby direct stream',
+    '播放路径待确认': 'Detecting route',
     '服务器配置': 'Server configuration',
     '添加服务器': 'Add server',
     '测试配置': 'Test configuration',
@@ -270,6 +283,8 @@ export function usePanelController() {
     '展开配置': 'Configure',
     '关闭服务器': 'Disable server',
     '开启服务器': 'Enable server',
+    '屏蔽 Emby Web UI': 'Block Emby Web UI',
+    '开启后禁止通过当前反代端口访问 /web 页面，不影响 Emby API 和播放。': 'Blocks /web through this proxy port without affecting Emby APIs or playback.',
     '重启服务器': 'Restart server',
     '重启中': 'Restarting',
     '删除': 'Delete',
@@ -277,10 +292,16 @@ export function usePanelController() {
     'Emby 地址': 'Emby address',
     '反代端口': 'Proxy port',
     '真实 IP 获取方式': 'Client IP strategy',
+    '可信代理 IP / CIDR': 'Trusted proxy IPs / CIDRs',
     '缓存秒数': 'Cache TTL (seconds)',
     '缓存最大条数': 'Cache capacity',
     '缓存与巡检': 'Cache and monitoring',
     '直链与重定向': 'Direct links and redirects',
+    '取消': 'Cancel',
+    '应用': 'Apply',
+    '已配置': 'Configured',
+    '秒': 'seconds',
+    '修改后需保存配置才会生效。': 'Changes take effect after saving the configuration.',
     'OpenList 地址': 'OpenList address',
     'OpenList Token': 'OpenList token',
     '客户端管控': 'Client controls',
@@ -379,7 +400,8 @@ export function usePanelController() {
     '显示 Emby API Key': 'Show Emby API key',
     '例如：x-real-ip': 'e.g. x-real-ip',
     '从下列常用 CDN 携带真实 IP 的 HTTP Header 中获取，按顺序取第一个能获取到的值。': 'Check the common CDN client-IP headers below and use the first available value.',
-    '默认使用系统识别。经过 CDN 或多层反代后 IP 不准时再配置，保存后会同步重启对应反代服务。': 'Use automatic detection by default. Configure this only when a CDN or proxy chain reports the wrong IP.',
+    '默认使用系统识别。经过 CDN 或多层反代后 IP 不准时再配置，保存后只会差量同步受影响的反代监听器。': 'Use automatic detection by default. Configure this only when a CDN or proxy chain reports the wrong IP; saving updates only affected proxy listeners.',
+    '只有来自可信代理地址的转发头才会被接受；留空时忽略所有转发头并使用连接来源 IP。': 'Forwarded headers are accepted only from trusted proxy addresses. When empty, all forwarded headers are ignored and the connection peer IP is used.',
     '可选': 'Optional',
     '启用服务器连通性巡检': 'Enable connectivity checks',
     '巡检间隔秒数': 'Check interval (seconds)',
@@ -456,7 +478,7 @@ export function usePanelController() {
     '日志级别、文件大小、保留数量和格式': 'Log level, file size, retention count, and format',
     '备份文件会使用备份密码加密；不包含面板管理员用户名、密码、登录会话、运行日志文件和请求统计数据。': 'Backups are encrypted with your password and exclude administrator credentials, sessions, runtime logs, and request statistics.',
     '输入备份密码后生成加密的 `embypanel-config-时间.json` 并弹出浏览器下载。': 'Enter a password to create and download an encrypted embypanel-config timestamp file.',
-    '点击后选择本机配置文件，加密备份需要输入对应密码，读取成功后自动还原并重启反代服务。': 'Choose a local configuration file. Encrypted backups require their password and restart proxy services after restore.',
+    '点击后选择本机配置文件，加密备份需要输入对应密码，读取成功后自动还原并差量同步受影响的反代监听器。': 'Choose a local configuration file. Encrypted backups require their password; restoring updates only affected proxy listeners.',
     '日志类型': 'Log type',
     '单列表查看播放日志、拦截日志、反代请求和运行日志，页面打开时每 3 秒自动刷新。': 'Review playback, blocked, proxy, and runtime logs in one stream with a three-second live refresh.',
     '级别': 'Level',
@@ -519,6 +541,7 @@ export function usePanelController() {
     '密码已更新，但用户名修改失败': 'The password was updated, but the username change failed',
     'UA 规则已删除': 'UA rule deleted',
     '登录已过期，请重新登录': 'Your session expired. Sign in again.',
+    '退出登录失败，请重试': 'Unable to sign out. Please try again.',
     '页面加载失败，请刷新后重试': 'Unable to load the page. Refresh and try again.',
     '重试': 'Retry',
     '加密请求失败': 'Unable to encrypt the request',
@@ -526,15 +549,15 @@ export function usePanelController() {
     '已开启': 'enabled',
     '已关闭': 'disabled',
     '确定删除这个服务器配置吗？对应反代端口保存后会停止监听。': 'Delete this server configuration? Its proxy port will stop listening after save.',
-    '服务器配置已保存，反代服务已重启': 'Server configuration saved. Proxy services restarted.',
+    '服务器配置已保存，反代监听器已差量同步': 'Server configuration saved. Affected proxy listeners were updated.',
     '请输入备份密码（至少 4 位），用于加密配置文件': 'Enter a backup password (at least 4 characters).',
     '备份密码至少需要 4 位': 'Backup passwords need at least 4 characters.',
     '加密配置备份已生成，请妥善保存备份密码': 'Encrypted backup created. Keep the password safe.',
     '配置文件内容为空': 'The configuration file is empty.',
-    '还原配置文件会覆盖当前配置并重启反代服务，确定继续吗？': 'Restoring will overwrite the current configuration and restart proxy services. Continue?',
+    '还原配置文件会覆盖当前配置，并差量同步受影响的反代监听器，确定继续吗？': 'Restoring will overwrite the current configuration and update affected proxy listeners. Continue?',
     '请输入该加密备份的密码': 'Enter the password for this encrypted backup.',
     '加密备份密码不能为空': 'The encrypted backup password cannot be empty.',
-    '配置文件已还原，反代服务已重启': 'Configuration restored. Proxy services restarted.',
+    '配置文件已还原，反代监听器已差量同步': 'Configuration restored. Affected proxy listeners were updated.',
     '用户封禁已解除': 'User ban lifted',
     '混合封禁已解除': 'Mixed ban lifted',
     'IP 屏蔽已解除': 'IP block lifted',
@@ -576,11 +599,13 @@ export function usePanelController() {
     port: 8096,
     cache_ttl_seconds: 180,
     cache_max_capacity: 10000,
+    cache_enabled: true,
     cache_domain_filter_mode: 'off',
     cache_domain_whitelist: '',
     enable_internal_redirect: false,
     internal_redirect_timeout_seconds: 15,
     strm_url_mappings: '',
+    strm_url_mapping_enabled: true,
     connectivity_check_enabled: true,
     connectivity_check_interval_seconds: 60,
     connectivity_check_timeout_seconds: 5,
@@ -991,6 +1016,10 @@ export function usePanelController() {
 
   function resetResourceCache() {
     dataSession += 1
+    clearApiKeyRevealState()
+    persistedServerIds = new Set()
+    passwordChangeToken = ''
+    deferredAuthExpiredToken = ''
     settingsLoaded = false
     clientControlLoaded = false
     logConfigLoaded = false
@@ -1245,7 +1274,7 @@ export function usePanelController() {
       Object.assign(settings, response)
       normalizeSettingsServers()
       settingsLoaded = true
-      showNotice(t('服务器配置已保存，反代服务已重启'))
+      showNotice(t('服务器配置已保存，反代监听器已差量同步'))
       await refreshProxyStatuses()
     } catch (err) {
       error.value = err instanceof Error ? err.message : String(err)
@@ -1329,7 +1358,7 @@ export function usePanelController() {
       backupError.value = t('配置文件内容为空')
       return
     }
-    const confirmed = window.confirm(t('还原配置文件会覆盖当前配置并重启反代服务，确定继续吗？'))
+    const confirmed = window.confirm(t('还原配置文件会覆盖当前配置，并差量同步受影响的反代监听器，确定继续吗？'))
     if (!confirmed) return
     const encryptedBackup = backup.startsWith('{') && backup.includes('"cipher"')
     const password = encryptedBackup ? window.prompt(t('请输入该加密备份的密码')) : null
@@ -1348,7 +1377,7 @@ export function usePanelController() {
       Object.assign(settings, response)
       normalizeSettingsServers()
       settingsLoaded = true
-      showNotice(t('配置文件已还原，反代服务已重启'))
+      showNotice(t('配置文件已还原，反代监听器已差量同步'))
     } catch (err) {
       backupError.value = err instanceof Error ? err.message : String(err)
     }
@@ -1475,8 +1504,10 @@ export function usePanelController() {
         emby_host: server.emby_host.trim(),
         emby_api_key: server.emby_api_key.trim(),
         port: Number(server.port),
+        block_web_ui: Boolean(server.block_web_ui),
         real_ip_mode: server.real_ip_mode || 'auto',
         real_ip_header: server.real_ip_header.trim(),
+        trusted_proxy_cidrs: server.trusted_proxy_cidrs.trim(),
       }))
       .filter((server) => server.emby_host || server.emby_api_key)
     const primary = servers.find((server) => server.enabled) ?? servers[0]
@@ -1494,9 +1525,12 @@ export function usePanelController() {
   function normalizeSettingsServers() {
     settings.servers = settings.servers.map((server) => ({
       ...server,
+      block_web_ui: Boolean(server.block_web_ui),
       real_ip_mode: server.real_ip_mode || 'auto',
       real_ip_header: server.real_ip_header || '',
+      trusted_proxy_cidrs: server.trusted_proxy_cidrs || '',
     }))
+    persistedServerIds = new Set(settings.servers.map((server) => server.id))
   }
 
   function addServer() {
@@ -1512,8 +1546,10 @@ export function usePanelController() {
       emby_api_key: '',
       port,
       enabled: true,
+      block_web_ui: false,
       real_ip_mode: 'auto',
       real_ip_header: '',
+      trusted_proxy_cidrs: '',
     }
   }
 
@@ -1542,8 +1578,8 @@ export function usePanelController() {
     const confirmed = window.confirm(t('确定删除这个服务器配置吗？对应反代端口保存后会停止监听。'))
     if (!confirmed) return
     settings.servers = settings.servers.filter((server) => server.id !== serverId)
-    const { [serverId]: _removed, ...visibleServers } = visibleApiKeyServers.value
-    visibleApiKeyServers.value = visibleServers
+    persistedServerIds.delete(serverId)
+    clearApiKeyRevealState()
     const { [serverId]: _collapsed, ...expandedServers } = expandedServerCards.value
     expandedServerCards.value = expandedServers
   }
@@ -1557,11 +1593,89 @@ export function usePanelController() {
     return Boolean(visibleApiKeyServers.value[serverId])
   }
 
-  function toggleApiKeyVisible(serverId: string) {
-    visibleApiKeyServers.value = {
-      ...visibleApiKeyServers.value,
-      [serverId]: !visibleApiKeyServers.value[serverId],
+  function isApiKeyRevealLoading(serverId: string) {
+    return Boolean(revealingApiKeyServers.value[serverId])
+  }
+
+  function apiKeyInputValue(server: EmbyServerConfig) {
+    if (server.emby_api_key) return server.emby_api_key
+    if (!isApiKeyVisible(server.id)) return ''
+    return revealedApiKeys.value[server.id] || ''
+  }
+
+  function updateApiKeyInput(server: EmbyServerConfig, event: Event) {
+    const target = event.target
+    if (!(target instanceof HTMLInputElement)) return
+    server.emby_api_key = target.value
+    const { [server.id]: _revealed, ...revealedKeys } = revealedApiKeys.value
+    revealedApiKeys.value = revealedKeys
+  }
+
+  async function toggleApiKeyVisible(server: EmbyServerConfig) {
+    const serverId = server.id
+    if (isApiKeyVisible(serverId)) {
+      const { [serverId]: _visible, ...visibleServers } = visibleApiKeyServers.value
+      visibleApiKeyServers.value = visibleServers
+      const { [serverId]: _revealed, ...revealedKeys } = revealedApiKeys.value
+      revealedApiKeys.value = revealedKeys
+      return
     }
+    if (server.emby_api_key) {
+      visibleApiKeyServers.value = {
+        ...visibleApiKeyServers.value,
+        [serverId]: true,
+      }
+      return
+    }
+    if (!persistedServerIds.has(serverId)) {
+      visibleApiKeyServers.value = {
+        ...visibleApiKeyServers.value,
+        [serverId]: true,
+      }
+      return
+    }
+    if (isApiKeyRevealLoading(serverId)) return
+    revealingApiKeyServers.value = {
+      ...revealingApiKeyServers.value,
+      [serverId]: true,
+    }
+    const revealGeneration = apiKeyRevealGeneration
+    error.value = ''
+    try {
+      const response = await api<{ api_key: string }>(
+        `/api/settings/servers/${encodeURIComponent(serverId)}/api-key`,
+        { method: 'POST' },
+      )
+      if (revealGeneration !== apiKeyRevealGeneration) return
+      revealedApiKeys.value = {
+        ...revealedApiKeys.value,
+        [serverId]: response.api_key,
+      }
+      visibleApiKeyServers.value = {
+        ...visibleApiKeyServers.value,
+        [serverId]: true,
+      }
+    } catch (err) {
+      if (revealGeneration === apiKeyRevealGeneration) {
+        error.value = err instanceof Error ? err.message : String(err)
+      }
+    } finally {
+      if (revealGeneration === apiKeyRevealGeneration) {
+        const { [serverId]: _revealing, ...revealingServers } = revealingApiKeyServers.value
+        revealingApiKeyServers.value = revealingServers
+      }
+    }
+  }
+
+  function apiKeyPlaceholder(server: EmbyServerConfig) {
+    return persistedServerIds.has(server.id) && !server.emby_api_key ? '************' : ''
+  }
+
+  function clearApiKeyRevealState() {
+    apiKeyRevealGeneration += 1
+    visibleApiKeyServers.value = {}
+    revealedApiKeys.value = {}
+    revealingApiKeyServers.value = {}
   }
 
   async function saveAccount() {
@@ -1600,7 +1714,7 @@ export function usePanelController() {
     }
 
     const operation = ++accountSaveOperation
-    const operationToken = token.value
+    let operationToken = token.value
     const operationIsCurrent = () => (
       operation === accountSaveOperation
       && token.value === operationToken
@@ -1615,11 +1729,26 @@ export function usePanelController() {
           new_password: passwordForm.new_password,
         })
         if (!operationIsCurrent()) return
-        await api<{ changed: boolean }>('/api/change-password', {
-          method: 'POST',
-          body: JSON.stringify(encryptedPassword),
-        })
+        passwordChangeToken = operationToken
+        let response: { changed: boolean; token: string }
+        try {
+          response = await api<{ changed: boolean; token: string }>('/api/change-password', {
+            method: 'POST',
+            body: JSON.stringify(encryptedPassword),
+          })
+        } catch (err) {
+          const expiredToken = deferredAuthExpiredToken
+          passwordChangeToken = ''
+          deferredAuthExpiredToken = ''
+          if (expiredToken) handleAuthExpired(expiredToken)
+          throw err
+        }
+        passwordChangeToken = ''
+        deferredAuthExpiredToken = ''
         if (!operationIsCurrent()) return
+        token.value = response.token
+        operationToken = response.token
+        storeToken(response.token)
         passwordForm.current_password = ''
         passwordForm.new_password = ''
         passwordForm.confirm_password = ''
@@ -1941,21 +2070,44 @@ export function usePanelController() {
     return locationText ? `${ipText} · ${locationText}` : ipText
   }
 
-  function logout() {
+  async function logout() {
+    if (logoutInProgress) return
+    logoutInProgress = true
     accountSaveOperation += 1
     savingAccount.value = false
-    token.value = ''
-    clearPasswordFields()
-    void router.replace({ name: 'home' }).catch(() => undefined)
-    mobileNavOpen.value = false
-    clearStoredToken()
-    removeStorage(localStorage, pageKey)
-    pageActivation += 1
-    pageLoading.value = false
-    pageReady.value = false
-    stopPagePolling()
-    resetResourceCache()
-    mode.value = 'login'
+    const logoutToken = token.value
+    error.value = ''
+    try {
+      if (logoutToken) {
+        const headers = new Headers({
+          Authorization: `Bearer ${logoutToken}`,
+          'Content-Type': 'application/json',
+        })
+        const response = await fetch('/api/logout', { method: 'POST', headers })
+        if (!response.ok && response.status !== 401) {
+          throw new Error(await response.text())
+        }
+        if (token.value !== logoutToken) return
+      }
+      token.value = ''
+      clearPasswordFields()
+      void router.replace({ name: 'home' }).catch(() => undefined)
+      mobileNavOpen.value = false
+      clearStoredToken()
+      removeStorage(localStorage, pageKey)
+      pageActivation += 1
+      pageLoading.value = false
+      pageReady.value = false
+      stopPagePolling()
+      resetResourceCache()
+      mode.value = 'login'
+    } catch {
+      if (token.value === logoutToken) {
+        error.value = t('退出登录失败，请重试')
+      }
+    } finally {
+      logoutInProgress = false
+    }
   }
 
   function storedToken() {
@@ -2041,6 +2193,28 @@ export function usePanelController() {
     } finally {
       playbackLoading.value = false
     }
+  }
+
+  async function fetchPlaybackArtwork(serverId: string, itemId: string, signal: AbortSignal) {
+    const requestToken = token.value
+    if (!requestToken || signal.aborted) return null
+    const params = new URLSearchParams({ server_id: serverId, item_id: itemId })
+    const headers = new Headers({ Authorization: `Bearer ${requestToken}` })
+    const response = await fetch(`/api/monitoring/playback-image?${params.toString()}`, {
+      headers,
+      signal,
+    })
+    if (response.status === 404) return null
+    if (!response.ok) {
+      const message = await response.text()
+      if (response.status === 401 && token.value === requestToken) {
+        handleAuthExpired(requestToken)
+      }
+      throw new Error(message)
+    }
+    if (token.value !== requestToken || signal.aborted) return null
+    const blob = await response.blob()
+    return token.value === requestToken && !signal.aborted && blob.type.startsWith('image/') ? blob : null
   }
 
   async function refreshActivityLogs() {
@@ -2225,7 +2399,11 @@ export function usePanelController() {
     if (!response.ok) {
       const message = await response.text()
       if (response.status === 401 && requestToken && !isAuthBootstrapPath(path)) {
-        handleAuthExpired(requestToken)
+        if (path !== '/api/change-password' && passwordChangeToken === requestToken) {
+          deferredAuthExpiredToken = requestToken
+        } else {
+          handleAuthExpired(requestToken)
+        }
       }
       throw new Error(message)
     }
@@ -2561,7 +2739,8 @@ export function usePanelController() {
     document.documentElement.classList.toggle('dark', enabled)
   }, { immediate: true })
 
-  watch(page, (nextPage) => {
+  watch(page, (nextPage, previousPage) => {
+    if (previousPage === 'server' && nextPage !== 'server') clearApiKeyRevealState()
     clearNotice()
     closeMobileNav()
     writeStorage(localStorage, pageKey, nextPage)
@@ -2727,6 +2906,7 @@ export function usePanelController() {
     failedDuration,
     unblockRateLimitWindow,
     refreshPlaybackSessions,
+    fetchPlaybackArtwork,
     formatTicks,
     settings,
     restartingServerId,
@@ -2744,6 +2924,10 @@ export function usePanelController() {
     restartProxyServer,
     removeServer,
     isApiKeyVisible,
+    isApiKeyRevealLoading,
+    apiKeyInputValue,
+    apiKeyPlaceholder,
+    updateApiKeyInput,
     toggleApiKeyVisible,
     needsRealIpHeader,
     updateRealIpMode,

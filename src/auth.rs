@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -25,6 +26,7 @@ use crate::{
 const SESSION_TTL_SECONDS: i64 = 86400 * 30;
 const LOGIN_FAILURE_WINDOW_SECONDS: i64 = 300;
 const LOGIN_FAILURE_LIMIT: usize = 8;
+const LOGIN_FAILURE_KEY_CAPACITY: usize = 2048;
 pub const TOKEN_COOKIE_NAME: &str = "embypanel_token";
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +60,12 @@ pub struct AuthResponse {
 #[derive(Debug, Serialize)]
 pub struct PasswordChangedResponse {
     pub changed: bool,
+    pub token: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LogoutResponse {
+    pub logged_out: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,17 +90,29 @@ pub async fn setup(
         ));
     }
     validate_credentials(&payload.username, &payload.password)?;
-    let password_hash = hash_password(&payload.password)?;
-    let admin_user_id = state
-        .settings_store
-        .create_admin(payload.username.trim(), &password_hash)?;
-    state.settings_store.record_audit(
+    let password_hash = hash_password_async(&state, payload.password).await?;
+    let token = random_token();
+    let token_hash = hash_token(&token);
+    let Some(admin_user_id) = state.settings_store.create_initial_admin_with_session(
+        payload.username.trim(),
+        &password_hash,
+        &token_hash,
+        now_ts() + SESSION_TTL_SECONDS,
+    )?
+    else {
+        return Err(AppError::Unauthorized(
+            "admin already initialized".to_string(),
+        ));
+    };
+    if let Err(err) = state.settings_store.record_audit(
         Some(admin_user_id),
         "account.setup",
         "初始化管理员账户",
         "success",
-    )?;
-    create_session_response(&state, admin_user_id).await
+    ) {
+        tracing::error!(error = %err.safe_log_message(), "failed to record account setup audit");
+    }
+    Ok(Json(AuthResponse { token }).into_response())
 }
 
 pub async fn login(
@@ -112,12 +132,35 @@ pub async fn login(
             "invalid username or password".to_string(),
         ));
     };
-    if let Err(err) = verify_password(&payload.password, &admin.password_hash) {
-        record_login_failure(&state, &login_key).await;
+    let current_password_hash = admin.password_hash;
+    if let Err(err) = verify_login_password_async(
+        &state,
+        &login_key,
+        payload.password,
+        current_password_hash.clone(),
+    )
+    .await
+    {
+        if matches!(err, AppError::Unauthorized(_)) {
+            record_login_failure(&state, &login_key).await;
+        }
         return Err(err);
     }
+    let token = random_token();
+    let token_hash = hash_token(&token);
+    if !state.settings_store.create_session_if_password_matches(
+        admin.admin_user_id,
+        &current_password_hash,
+        &token_hash,
+        now_ts() + SESSION_TTL_SECONDS,
+    )? {
+        record_login_failure(&state, &login_key).await;
+        return Err(AppError::Unauthorized(
+            "invalid username or password".to_string(),
+        ));
+    }
     clear_login_failures(&state, &login_key).await;
-    create_session_response(&state, admin.admin_user_id).await
+    Ok(Json(AuthResponse { token }).into_response())
 }
 
 pub async fn change_password(
@@ -140,7 +183,14 @@ pub async fn change_password(
             "invalid or expired session".to_string(),
         ));
     };
-    match verify_password(&payload.current_password, &admin.password_hash) {
+    let current_password_hash = admin.password_hash;
+    match verify_password_async(
+        &state,
+        payload.current_password,
+        current_password_hash.clone(),
+    )
+    .await
+    {
         Ok(()) => {}
         Err(AppError::Unauthorized(_)) => {
             return Err(AppError::Validation(
@@ -149,17 +199,58 @@ pub async fn change_password(
         }
         Err(err) => return Err(err),
     }
-    let password_hash = hash_password(&payload.new_password)?;
-    state
+    let password_hash = hash_password_async(&state, payload.new_password).await?;
+    let current_token_hash = hash_token(auth_token(&headers)?);
+    let token = random_token();
+    let token_hash = hash_token(&token);
+    let updated = state
         .settings_store
-        .update_admin_password(admin_user_id, &password_hash)?;
-    state.settings_store.record_audit(
+        .update_admin_password_and_replace_sessions(
+            admin_user_id,
+            &current_password_hash,
+            &password_hash,
+            &current_token_hash,
+            &token_hash,
+            now_ts(),
+            now_ts() + SESSION_TTL_SECONDS,
+        )?;
+    if !updated {
+        return Err(AppError::Unauthorized(
+            "invalid or expired session".to_string(),
+        ));
+    }
+    if let Err(err) = state.settings_store.record_audit(
         Some(admin_user_id),
         "account.password",
         "修改管理员密码",
         "success",
-    )?;
-    Ok(Json(PasswordChangedResponse { changed: true }))
+    ) {
+        tracing::error!(error = %err.safe_log_message(), "failed to record password change audit");
+    }
+    Ok(Json(PasswordChangedResponse {
+        changed: true,
+        token,
+    }))
+}
+
+pub async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<LogoutResponse>> {
+    let token_hash = hash_token(auth_token(&headers)?);
+    let admin_user_id = state
+        .settings_store
+        .revoke_session(&token_hash, now_ts())?
+        .ok_or_else(|| AppError::Unauthorized("invalid or expired session".to_string()))?;
+    if let Err(err) = state.settings_store.record_audit(
+        Some(admin_user_id),
+        "account.logout",
+        "管理员退出登录",
+        "success",
+    ) {
+        tracing::error!(error = %err.safe_log_message(), "failed to record logout audit");
+    }
+    Ok(Json(LogoutResponse { logged_out: true }))
 }
 
 pub async fn get_profile(
@@ -234,14 +325,19 @@ fn validate_credentials(username: &str, password: &str) -> AppResult<()> {
 async fn enforce_login_attempt_limit(state: &AppState, key: &str) -> AppResult<()> {
     let now = now_ts();
     let mut attempts = state.login_failures.lock().await;
-    let failures = attempts.entry(key.to_string()).or_default();
-    while failures
-        .front()
-        .is_some_and(|timestamp| now.saturating_sub(*timestamp) > LOGIN_FAILURE_WINDOW_SECONDS)
-    {
-        failures.pop_front();
+    prune_login_failure_key(&mut attempts, key, now);
+    if !attempts.contains_key(key) && attempts.len() >= LOGIN_FAILURE_KEY_CAPACITY {
+        prune_login_failures(&mut attempts, now);
+        if attempts.len() >= LOGIN_FAILURE_KEY_CAPACITY {
+            return Err(AppError::RateLimited(
+                "too many login attempts, please try again later".to_string(),
+            ));
+        }
     }
-    if failures.len() >= LOGIN_FAILURE_LIMIT {
+    if attempts
+        .get(key)
+        .is_some_and(|failures| failures.len() >= LOGIN_FAILURE_LIMIT)
+    {
         return Err(AppError::RateLimited(
             "too many login attempts, please try again later".to_string(),
         ));
@@ -252,18 +348,45 @@ async fn enforce_login_attempt_limit(state: &AppState, key: &str) -> AppResult<(
 async fn record_login_failure(state: &AppState, key: &str) {
     let now = now_ts();
     let mut attempts = state.login_failures.lock().await;
-    let failures = attempts.entry(key.to_string()).or_default();
-    while failures
-        .front()
-        .is_some_and(|timestamp| now.saturating_sub(*timestamp) > LOGIN_FAILURE_WINDOW_SECONDS)
-    {
-        failures.pop_front();
+    prune_login_failure_key(&mut attempts, key, now);
+    if !attempts.contains_key(key) && attempts.len() >= LOGIN_FAILURE_KEY_CAPACITY {
+        prune_login_failures(&mut attempts, now);
+        if attempts.len() >= LOGIN_FAILURE_KEY_CAPACITY {
+            return;
+        }
     }
-    failures.push_back(now);
+    attempts.entry(key.to_string()).or_default().push_back(now);
 }
 
 async fn clear_login_failures(state: &AppState, key: &str) {
     state.login_failures.lock().await.remove(key);
+}
+
+fn prune_login_failures(attempts: &mut HashMap<String, VecDeque<i64>>, now: i64) {
+    attempts.retain(|_, failures| {
+        while failures
+            .front()
+            .is_some_and(|timestamp| now.saturating_sub(*timestamp) > LOGIN_FAILURE_WINDOW_SECONDS)
+        {
+            failures.pop_front();
+        }
+        !failures.is_empty()
+    });
+}
+
+fn prune_login_failure_key(attempts: &mut HashMap<String, VecDeque<i64>>, key: &str, now: i64) {
+    let remove = attempts.get_mut(key).is_some_and(|failures| {
+        while failures
+            .front()
+            .is_some_and(|timestamp| now.saturating_sub(*timestamp) > LOGIN_FAILURE_WINDOW_SECONDS)
+        {
+            failures.pop_front();
+        }
+        failures.is_empty()
+    });
+    if remove {
+        attempts.remove(key);
+    }
 }
 
 fn hash_password(password: &str) -> AppResult<String> {
@@ -277,6 +400,21 @@ fn hash_password(password: &str) -> AppResult<String> {
         .map_err(|err| AppError::Internal(format!("failed to hash password: {err}")))
 }
 
+async fn hash_password_async(state: &AppState, password: String) -> AppResult<String> {
+    let permit = state
+        .password_tasks
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| AppError::Internal("password task limiter closed".to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        hash_password(&password)
+    })
+    .await
+    .map_err(|err| AppError::Internal(format!("password hashing task failed: {err}")))?
+}
+
 fn verify_password(password: &str, password_hash: &str) -> AppResult<()> {
     let parsed = PasswordHash::new(password_hash)
         .map_err(|err| AppError::Internal(format!("invalid password hash: {err}")))?;
@@ -285,15 +423,43 @@ fn verify_password(password: &str, password_hash: &str) -> AppResult<()> {
         .map_err(|_| AppError::Unauthorized("invalid username or password".to_string()))
 }
 
-async fn create_session_response(state: &AppState, admin_user_id: i64) -> AppResult<Response> {
-    let token = random_token();
-    let token_hash = hash_token(&token);
-    state.settings_store.create_session(
-        admin_user_id,
-        &token_hash,
-        now_ts() + SESSION_TTL_SECONDS,
-    )?;
-    Ok(Json(AuthResponse { token }).into_response())
+async fn verify_password_async(
+    state: &AppState,
+    password: String,
+    password_hash: String,
+) -> AppResult<()> {
+    let permit = state
+        .password_tasks
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| AppError::Internal("password task limiter closed".to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        verify_password(&password, &password_hash)
+    })
+    .await
+    .map_err(|err| AppError::Internal(format!("password verification task failed: {err}")))?
+}
+
+async fn verify_login_password_async(
+    state: &AppState,
+    login_key: &str,
+    password: String,
+    password_hash: String,
+) -> AppResult<()> {
+    let permit = state
+        .password_tasks
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::RateLimited("authentication is busy; try again".to_string()))?;
+    enforce_login_attempt_limit(state, login_key).await?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        verify_password(&password, &password_hash)
+    })
+    .await
+    .map_err(|err| AppError::Internal(format!("password verification task failed: {err}")))?
 }
 
 fn random_token() -> String {

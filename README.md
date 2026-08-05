@@ -71,6 +71,12 @@ services:
 docker compose up -d
 ```
 
+首次启动缺少 `qqwry.ipdb` 时会从项目默认上游分块下载，默认最大 `67108864` 字节。可按部署需要设置：
+
+- `EMBYPANEL_IPDB_URL`：自定义 IPDB 下载地址，仅支持 HTTP/HTTPS。
+- `EMBYPANEL_IPDB_MAX_BYTES`：允许下载的最大字节数。
+- `EMBYPANEL_IPDB_SHA256`：可选的 64 位十六进制 SHA-256；设置后校验不通过不会替换本地数据库。
+
 查看日志：
 
 ```bash

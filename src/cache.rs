@@ -9,9 +9,9 @@ pub struct DirectLinkCache {
 }
 
 impl DirectLinkCache {
-    pub fn new(ttl_seconds: u64, max_capacity: u64) -> Self {
+    pub fn new(enabled: bool, ttl_seconds: u64, max_capacity: u64) -> Self {
         Self {
-            enabled: ttl_seconds > 0,
+            enabled: enabled && ttl_seconds > 0,
             inner: Cache::builder()
                 .time_to_live(Duration::from_secs(ttl_seconds.max(1)))
                 .max_capacity(max_capacity)

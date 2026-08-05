@@ -1,3 +1,6 @@
+use std::net::IpAddr;
+
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -20,6 +23,8 @@ pub struct Config {
     pub cache_ttl_seconds: u64,
     #[serde(default = "default_cache_max_capacity")]
     pub cache_max_capacity: u64,
+    #[serde(default = "default_cache_enabled")]
+    pub cache_enabled: bool,
     #[serde(default = "default_cache_domain_filter_mode")]
     pub cache_domain_filter_mode: String,
     #[serde(default)]
@@ -32,6 +37,8 @@ pub struct Config {
     pub internal_redirect_timeout_seconds: u64,
     #[serde(default)]
     pub strm_url_mappings: String,
+    #[serde(default = "default_strm_url_mapping_enabled")]
+    pub strm_url_mapping_enabled: bool,
     #[serde(default = "default_connectivity_check_enabled")]
     pub connectivity_check_enabled: bool,
     #[serde(default = "default_connectivity_check_interval_seconds")]
@@ -53,10 +60,16 @@ pub struct EmbyServerConfig {
     pub port: u16,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    #[serde(default)]
+    pub block_web_ui: bool,
     #[serde(default = "default_real_ip_mode")]
     pub real_ip_mode: String,
     #[serde(default)]
     pub real_ip_header: String,
+    #[serde(default)]
+    pub trusted_proxy_cidrs: String,
+    #[serde(skip)]
+    pub(crate) trusted_proxy_networks: Vec<IpNet>,
 }
 
 impl Config {
@@ -70,12 +83,14 @@ impl Config {
             port: default_port(),
             cache_ttl_seconds: default_cache_ttl_seconds(),
             cache_max_capacity: default_cache_max_capacity(),
+            cache_enabled: default_cache_enabled(),
             cache_domain_filter_mode: default_cache_domain_filter_mode(),
             cache_domain_whitelist: String::new(),
             cache_domain_blacklist: String::new(),
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: default_internal_redirect_timeout_seconds(),
             strm_url_mappings: String::new(),
+            strm_url_mapping_enabled: default_strm_url_mapping_enabled(),
             connectivity_check_enabled: default_connectivity_check_enabled(),
             connectivity_check_interval_seconds: default_connectivity_check_interval_seconds(),
             connectivity_check_timeout_seconds: default_connectivity_check_timeout_seconds(),
@@ -176,8 +191,11 @@ impl Config {
                     emby_api_key: self.emby_api_key.clone(),
                     port: self.port,
                     enabled: true,
+                    block_web_ui: false,
                     real_ip_mode: default_real_ip_mode(),
                     real_ip_header: String::new(),
+                    trusted_proxy_cidrs: String::new(),
+                    trusted_proxy_networks: Vec::new(),
                 });
                 return Ok(());
             }
@@ -211,6 +229,10 @@ impl Config {
             validate_port(server.port)?;
             server.real_ip_mode = normalize_real_ip_mode(&server.real_ip_mode)?;
             server.real_ip_header = normalize_header_list(&server.real_ip_header);
+            let (trusted_proxy_cidrs, trusted_proxy_networks) =
+                normalize_trusted_proxy_cidrs(&server.trusted_proxy_cidrs)?;
+            server.trusted_proxy_cidrs = trusted_proxy_cidrs;
+            server.trusted_proxy_networks = trusted_proxy_networks;
             if server.real_ip_mode == "header" && server.real_ip_header.is_empty() {
                 return Err(AppError::Config(
                     "server.real_ip_header cannot be empty when real_ip_mode is header".to_string(),
@@ -254,6 +276,21 @@ impl Config {
     }
 }
 
+impl EmbyServerConfig {
+    pub(crate) fn is_trusted_proxy(&self, peer_ip: IpAddr) -> bool {
+        let peer_ip = match peer_ip {
+            IpAddr::V6(ip) => ip
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(ip)),
+            peer_ip => peer_ip,
+        };
+        self.trusted_proxy_networks
+            .iter()
+            .any(|network| network.contains(&peer_ip))
+    }
+}
+
 fn default_port() -> u16 {
     8096
 }
@@ -274,12 +311,20 @@ fn default_cache_max_capacity() -> u64 {
     10_000
 }
 
+fn default_cache_enabled() -> bool {
+    true
+}
+
 fn default_cache_domain_filter_mode() -> String {
     "off".to_string()
 }
 
 fn default_internal_redirect_timeout_seconds() -> u64 {
     15
+}
+
+fn default_strm_url_mapping_enabled() -> bool {
+    true
 }
 
 fn default_connectivity_check_enabled() -> bool {
@@ -345,6 +390,36 @@ fn normalize_header_list(value: &str) -> String {
         .join("\n")
 }
 
+fn normalize_trusted_proxy_cidrs(value: &str) -> AppResult<(String, Vec<IpNet>)> {
+    let mut networks = Vec::new();
+    for item in value
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        let network = match item.parse::<IpNet>() {
+            Ok(network) => network.trunc(),
+            Err(cidr_error) => match item.parse::<IpAddr>() {
+                Ok(ip) => IpNet::from(ip),
+                Err(_) => {
+                    return Err(AppError::Config(format!(
+                        "server.trusted_proxy_cidrs contains invalid IP or CIDR {item}: {cidr_error}"
+                    )));
+                }
+            },
+        };
+        if !networks.contains(&network) {
+            networks.push(network);
+        }
+    }
+    let normalized = networks
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok((normalized, networks))
+}
+
 fn normalize_real_ip_mode(value: &str) -> AppResult<String> {
     let mode = value.trim().to_ascii_lowercase();
     match mode.as_str() {
@@ -394,12 +469,14 @@ mod tests {
             port: 18096,
             cache_ttl_seconds: 0,
             cache_max_capacity: 10_000,
+            cache_enabled: true,
             cache_domain_filter_mode: "off".to_string(),
             cache_domain_whitelist: String::new(),
             cache_domain_blacklist: String::new(),
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            strm_url_mapping_enabled: true,
             connectivity_check_enabled: true,
             connectivity_check_interval_seconds: 60,
             connectivity_check_timeout_seconds: 5,
@@ -421,12 +498,14 @@ mod tests {
             port: 18096,
             cache_ttl_seconds: 180,
             cache_max_capacity: 0,
+            cache_enabled: true,
             cache_domain_filter_mode: "off".to_string(),
             cache_domain_whitelist: String::new(),
             cache_domain_blacklist: String::new(),
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            strm_url_mapping_enabled: true,
             connectivity_check_enabled: true,
             connectivity_check_interval_seconds: 60,
             connectivity_check_timeout_seconds: 5,
@@ -448,12 +527,14 @@ mod tests {
             port: 18096,
             cache_ttl_seconds: 180,
             cache_max_capacity: 10_000,
+            cache_enabled: true,
             cache_domain_filter_mode: "off".to_string(),
             cache_domain_whitelist: String::new(),
             cache_domain_blacklist: String::new(),
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            strm_url_mapping_enabled: true,
             connectivity_check_enabled: true,
             connectivity_check_interval_seconds: 60,
             connectivity_check_timeout_seconds: 5,
@@ -481,12 +562,14 @@ mod tests {
             port: 18096,
             cache_ttl_seconds: 180,
             cache_max_capacity: 10_000,
+            cache_enabled: true,
             cache_domain_filter_mode: "off".to_string(),
             cache_domain_whitelist: String::new(),
             cache_domain_blacklist: String::new(),
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            strm_url_mapping_enabled: true,
             connectivity_check_enabled: true,
             connectivity_check_interval_seconds: 60,
             connectivity_check_timeout_seconds: 5,
@@ -508,12 +591,14 @@ mod tests {
             port: 8096,
             cache_ttl_seconds: 180,
             cache_max_capacity: 10_000,
+            cache_enabled: true,
             cache_domain_filter_mode: "off".to_string(),
             cache_domain_whitelist: String::new(),
             cache_domain_blacklist: String::new(),
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            strm_url_mapping_enabled: true,
             connectivity_check_enabled: true,
             connectivity_check_interval_seconds: 60,
             connectivity_check_timeout_seconds: 5,
@@ -539,12 +624,14 @@ mod tests {
             port: 18096,
             cache_ttl_seconds: 180,
             cache_max_capacity: 10_000,
+            cache_enabled: true,
             cache_domain_filter_mode: "off".to_string(),
             cache_domain_whitelist: String::new(),
             cache_domain_blacklist: String::new(),
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: String::new(),
+            strm_url_mapping_enabled: true,
             connectivity_check_enabled: true,
             connectivity_check_interval_seconds: 60,
             connectivity_check_timeout_seconds: 5,
@@ -566,12 +653,14 @@ mod tests {
             port: 18096,
             cache_ttl_seconds: 180,
             cache_max_capacity: 10_000,
+            cache_enabled: true,
             cache_domain_filter_mode: "off".to_string(),
             cache_domain_whitelist: String::new(),
             cache_domain_blacklist: String::new(),
             enable_internal_redirect: true,
             internal_redirect_timeout_seconds: 0,
             strm_url_mappings: String::new(),
+            strm_url_mapping_enabled: true,
             connectivity_check_enabled: true,
             connectivity_check_interval_seconds: 60,
             connectivity_check_timeout_seconds: 5,
@@ -593,12 +682,14 @@ mod tests {
             port: 18096,
             cache_ttl_seconds: 180,
             cache_max_capacity: 10_000,
+            cache_enabled: true,
             cache_domain_filter_mode: "off".to_string(),
             cache_domain_whitelist: String::new(),
             cache_domain_blacklist: String::new(),
             enable_internal_redirect: false,
             internal_redirect_timeout_seconds: 15,
             strm_url_mappings: "https://openlist.example.test => http://localhost:5244".to_string(),
+            strm_url_mapping_enabled: true,
             connectivity_check_enabled: true,
             connectivity_check_interval_seconds: 60,
             connectivity_check_timeout_seconds: 5,
@@ -609,5 +700,47 @@ mod tests {
         config.normalize_and_validate().unwrap();
 
         assert_eq!(config.strm_url_mapping_rules.len(), 1);
+    }
+
+    #[test]
+    fn config_defaults_feature_switches_to_enabled() {
+        let mut value = serde_json::to_value(Config::default_runtime()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("cache_enabled");
+        object.remove("strm_url_mapping_enabled");
+
+        let config: Config = serde_json::from_value(value).unwrap();
+
+        assert!(config.cache_enabled);
+        assert!(config.strm_url_mapping_enabled);
+    }
+
+    #[test]
+    fn trusted_proxy_cidrs_are_validated_and_normalized() {
+        let (normalized, networks) =
+            normalize_trusted_proxy_cidrs(" 192.0.2.9, 10.0.0.42/8\n2001:db8::7/32\n192.0.2.9 ")
+                .unwrap();
+
+        assert_eq!(normalized, "192.0.2.9/32\n10.0.0.0/8\n2001:db8::/32");
+        assert_eq!(networks.len(), 3);
+        assert!(networks[1].contains(&"10.20.30.40".parse::<IpAddr>().unwrap()));
+        assert!(normalize_trusted_proxy_cidrs("10.0.0.0/99").is_err());
+        assert!(normalize_trusted_proxy_cidrs("not-an-address").is_err());
+    }
+
+    #[test]
+    fn server_config_defaults_web_ui_block_to_disabled() {
+        let server: EmbyServerConfig = toml::from_str(
+            r#"
+id = "server-1"
+name = "Server 1"
+emby_host = "http://emby.test:8096"
+emby_api_key = "key"
+port = 18096
+"#,
+        )
+        .unwrap();
+
+        assert!(!server.block_web_ui);
     }
 }

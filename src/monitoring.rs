@@ -1,11 +1,18 @@
 use axum::{
     Json,
+    body::Body,
     extract::{Query, State},
-    http::{HeaderMap, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
+use std::{
+    future::Future,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 use sysinfo::{Disks, System};
+use tokio::task::JoinSet;
 
 use crate::{
     AppState, PROJECT_NAME,
@@ -13,12 +20,16 @@ use crate::{
     app_version, auth,
     config::Config,
     emby::{MediaOverview, PlaybackSession},
-    error::AppResult,
-    error::safe_error_message,
+    error::{AppError, AppResult, safe_error_message},
     management_listen_addr, tz_offset_seconds,
 };
 
-#[derive(Debug, Serialize)]
+const SERVER_QUERY_CONCURRENCY_LIMIT: usize = 4;
+const SERVER_HEALTH_CACHE_TTL: Duration = Duration::from_secs(5);
+
+static SERVER_HEALTH_CACHE: OnceLock<Mutex<Option<(Instant, ServerHealth)>>> = OnceLock::new();
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ServerHealth {
     pub uptime_seconds: u64,
     pub cpu_percent: u8,
@@ -71,6 +82,12 @@ pub struct BlockLogQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PlaybackImageQuery {
+    server_id: String,
+    item_id: String,
+}
+
 pub async fn media_overview(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -79,8 +96,16 @@ pub async fn media_overview(
     let config = state.config.read().await.clone();
     let configs = playback_configs(&config);
     let mut overviews = Vec::new();
-    for config in configs {
-        match crate::emby::get_media_overview(&state.client, &config).await {
+    let client = state.client.clone();
+    let queries = configs.into_iter().map(move |config| {
+        let client = client.clone();
+        async move {
+            let result = crate::emby::get_media_overview(&client, &config).await;
+            (config, result)
+        }
+    });
+    for (config, result) in collect_server_queries(queries).await {
+        match result {
             Ok(mut overview) => {
                 let (server_id, server_name) = server_label(&config);
                 overview.server_id = server_id;
@@ -116,10 +141,50 @@ pub async fn list_playback_sessions(
     let config = state.config.read().await.clone();
     let configs = playback_configs(&config);
     let mut sessions = Vec::new();
-    for config in configs {
-        match crate::emby::get_active_playback_sessions(&state.client, &config).await {
+    let client = state.client.clone();
+    let query_client = client.clone();
+    let queries = configs.into_iter().map(move |config| {
+        let client = query_client.clone();
+        async move {
+            let result = crate::emby::get_active_playback_sessions(&client, &config).await;
+            (config, result)
+        }
+    });
+    for (config, result) in collect_server_queries(queries).await {
+        match result {
             Ok(mut server_sessions) => {
                 for session in &mut server_sessions {
+                    if !session.transcoding {
+                        let actual_mode = {
+                            let mut playback_paths = state.playback_paths.lock().await;
+                            playback_paths.lookup(
+                                &session.server_id,
+                                &session.item_id,
+                                session.device_id.as_deref(),
+                                session.media_source_id.as_deref(),
+                            )
+                        };
+                        if let Some(actual_mode) = actual_mode {
+                            session.playback_mode = actual_mode.to_string();
+                        } else if matches!(
+                            session.playback_mode.as_str(),
+                            "emby_direct_play" | "emby_direct_stream"
+                        ) && let Some(inferred_mode) =
+                            infer_untracked_playback_mode(&client, &config, session).await
+                        {
+                            {
+                                let mut playback_paths = state.playback_paths.lock().await;
+                                playback_paths.record(
+                                    &session.server_id,
+                                    &session.item_id,
+                                    session.device_id.as_deref(),
+                                    session.media_source_id.as_deref(),
+                                    inferred_mode,
+                                );
+                            }
+                            session.playback_mode = inferred_mode.to_string();
+                        }
+                    }
                     if let Some(ip) = session.playback_ip.as_deref() {
                         session.ip_location = state.ip_location.lookup(ip).await;
                     }
@@ -154,6 +219,101 @@ pub async fn list_playback_sessions(
         }
     }
     Ok(Json(sessions))
+}
+
+async fn infer_untracked_playback_mode(
+    client: &reqwest::Client,
+    config: &Config,
+    session: &PlaybackSession,
+) -> Option<&'static str> {
+    let media_path = crate::emby::get_media_path(
+        client,
+        config,
+        &session.item_id,
+        session.media_source_id.as_deref(),
+        &session.user_agent,
+    )
+    .await
+    .ok()??;
+
+    Some(if crate::media_path_uses_direct_link(config, &media_path) {
+        crate::PLAYBACK_MODE_DIRECT_LINK
+    } else {
+        crate::PLAYBACK_MODE_SERVER_PROXY
+    })
+}
+
+pub async fn playback_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PlaybackImageQuery>,
+) -> AppResult<Response> {
+    auth::require_auth(&state, &headers).await?;
+    if !is_valid_item_id(&query.item_id) {
+        return Err(AppError::Validation("invalid item_id".to_string()));
+    }
+
+    let root_config = state.config.read().await.clone();
+    let Some(config) = playback_config_by_server_id(&root_config, &query.server_id) else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let mut url = config.emby_url(&format!("/Items/{}/Images/Primary", query.item_id))?;
+    url.query_pairs_mut()
+        .append_pair("maxWidth", "640")
+        .append_pair("quality", "90");
+
+    let upstream = state
+        .client
+        .get(url)
+        .header("X-Emby-Token", &config.emby_api_key)
+        .send()
+        .await?;
+    if upstream.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    if !upstream.status().is_success() {
+        return Err(AppError::BadGateway(format!(
+            "Emby playback image query failed with status {}",
+            upstream.status()
+        )));
+    }
+
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .filter(|value| {
+            value
+                .to_str()
+                .is_ok_and(|value| value.trim().to_ascii_lowercase().starts_with("image/"))
+        })
+        .cloned()
+        .ok_or_else(|| {
+            AppError::BadGateway(
+                "Emby playback image returned a non-image content type".to_string(),
+            )
+        })?;
+    let content_length = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .cloned();
+    let etag = upstream.headers().get(reqwest::header::ETAG).cloned();
+
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "private, max-age=300")
+        .header("x-content-type-options", "nosniff");
+    if let Some(content_length) = content_length {
+        builder = builder.header(header::CONTENT_LENGTH, content_length);
+    }
+    if let Some(etag) = etag {
+        builder = builder.header(header::ETAG, etag);
+    }
+    builder
+        .body(Body::from_stream(upstream.bytes_stream()))
+        .map_err(|err| {
+            AppError::Internal(format!("failed to build playback image response: {err}"))
+        })
 }
 
 pub async fn list_activity_logs(
@@ -392,11 +552,51 @@ async fn record_runtime_info(state: &AppState) {
     }
 }
 
+async fn collect_server_queries<I, F, T>(futures: I) -> Vec<T>
+where
+    I: IntoIterator<Item = F>,
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut pending = futures.into_iter().enumerate();
+    let mut tasks = JoinSet::new();
+    for _ in 0..SERVER_QUERY_CONCURRENCY_LIMIT {
+        let Some((index, future)) = pending.next() else {
+            break;
+        };
+        tasks.spawn(async move { (index, future.await) });
+    }
+
+    let mut results = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        if let Some((index, future)) = pending.next() {
+            tasks.spawn(async move { (index, future.await) });
+        }
+        match result {
+            Ok(result) => results.push(result),
+            Err(err) => tracing::error!(error = %err, "monitoring server query task failed"),
+        }
+    }
+    results.sort_unstable_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
+}
+
 pub async fn server_health(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<ServerHealth>> {
     auth::require_auth(&state, &headers).await?;
+    let cache = SERVER_HEALTH_CACHE.get_or_init(|| Mutex::new(None));
+    if let Some(health) = cache
+        .lock()
+        .expect("server health cache mutex poisoned")
+        .as_ref()
+        .filter(|(updated_at, _)| updated_at.elapsed() < SERVER_HEALTH_CACHE_TTL)
+        .map(|(_, health)| health.clone())
+    {
+        return Ok(Json(health));
+    }
+
     let mut system = System::new_all();
     system.refresh_all();
     let disks = Disks::new_with_refreshed_list();
@@ -414,7 +614,7 @@ pub async fn server_health(
         .map(|cpu| cpu.brand().to_string())
         .unwrap_or_else(|| "CPU".to_string());
 
-    Ok(Json(ServerHealth {
+    let health = ServerHealth {
         uptime_seconds: System::uptime(),
         cpu_percent,
         cpu_name,
@@ -425,7 +625,10 @@ pub async fn server_health(
         disk_used_bytes: used_disk,
         disk_total_bytes: total_disk,
         disk_percent: percent(used_disk, total_disk),
-    }))
+    };
+    *cache.lock().expect("server health cache mutex poisoned") =
+        Some((Instant::now(), health.clone()));
+    Ok(Json(health))
 }
 
 fn playback_configs(config: &Config) -> Vec<Config> {
@@ -435,6 +638,25 @@ fn playback_configs(config: &Config) -> Vec<Config> {
     } else {
         configs
     }
+}
+
+fn playback_config_by_server_id(config: &Config, server_id: &str) -> Option<Config> {
+    if config.servers.is_empty() {
+        return (server_id == "default").then(|| config.clone());
+    }
+    config
+        .servers
+        .iter()
+        .find(|server| server.id == server_id)
+        .map(|server| config.proxy_config_for_server(Some(&server.id)))
+}
+
+fn is_valid_item_id(item_id: &str) -> bool {
+    !item_id.is_empty()
+        && item_id.len() <= 128
+        && item_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn server_label(config: &Config) -> (String, String) {
@@ -464,4 +686,19 @@ fn local_date() -> String {
         .unwrap_or(8 * 3600);
     let now = chrono::Utc::now() + chrono::Duration::seconds(offset.into());
     now.format("%Y-%m-%d").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_item_id;
+
+    #[test]
+    fn playback_image_item_id_validation_is_strict() {
+        assert!(is_valid_item_id("item-123_ABC"));
+        assert!(is_valid_item_id(&"a".repeat(128)));
+        assert!(!is_valid_item_id(""));
+        assert!(!is_valid_item_id(&"a".repeat(129)));
+        assert!(!is_valid_item_id("item/123"));
+        assert!(!is_valid_item_id("媒体-123"));
+    }
 }

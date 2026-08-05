@@ -7,6 +7,13 @@ pub fn is_base_html_player(path: &str) -> bool {
     path.ends_with("/basehtmlplayer.js")
 }
 
+pub fn is_web_ui_path(path: &str) -> bool {
+    path.trim_start_matches('/')
+        .split('/')
+        .next()
+        .is_some_and(|segment| segment.eq_ignore_ascii_case("web"))
+}
+
 pub fn is_system_info(path: &str) -> bool {
     path.to_ascii_lowercase().ends_with("/system/info")
 }
@@ -168,6 +175,23 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn detects_only_web_ui_path_boundaries() {
+        for path in [
+            "/web",
+            "/web/",
+            "/web/index.html",
+            "/WEB/modules/app.js",
+            "//web/index.html",
+        ] {
+            assert!(is_web_ui_path(path), "expected Web UI path: {path}");
+        }
+
+        for path in ["/", "/webhook", "/websocket", "/api/web", "/emby/web"] {
+            assert!(!is_web_ui_path(path), "unexpected Web UI path: {path}");
+        }
+    }
 
     #[test]
     fn parses_item_ids_from_video_and_item_paths() {

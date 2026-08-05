@@ -5,17 +5,15 @@ use url::Url;
 use crate::error::{AppError, AppResult};
 
 pub async fn resolve_redirect_location(
+    client: &reqwest::Client,
     url: &str,
     timeout_seconds: u64,
     user_agent: &str,
 ) -> AppResult<String> {
     let parsed = Url::parse(url)?;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(timeout_seconds))
-        .build()?;
-
-    let mut request = client.get(parsed.clone());
+    let mut request = client
+        .get(parsed.clone())
+        .timeout(Duration::from_secs(timeout_seconds));
     if !user_agent.trim().is_empty() {
         request = request.header(reqwest::header::USER_AGENT, user_agent.trim());
     }

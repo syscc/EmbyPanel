@@ -3,7 +3,12 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
 };
 use argon2::Argon2;
-use axum::{Json, extract::State, http::HeaderMap};
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::{HeaderMap, header},
+    response::{IntoResponse, Response},
+};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -14,8 +19,10 @@ use crate::{
     config::Config,
     crypto_api::EncryptedRequest,
     error::{AppError, AppResult, safe_error_message},
-    file_log::{SystemLogConfig, normalize_config},
+    file_log::{SETTING_KEY as SYSTEM_LOG_SETTING_KEY, SystemLogConfig, normalize_config},
 };
+
+const CLIENT_CONTROL_SETTING_KEY: &str = "client_control";
 
 #[derive(Debug, Deserialize)]
 pub struct RestartProxyRequest {
@@ -76,6 +83,11 @@ pub struct ValidationResult {
     detail: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct EmbyApiKeyResponse {
+    api_key: String,
+}
+
 pub async fn get_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -86,6 +98,34 @@ pub async fn get_settings(
     )))
 }
 
+pub async fn reveal_emby_api_key(
+    State(state): State<AppState>,
+    Path(server_id): Path<String>,
+    headers: HeaderMap,
+) -> AppResult<Response> {
+    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let (server_name, api_key) = {
+        let config = state.config.read().await;
+        let server = config
+            .servers
+            .iter()
+            .find(|server| server.id == server_id)
+            .ok_or_else(|| AppError::Validation("server_id does not exist".to_string()))?;
+        (server.name.clone(), server.emby_api_key.clone())
+    };
+    state.settings_store.record_audit(
+        Some(admin_user_id),
+        "settings.reveal_emby_api_key",
+        &format!("查看服务器 {server_name} 的 Emby API Key"),
+        "success",
+    )?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(EmbyApiKeyResponse { api_key }),
+    )
+        .into_response())
+}
+
 pub async fn update_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -93,6 +133,7 @@ pub async fn update_settings(
 ) -> AppResult<Json<Config>> {
     let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
     let mut payload: Config = state.crypto_keys.decrypt_named(&request, "settings")?;
+    let _config_update = state.config_updates.lock().await;
     let existing = state.config.read().await.clone();
     for server in &mut payload.servers {
         if server.emby_api_key.trim().is_empty()
@@ -105,7 +146,7 @@ pub async fn update_settings(
         }
     }
     if !payload.servers.is_empty() && payload.emby_api_key.trim().is_empty() {
-        payload.emby_api_key = existing.emby_api_key;
+        payload.emby_api_key = existing.emby_api_key.clone();
     } else if payload.servers.is_empty() {
         payload.emby_host.clear();
         payload.emby_api_key.clear();
@@ -119,23 +160,19 @@ pub async fn update_settings(
         .trim()
         .is_empty()
     {
-        payload.openlist_token = existing.openlist_token;
+        payload.openlist_token = existing.openlist_token.clone();
     }
     payload
         .validate_for_storage()
-        .map_err(|err| AppError::Config(err.to_string()))?;
-    state.settings_store.save_config(&payload)?;
-    state.settings_store.record_audit(
+        .map_err(|err| AppError::Validation(err.safe_log_message()))?;
+    apply_runtime_config(&state, &existing, &payload).await?;
+    if let Err(err) = state.settings_store.record_audit(
         Some(admin_user_id),
         "settings.update",
         "保存服务器配置",
         "success",
-    )?;
-    *state.config.write().await = payload.clone();
-    *state.cache.write().await =
-        DirectLinkCache::new(payload.cache_ttl_seconds, payload.cache_max_capacity);
-    if let Some(proxy_manager) = state.proxy_manager.as_ref() {
-        proxy_manager.restart_all(state.clone()).await?;
+    ) {
+        tracing::error!(error = %err.safe_log_message(), "failed to record settings update audit");
     }
     Ok(Json(redact_config_secrets(payload)))
 }
@@ -155,12 +192,14 @@ pub async fn restart_proxy_server(
             .restart_server(state.clone(), server_id)
             .await?;
     }
-    state.settings_store.record_audit(
+    if let Err(err) = state.settings_store.record_audit(
         Some(admin_user_id),
         "settings.restart_proxy",
         &format!("重启反代服务器 {server_id}"),
         "success",
-    )?;
+    ) {
+        tracing::error!(error = %err.safe_log_message(), "failed to record proxy restart audit");
+    }
     Ok(Json(redact_config_secrets(
         state.config.read().await.clone(),
     )))
@@ -177,7 +216,9 @@ pub async fn toggle_proxy_server(
         return Err(AppError::Validation("server_id is required".to_string()));
     }
 
-    let mut config = state.config.read().await.clone();
+    let _config_update = state.config_updates.lock().await;
+    let existing = state.config.read().await.clone();
+    let mut config = existing.clone();
     let server_name = {
         let server = config
             .servers
@@ -190,20 +231,9 @@ pub async fn toggle_proxy_server(
     config
         .validate_for_storage()
         .map_err(|err| AppError::Config(err.to_string()))?;
-    state.settings_store.save_config(&config)?;
-    *state.config.write().await = config.clone();
+    apply_runtime_config(&state, &existing, &config).await?;
 
-    if let Some(proxy_manager) = state.proxy_manager.as_ref() {
-        if payload.enabled {
-            proxy_manager
-                .restart_server(state.clone(), server_id)
-                .await?;
-        } else {
-            proxy_manager.stop_server(server_id).await;
-        }
-    }
-
-    state.settings_store.record_audit(
+    if let Err(err) = state.settings_store.record_audit(
         Some(admin_user_id),
         "settings.toggle_proxy",
         &format!(
@@ -212,7 +242,9 @@ pub async fn toggle_proxy_server(
             server_name
         ),
         "success",
-    )?;
+    ) {
+        tracing::error!(error = %err.safe_log_message(), "failed to record proxy toggle audit");
+    }
     Ok(Json(redact_config_secrets(config)))
 }
 
@@ -233,6 +265,19 @@ pub async fn validate_settings(
         {
             server.emby_api_key = existing_server.emby_api_key.clone();
         }
+    }
+    if !payload.servers.is_empty() && payload.emby_api_key.trim().is_empty() {
+        payload.emby_api_key = existing.emby_api_key.clone();
+    }
+    if payload.openlist_addr.is_some()
+        && payload
+            .openlist_token
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+    {
+        payload.openlist_token = existing.openlist_token.clone();
     }
     let mut results = Vec::new();
     match payload.validate_for_storage() {
@@ -326,12 +371,14 @@ pub async fn update_log_config(
     let config = state
         .file_log
         .update_config(&state.settings_store, payload)?;
-    state.settings_store.record_audit(
+    if let Err(err) = state.settings_store.record_audit(
         Some(admin_user_id),
         "log_config.update",
         "保存日志配置",
         "success",
-    )?;
+    ) {
+        tracing::error!(error = %err.safe_log_message(), "failed to record log config audit");
+    }
     Ok(Json(config))
 }
 
@@ -375,36 +422,182 @@ pub async fn import_backup(
     backup
         .runtime_config
         .validate_for_storage()
-        .map_err(|err| AppError::Config(err.to_string()))?;
-    state.settings_store.save_config(&backup.runtime_config)?;
-    if let Some(client_control) = backup.client_control {
-        state
+        .map_err(|err| AppError::Validation(err.safe_log_message()))?;
+    let _config_update = state.config_updates.lock().await;
+    let existing = state.config.read().await.clone();
+    let previous_client_control = state
+        .settings_store
+        .load_setting_json::<serde_json::Value>(CLIENT_CONTROL_SETTING_KEY)?;
+    let previous_log_setting = state
+        .settings_store
+        .load_setting_json::<serde_json::Value>(SYSTEM_LOG_SETTING_KEY)?;
+    let previous_log_config = state.file_log.config();
+    let mut client_control_applied = false;
+    let mut log_config_applied = false;
+
+    if let Some(client_control) = backup.client_control.as_ref() {
+        if let Err(err) = state
             .settings_store
-            .save_setting_json("client_control", &client_control)?;
+            .save_setting_json(CLIENT_CONTROL_SETTING_KEY, client_control)
+        {
+            return Err(err);
+        }
+        client_control_applied = true;
     }
-    if let Some(log_config) = backup.system_log_config.take() {
-        let _ = state
+    if let Some(log_config) = backup.system_log_config.as_ref() {
+        if let Err(err) = state
             .file_log
-            .update_config(&state.settings_store, normalize_config(log_config))?;
+            .update_config(&state.settings_store, normalize_config(log_config.clone()))
+        {
+            rollback_backup_auxiliary_settings(
+                &state,
+                previous_client_control.as_ref(),
+                previous_log_setting.as_ref(),
+                &previous_log_config,
+                client_control_applied,
+                false,
+            )?;
+            return Err(err);
+        }
+        log_config_applied = true;
     }
-    *state.config.write().await = backup.runtime_config.clone();
-    *state.cache.write().await = DirectLinkCache::new(
-        backup.runtime_config.cache_ttl_seconds,
-        backup.runtime_config.cache_max_capacity,
-    );
-    if let Some(proxy_manager) = state.proxy_manager.as_ref() {
-        proxy_manager.restart_all(state.clone()).await?;
+    if let Err(err) = apply_runtime_config(&state, &existing, &backup.runtime_config).await {
+        if let Err(rollback_error) = rollback_backup_auxiliary_settings(
+            &state,
+            previous_client_control.as_ref(),
+            previous_log_setting.as_ref(),
+            &previous_log_config,
+            client_control_applied,
+            log_config_applied,
+        ) {
+            tracing::error!(
+                import_error = %err.safe_log_message(),
+                rollback_error = %rollback_error.safe_log_message(),
+                "failed to rollback auxiliary backup settings"
+            );
+            return Err(AppError::Internal(
+                "backup import failed and auxiliary settings could not be restored".to_string(),
+            ));
+        }
+        return Err(err);
     }
-    state.settings_store.record_audit(
+    if let Err(err) = state.settings_store.record_audit(
         Some(admin_user_id),
         "backup.import",
         "还原配置文件",
         "success",
-    )?;
+    ) {
+        tracing::error!(error = %err.safe_log_message(), "failed to record backup import audit");
+    }
     Ok(Json(redact_config_secrets(backup.runtime_config)))
 }
 
+fn rollback_backup_auxiliary_settings(
+    state: &AppState,
+    previous_client_control: Option<&serde_json::Value>,
+    previous_log_setting: Option<&serde_json::Value>,
+    previous_log_config: &SystemLogConfig,
+    restore_client_control: bool,
+    restore_log_config: bool,
+) -> AppResult<()> {
+    let mut first_error = None;
+    if restore_client_control
+        && let Err(err) = restore_setting_snapshot(
+            &state.settings_store,
+            CLIENT_CONTROL_SETTING_KEY,
+            previous_client_control,
+        )
+    {
+        first_error = Some(err);
+    }
+    if restore_log_config {
+        if let Err(err) = state
+            .file_log
+            .update_config(&state.settings_store, previous_log_config.clone())
+            && first_error.is_none()
+        {
+            first_error = Some(err);
+        }
+        if let Err(err) = restore_setting_snapshot(
+            &state.settings_store,
+            SYSTEM_LOG_SETTING_KEY,
+            previous_log_setting,
+        ) && first_error.is_none()
+        {
+            first_error = Some(err);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn restore_setting_snapshot(
+    settings_store: &crate::db::SettingsStore,
+    key: &str,
+    previous: Option<&serde_json::Value>,
+) -> AppResult<()> {
+    match previous {
+        Some(value) => settings_store.save_setting_json(key, value),
+        None => settings_store.delete_setting(key),
+    }
+}
+
+async fn apply_runtime_config(state: &AppState, previous: &Config, next: &Config) -> AppResult<()> {
+    state.settings_store.save_config(next)?;
+    install_runtime_config(state, next).await;
+
+    let Some(proxy_manager) = state.proxy_manager.as_ref() else {
+        return Ok(());
+    };
+    let Err(reconcile_error) = proxy_manager.ensure_running(state.clone()).await else {
+        return Ok(());
+    };
+
+    install_runtime_config(state, previous).await;
+    if let Err(rollback_error) = state.settings_store.save_config(previous) {
+        install_runtime_config(state, next).await;
+        if let Err(recovery_error) = proxy_manager.ensure_running(state.clone()).await {
+            tracing::error!(
+                reconcile_error = %reconcile_error.safe_log_message(),
+                recovery_error = %recovery_error.safe_log_message(),
+                "failed to reconcile listeners with persisted proxy configuration"
+            );
+        }
+        tracing::error!(
+            reconcile_error = %reconcile_error.safe_log_message(),
+            rollback_error = %rollback_error.safe_log_message(),
+            "failed to rollback persisted proxy configuration"
+        );
+        return Err(AppError::Internal(
+            "proxy configuration failed and persisted rollback also failed".to_string(),
+        ));
+    }
+    if let Err(restore_error) = proxy_manager.ensure_running(state.clone()).await {
+        tracing::error!(
+            reconcile_error = %reconcile_error.safe_log_message(),
+            restore_error = %restore_error.safe_log_message(),
+            "failed to restore previous proxy listeners"
+        );
+        return Err(AppError::Internal(
+            "proxy configuration failed and previous listeners could not be restored".to_string(),
+        ));
+    }
+    Err(reconcile_error)
+}
+
+async fn install_runtime_config(state: &AppState, config: &Config) {
+    *state.config.write().await = config.clone();
+    *state.cache.write().await = DirectLinkCache::new(
+        config.cache_enabled,
+        config.cache_ttl_seconds,
+        config.cache_max_capacity,
+    );
+}
+
 fn redact_config_secrets(mut config: Config) -> Config {
+    config.emby_api_key.clear();
+    for server in &mut config.servers {
+        server.emby_api_key.clear();
+    }
     config.openlist_token = None;
     config
 }
@@ -430,7 +623,7 @@ fn err_result(scope: &str, message: &str, detail: &str) -> ValidationResult {
 fn backup_client_control_config(state: &AppState) -> AppResult<Option<serde_json::Value>> {
     let config = state
         .settings_store
-        .load_setting_json::<ClientControlConfig>("client_control")?;
+        .load_setting_json::<ClientControlConfig>(CLIENT_CONTROL_SETTING_KEY)?;
     backup_client_control_value(config)
 }
 
@@ -562,6 +755,38 @@ mod tests {
         let err = decrypt_backup("wrong-password", &backup).unwrap_err();
 
         assert!(err.to_string().contains("backup password is invalid"));
+    }
+
+    #[test]
+    fn settings_responses_redact_all_runtime_secrets() {
+        let mut config = Config::default_runtime();
+        config.emby_api_key = "top-level-key".to_string();
+        config.openlist_addr = Some("https://openlist.example.test".to_string());
+        config.openlist_token = Some("openlist-token".to_string());
+        config.servers.push(crate::config::EmbyServerConfig {
+            id: "server-a".to_string(),
+            name: "Server A".to_string(),
+            emby_host: "https://emby.example.test".to_string(),
+            emby_api_key: "server-key".to_string(),
+            port: 18096,
+            enabled: true,
+            block_web_ui: false,
+            real_ip_mode: "auto".to_string(),
+            real_ip_header: String::new(),
+            trusted_proxy_cidrs: String::new(),
+            trusted_proxy_networks: Vec::new(),
+        });
+
+        let redacted = redact_config_secrets(config);
+
+        assert!(redacted.emby_api_key.is_empty());
+        assert!(
+            redacted
+                .servers
+                .iter()
+                .all(|server| server.emby_api_key.is_empty())
+        );
+        assert!(redacted.openlist_token.is_none());
     }
 
     #[test]

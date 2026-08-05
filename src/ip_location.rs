@@ -1,10 +1,15 @@
 use std::{
+    env,
+    fmt::Write as _,
     net::IpAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
 use crate::{
@@ -13,7 +18,13 @@ use crate::{
 };
 
 const IPDB_FILE_NAME: &str = "qqwry.ipdb";
-const IPDB_DOWNLOAD_URL: &str = "https://cdn.1008.site/gh/nmgliangwei/qqwry.ipdb@main/qqwry.ipdb";
+const DEFAULT_IPDB_DOWNLOAD_URL: &str =
+    "https://raw.githubusercontent.com/nmgliangwei/qqwry.ipdb/main/qqwry.ipdb";
+const DEFAULT_IPDB_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const IPDB_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const IPDB_URL_ENV: &str = "EMBYPANEL_IPDB_URL";
+const IPDB_MAX_BYTES_ENV: &str = "EMBYPANEL_IPDB_MAX_BYTES";
+const IPDB_SHA256_ENV: &str = "EMBYPANEL_IPDB_SHA256";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct IpLocation {
@@ -151,22 +162,136 @@ async fn ensure_ipdb_file(client: &reqwest::Client, path: &Path) -> AppResult<()
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let response = client
-        .get(IPDB_DOWNLOAD_URL)
+    let url = configured_ipdb_url()?;
+    let max_bytes = configured_ipdb_max_bytes()?;
+    let expected_sha256 = configured_ipdb_sha256()?;
+    let mut response = client
+        .get(url)
+        .timeout(IPDB_DOWNLOAD_TIMEOUT)
         .send()
         .await?
         .error_for_status()?;
-    let bytes = response.bytes().await?;
-    if bytes.is_empty() {
+    if response.status().is_redirection() {
         return Err(AppError::BadGateway(
-            "downloaded IP database is empty".to_string(),
+            "IP database download returned an unexpected redirect".to_string(),
         ));
     }
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > max_bytes)
+    {
+        return Err(AppError::BadGateway(format!(
+            "IP database exceeds the configured {max_bytes} byte limit"
+        )));
+    }
+
     let temp_path = path.with_extension("ipdb.tmp");
-    tokio::fs::write(&temp_path, &bytes).await?;
-    tokio::fs::rename(&temp_path, path).await?;
-    tracing::info!(path = %path.display(), bytes = bytes.len(), "IP database downloaded");
+    let download_result = async {
+        let mut file = tokio::fs::File::create(&temp_path).await?;
+        let mut hasher = Sha256::new();
+        let mut downloaded = 0_u64;
+        while let Some(chunk) = response.chunk().await? {
+            downloaded = downloaded
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| AppError::BadGateway("IP database is too large".to_string()))?;
+            if downloaded > max_bytes {
+                return Err(AppError::BadGateway(format!(
+                    "IP database exceeds the configured {max_bytes} byte limit"
+                )));
+            }
+            file.write_all(&chunk).await?;
+            hasher.update(&chunk);
+        }
+        file.flush().await?;
+        if downloaded == 0 {
+            return Err(AppError::BadGateway(
+                "downloaded IP database is empty".to_string(),
+            ));
+        }
+        Ok((downloaded, sha256_hex(&hasher.finalize())))
+    }
+    .await;
+    let (downloaded, actual_sha256) = match download_result {
+        Ok(result) => result,
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(err);
+        }
+    };
+    if expected_sha256
+        .as_deref()
+        .is_some_and(|expected| expected != actual_sha256)
+    {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(AppError::BadGateway(
+            "downloaded IP database SHA-256 does not match".to_string(),
+        ));
+    }
+    if let Err(err) = ipdb::Reader::open_file(&temp_path) {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(AppError::BadGateway(format!(
+            "downloaded IP database is invalid: {err}"
+        )));
+    }
+    if let Err(err) = tokio::fs::rename(&temp_path, path).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(err.into());
+    }
+    tracing::info!(path = %path.display(), bytes = downloaded, "IP database downloaded");
     Ok(())
+}
+
+fn configured_ipdb_url() -> AppResult<reqwest::Url> {
+    let value = env::var(IPDB_URL_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_IPDB_DOWNLOAD_URL.to_string());
+    let url = reqwest::Url::parse(value.trim())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(AppError::Config(format!(
+            "{IPDB_URL_ENV} must use http or https"
+        )));
+    }
+    Ok(url)
+}
+
+fn configured_ipdb_max_bytes() -> AppResult<u64> {
+    let Some(value) = env::var(IPDB_MAX_BYTES_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(DEFAULT_IPDB_MAX_BYTES);
+    };
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| AppError::Config(format!("{IPDB_MAX_BYTES_ENV} must be a positive integer")))
+}
+
+fn configured_ipdb_sha256() -> AppResult<Option<String>> {
+    let Some(value) = env::var(IPDB_SHA256_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::Config(format!(
+            "{IPDB_SHA256_ENV} must contain 64 hexadecimal characters"
+        )));
+    }
+    Ok(Some(value))
+}
+
+fn sha256_hex(digest: &[u8]) -> String {
+    let mut value = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(&mut value, "{byte:02x}");
+    }
+    value
 }
 
 #[cfg(test)]

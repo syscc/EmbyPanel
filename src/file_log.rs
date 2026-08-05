@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -42,7 +42,13 @@ impl Default for SystemLogConfig {
 
 pub struct FileLogStore {
     path: PathBuf,
-    config: Mutex<SystemLogConfig>,
+    state: Mutex<FileLogState>,
+}
+
+struct FileLogState {
+    config: SystemLogConfig,
+    file: Option<File>,
+    size: u64,
 }
 
 impl FileLogStore {
@@ -55,16 +61,25 @@ impl FileLogStore {
             .unwrap_or_default();
         let dir = db::data_dir().join("logs");
         let _ = fs::create_dir_all(&dir);
+        let path = dir.join("embypanel.log");
+        let size = fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         Self {
-            path: dir.join("embypanel.log"),
-            config: Mutex::new(config),
+            path,
+            state: Mutex::new(FileLogState {
+                config,
+                file: None,
+                size,
+            }),
         }
     }
 
     pub fn config(&self) -> SystemLogConfig {
-        self.config
+        self.state
             .lock()
-            .expect("file log config mutex poisoned")
+            .expect("file log state mutex poisoned")
+            .config
             .clone()
     }
 
@@ -75,52 +90,71 @@ impl FileLogStore {
     ) -> AppResult<SystemLogConfig> {
         let config = normalize_config(config);
         settings_store.save_setting_json(SETTING_KEY, &config)?;
-        *self.config.lock().expect("file log config mutex poisoned") = config.clone();
+        self.state
+            .lock()
+            .expect("file log state mutex poisoned")
+            .config = config.clone();
         Ok(config)
     }
 
     pub fn write(&self, level: &str, message: &str, detail: &str) {
-        let config = self.config();
-        if !level_enabled(level, &config) {
+        let mut state = self.state.lock().expect("file log state mutex poisoned");
+        if !level_enabled(level, &state.config) {
             return;
         }
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = self.rotate_if_needed(&config);
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
-            let line = render_line(&config, level, message, detail);
-            let _ = writeln!(file, "{line}");
-        }
-    }
-
-    fn rotate_if_needed(&self, config: &SystemLogConfig) -> std::io::Result<()> {
-        let max_bytes = config.max_size_mb.max(1) * 1024 * 1024;
-        if fs::metadata(&self.path)
-            .map(|metadata| metadata.len() < max_bytes)
-            .unwrap_or(true)
-        {
-            return Ok(());
-        }
-        let max_backups = config.max_backups.clamp(1, 99);
-        for index in (1..=max_backups).rev() {
-            let from = backup_path(&self.path, index);
-            let to = backup_path(&self.path, index + 1);
-            if index == max_backups {
-                let _ = fs::remove_file(&from);
-            } else if from.exists() {
-                let _ = fs::rename(&from, &to);
+        let max_bytes = state.config.max_size_mb.max(1) * 1024 * 1024;
+        if state.size >= max_bytes {
+            state.file.take();
+            if rotate_log_files(&self.path, state.config.max_backups).is_ok() {
+                state.size = 0;
+            } else {
+                state.size = fs::metadata(&self.path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
             }
         }
-        if self.path.exists() {
-            fs::rename(&self.path, backup_path(&self.path, 1))?;
+        if state.file.is_none() {
+            state.file = open_log_file(&self.path).ok();
         }
-        Ok(())
+        let mut line = render_line(&state.config, level, message, detail);
+        line.push('\n');
+        let written = state
+            .file
+            .as_mut()
+            .is_some_and(|file| file.write_all(line.as_bytes()).is_ok());
+        if written {
+            state.size = state.size.saturating_add(line.len() as u64);
+        } else {
+            state.file = None;
+            state.size = fs::metadata(&self.path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+        }
     }
+}
+
+fn open_log_file(path: &Path) -> std::io::Result<File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
+fn rotate_log_files(path: &Path, max_backups: u64) -> std::io::Result<()> {
+    let max_backups = max_backups.clamp(1, 99);
+    for index in (1..=max_backups).rev() {
+        let from = backup_path(path, index);
+        let to = backup_path(path, index + 1);
+        if index == max_backups {
+            let _ = fs::remove_file(&from);
+        } else if from.exists() {
+            let _ = fs::rename(&from, &to);
+        }
+    }
+    if path.exists() {
+        fs::rename(path, backup_path(path, 1))?;
+    }
+    Ok(())
 }
 
 fn backup_path(path: &Path, index: u64) -> PathBuf {

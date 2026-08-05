@@ -32,6 +32,7 @@ pub async fn get_media_path(
     config: &Config,
     item_id: &str,
     media_source_id: Option<&str>,
+    user_agent: &str,
 ) -> AppResult<Option<String>> {
     let mut url = config.emby_url("/Items")?;
     url.query_pairs_mut()
@@ -39,7 +40,11 @@ pub async fn get_media_path(
         .append_pair("Fields", "Path,MediaSources")
         .append_pair("api_key", &config.emby_api_key);
 
-    let response = client.get(url).send().await?;
+    let mut request = client.get(url);
+    if !user_agent.trim().is_empty() {
+        request = request.header(reqwest::header::USER_AGENT, user_agent);
+    }
+    let response = request.send().await?;
     if !response.status().is_success() {
         return Err(AppError::BadGateway(format!(
             "Emby item query failed with status {}",
@@ -69,6 +74,13 @@ pub struct PlaybackSession {
     pub server_name: String,
     pub id: String,
     pub item_id: String,
+    pub series_id: Option<String>,
+    pub season_number: Option<i32>,
+    pub episode_number: Option<i32>,
+    pub item_type: Option<String>,
+    pub media_source_id: Option<String>,
+    #[serde(skip_serializing)]
+    pub(crate) device_id: Option<String>,
     pub user_name: String,
     pub client: String,
     pub device_name: String,
@@ -81,6 +93,7 @@ pub struct PlaybackSession {
     pub runtime_ticks: Option<i64>,
     pub percent: Option<u8>,
     pub play_method: Option<String>,
+    pub playback_mode: String,
     pub transcoding: bool,
 }
 
@@ -182,10 +195,18 @@ struct SessionResponse {
 struct NowPlayingItem {
     #[serde(rename = "Id")]
     id: Option<String>,
+    #[serde(rename = "SeriesId")]
+    series_id: Option<String>,
     #[serde(rename = "Name")]
     name: Option<String>,
     #[serde(rename = "SeriesName")]
     series_name: Option<String>,
+    #[serde(rename = "ParentIndexNumber")]
+    season_number: Option<i32>,
+    #[serde(rename = "IndexNumber")]
+    episode_number: Option<i32>,
+    #[serde(rename = "Type")]
+    item_type: Option<String>,
     #[serde(rename = "RunTimeTicks")]
     runtime_ticks: Option<i64>,
 }
@@ -196,6 +217,8 @@ struct PlayState {
     position_ticks: Option<i64>,
     #[serde(rename = "PlayMethod")]
     play_method: Option<String>,
+    #[serde(rename = "MediaSourceId")]
+    media_source_id: Option<String>,
 }
 
 pub async fn get_active_playback_sessions(
@@ -223,11 +246,29 @@ pub async fn get_active_playback_sessions(
             let play_state = session.play_state;
             let runtime_ticks = item.runtime_ticks;
             let position_ticks = play_state.as_ref().and_then(|state| state.position_ticks);
+            let play_method = play_state
+                .as_ref()
+                .and_then(|state| state.play_method.clone());
+            let media_source_id = play_state
+                .as_ref()
+                .and_then(|state| state.media_source_id.clone());
+            let device_id = session.device_id.clone();
+            let transcoding = session.transcoding_info.is_some()
+                || play_method
+                    .as_deref()
+                    .is_some_and(|method| method.eq_ignore_ascii_case("Transcode"));
+            let playback_mode = emby_playback_mode(play_method.as_deref(), transcoding).to_string();
             Some(PlaybackSession {
                 server_id: server_id.clone(),
                 server_name: server_name.clone(),
                 id: session.id.unwrap_or_default(),
                 item_id: item.id.unwrap_or_default(),
+                series_id: item.series_id,
+                season_number: item.season_number,
+                episode_number: item.episode_number,
+                item_type: item.item_type,
+                media_source_id,
+                device_id,
                 user_name: session.user_name.unwrap_or_else(|| "Unknown".to_string()),
                 client: session
                     .client
@@ -246,11 +287,24 @@ pub async fn get_active_playback_sessions(
                 position_ticks,
                 runtime_ticks,
                 percent: playback_percent(position_ticks, runtime_ticks),
-                play_method: play_state.and_then(|state| state.play_method),
-                transcoding: session.transcoding_info.is_some(),
+                play_method,
+                playback_mode,
+                transcoding,
             })
         })
         .collect())
+}
+
+fn emby_playback_mode(play_method: Option<&str>, transcoding: bool) -> &'static str {
+    if transcoding || play_method.is_some_and(|method| method.eq_ignore_ascii_case("Transcode")) {
+        return "transcode";
+    }
+
+    match play_method.map(str::trim) {
+        Some(method) if method.eq_ignore_ascii_case("DirectPlay") => "emby_direct_play",
+        Some(method) if method.eq_ignore_ascii_case("DirectStream") => "emby_direct_stream",
+        _ => "unknown",
+    }
 }
 
 pub async fn get_user_name_by_device_id(
@@ -618,4 +672,24 @@ fn playback_percent(position_ticks: Option<i64>, runtime_ticks: Option<i64>) -> 
         return None;
     }
     Some(((position_ticks as f64 / runtime_ticks as f64) * 100.0).clamp(0.0, 100.0) as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::emby_playback_mode;
+
+    #[test]
+    fn playback_mode_normalizes_emby_methods_and_transcoding() {
+        assert_eq!(
+            emby_playback_mode(Some("DirectPlay"), false),
+            "emby_direct_play"
+        );
+        assert_eq!(
+            emby_playback_mode(Some("DirectStream"), false),
+            "emby_direct_stream"
+        );
+        assert_eq!(emby_playback_mode(Some("Transcode"), false), "transcode");
+        assert_eq!(emby_playback_mode(Some("DirectPlay"), true), "transcode");
+        assert_eq!(emby_playback_mode(None, false), "unknown");
+    }
 }

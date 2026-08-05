@@ -27,6 +27,7 @@ type Star = {
 const canvas = ref<HTMLCanvasElement | null>(null)
 
 let animationFrame = 0
+let resizeFrame = 0
 let resizeObserver: ResizeObserver | undefined
 let themeObserver: MutationObserver | undefined
 let motionQuery: MediaQueryList | undefined
@@ -166,6 +167,14 @@ function resizeCanvas() {
   context?.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0)
   syncParticleCounts()
   drawFrame(0)
+}
+
+function scheduleResizeCanvas() {
+  if (resizeFrame) return
+  resizeFrame = window.requestAnimationFrame(() => {
+    resizeFrame = 0
+    resizeCanvas()
+  })
 }
 
 function updateParticle(particle: Particle, elapsed: number) {
@@ -327,10 +336,10 @@ onMounted(() => {
   motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)')
   addMotionPreferenceListener(motionQuery)
   if (typeof ResizeObserver !== 'undefined') {
-    resizeObserver = new ResizeObserver(resizeCanvas)
+    resizeObserver = new ResizeObserver(scheduleResizeCanvas)
     resizeObserver.observe(document.documentElement)
   }
-  window.addEventListener('resize', resizeCanvas)
+  window.addEventListener('resize', scheduleResizeCanvas)
   themeObserver = new MutationObserver(() => {
     readPalette()
     drawFrame(0)
@@ -345,11 +354,12 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   window.cancelAnimationFrame(animationFrame)
+  window.cancelAnimationFrame(resizeFrame)
   resizeObserver?.disconnect()
   themeObserver?.disconnect()
   if (motionQuery) removeMotionPreferenceListener(motionQuery)
   window.removeEventListener('pointermove', handlePointerMove)
-  window.removeEventListener('resize', resizeCanvas)
+  window.removeEventListener('resize', scheduleResizeCanvas)
   document.removeEventListener('visibilitychange', handleVisibilityChange)
   document.documentElement.removeEventListener('pointerleave', handlePointerLeave)
 })

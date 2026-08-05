@@ -6,7 +6,7 @@ use axum::{
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use url::Url;
 
 use crate::{
@@ -20,6 +20,11 @@ use crate::{
 
 const SETTING_KEY: &str = "client_control";
 const PLAYBACK_RATE_RECENT_EVENT_TTL_SECONDS: u64 = 5;
+const PLAYBACK_RATE_STATE_CAPACITY: usize = 4096;
+const PLAYBACK_RATE_MAX_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+const PLAYBACK_RATE_MAX_REQUESTS: u64 = 1000;
+const PLAYBACK_RATE_MAX_BLOCK_SECONDS: u64 = 31 * 24 * 60 * 60;
+const CONCURRENT_PLAYBACK_MAX: u64 = 100;
 
 #[derive(Debug, Clone)]
 pub struct PlaybackRateHit {
@@ -226,19 +231,27 @@ pub async fn update_client_control(
     config.notify_enabled = payload.notify_enabled;
     config.playback_rate_limit_enabled = payload.playback_rate_limit_enabled;
     if payload.playback_rate_limit_window_seconds > 0 {
-        config.playback_rate_limit_window_seconds = payload.playback_rate_limit_window_seconds;
+        config.playback_rate_limit_window_seconds = payload
+            .playback_rate_limit_window_seconds
+            .min(PLAYBACK_RATE_MAX_WINDOW_SECONDS);
     }
     if payload.playback_rate_limit_max_requests > 0 {
-        config.playback_rate_limit_max_requests = payload.playback_rate_limit_max_requests;
+        config.playback_rate_limit_max_requests = payload
+            .playback_rate_limit_max_requests
+            .min(PLAYBACK_RATE_MAX_REQUESTS);
     }
     if payload.playback_rate_limit_block_seconds > 0 {
-        config.playback_rate_limit_block_seconds = payload.playback_rate_limit_block_seconds;
+        config.playback_rate_limit_block_seconds = payload
+            .playback_rate_limit_block_seconds
+            .min(PLAYBACK_RATE_MAX_BLOCK_SECONDS);
     }
     config.playback_rate_limit_action =
         normalize_playback_rate_limit_action(&payload.playback_rate_limit_action);
     config.concurrent_playback_limit_enabled = payload.concurrent_playback_limit_enabled;
     if payload.concurrent_playback_limit_max > 0 {
-        config.concurrent_playback_limit_max = payload.concurrent_playback_limit_max;
+        config.concurrent_playback_limit_max = payload
+            .concurrent_playback_limit_max
+            .min(CONCURRENT_PLAYBACK_MAX);
     }
     config.webhooks = merge_existing_webhook_secrets(
         normalize_webhook_configs(payload.webhooks, payload.webhook),
@@ -475,65 +488,70 @@ pub async fn rate_limit_status(
     let window = config.playback_rate_limit_window_seconds.max(1);
     let threshold = config.playback_rate_limit_max_requests.max(1);
     let blocks = config.rate_limit_blocks;
-    let hits = state.playback_rate_hits.lock().await;
-    let mut rows = Vec::new();
-    let mut row_keys = HashSet::new();
-    for (key, timestamps) in hits.iter() {
-        let Some((server_id, ip)) = key.split_once(':') else {
-            continue;
-        };
-        let active = timestamps
-            .iter()
-            .filter(|hit| now.saturating_sub(hit.timestamp) < window)
-            .collect::<Vec<_>>();
-        if active.is_empty() {
-            continue;
-        }
-        let oldest = active.first().map(|hit| hit.timestamp).unwrap_or(now);
-        let user_name = active
-            .iter()
-            .rev()
-            .find_map(|hit| {
-                let user_name = hit.user_name.trim();
-                (!user_name.is_empty() && user_name != "--").then(|| user_name.to_string())
-            })
-            .or_else(|| {
-                blocks.iter().find_map(|record| {
-                    let blocked_until = record.blocked_until.parse::<u64>().unwrap_or_default();
-                    let user_name = record.user_name.trim();
-                    (record.enabled
-                        && record.server_id == server_id
-                        && record.ip == ip
-                        && blocked_until > now
-                        && !user_name.is_empty()
-                        && user_name != "--")
-                        .then(|| user_name.to_string())
+    let mut rows = {
+        let hits = state.playback_rate_hits.lock().await;
+        let mut rows = Vec::new();
+        for (key, timestamps) in hits.iter() {
+            let Some((server_id, ip)) = key.split_once(':') else {
+                continue;
+            };
+            let active = timestamps
+                .iter()
+                .filter(|hit| now.saturating_sub(hit.timestamp) < window)
+                .collect::<Vec<_>>();
+            if active.is_empty() {
+                continue;
+            }
+            let oldest = active.first().map(|hit| hit.timestamp).unwrap_or(now);
+            let user_name = active
+                .iter()
+                .rev()
+                .find_map(|hit| {
+                    let user_name = hit.user_name.trim();
+                    (!user_name.is_empty() && user_name != "--").then(|| user_name.to_string())
                 })
-            })
-            .unwrap_or_else(|| "--".to_string());
-        let current_count = active.len() as u64;
-        let reset_at = oldest + window;
-        let block_record = blocks.iter().find(|record| {
-            record.enabled
-                && record.server_id == server_id
-                && record.ip == ip
-                && record.blocked_until.parse::<u64>().unwrap_or_default() > now
-        });
-        rows.push(PlaybackRateWindowStatus {
-            server_id: server_id.to_string(),
-            block_id: block_record.map(|record| record.id.clone()),
-            block_action: block_record.map(|record| record.action.clone()),
-            user_name,
-            ip: ip.to_string(),
-            ip_location: state.ip_location.lookup(ip).await,
-            current_count,
-            threshold,
-            remaining: threshold.saturating_sub(current_count),
-            window_seconds: window,
-            reset_at: reset_at.to_string(),
-            blocked: block_record.is_some(),
-        });
-        row_keys.insert((server_id.to_string(), ip.to_string()));
+                .or_else(|| {
+                    blocks.iter().find_map(|record| {
+                        let blocked_until = record.blocked_until.parse::<u64>().unwrap_or_default();
+                        let user_name = record.user_name.trim();
+                        (record.enabled
+                            && record.server_id == server_id
+                            && record.ip == ip
+                            && blocked_until > now
+                            && !user_name.is_empty()
+                            && user_name != "--")
+                            .then(|| user_name.to_string())
+                    })
+                })
+                .unwrap_or_else(|| "--".to_string());
+            let current_count = active.len() as u64;
+            let block_record = blocks.iter().find(|record| {
+                record.enabled
+                    && record.server_id == server_id
+                    && record.ip == ip
+                    && record.blocked_until.parse::<u64>().unwrap_or_default() > now
+            });
+            rows.push(PlaybackRateWindowStatus {
+                server_id: server_id.to_string(),
+                block_id: block_record.map(|record| record.id.clone()),
+                block_action: block_record.map(|record| record.action.clone()),
+                user_name,
+                ip: ip.to_string(),
+                ip_location: None,
+                current_count,
+                threshold,
+                remaining: threshold.saturating_sub(current_count),
+                window_seconds: window,
+                reset_at: oldest.saturating_add(window).to_string(),
+                blocked: block_record.is_some(),
+            });
+        }
+        rows
+    };
+    let mut row_keys = HashSet::new();
+    for row in &mut rows {
+        row.ip_location = state.ip_location.lookup(&row.ip).await;
+        row_keys.insert((row.server_id.clone(), row.ip.clone()));
     }
     for record in blocks.iter() {
         let blocked_until = record.blocked_until.parse::<u64>().unwrap_or_default();
@@ -632,7 +650,7 @@ pub fn record_client_event(
     let device_name = normalize_value(&device_name);
     let user_name = normalize_value(&user_name);
     let mut config = load_or_default(state)?;
-    if let Some(existing) = config
+    let changed = if let Some(existing) = config
         .records
         .iter_mut()
         .find(|record| record.user_agent.eq_ignore_ascii_case(&user_agent))
@@ -653,6 +671,7 @@ pub fn record_client_event(
         if changed {
             existing.updated_at = chrono_like_now();
         }
+        changed
     } else {
         let now = chrono_like_now();
         config.records.push(ClientRuleRecord {
@@ -667,26 +686,58 @@ pub fn record_client_event(
             updated_at: now,
             note: "自动记录播放设备".to_string(),
         });
+        true
+    };
+    if changed {
+        state
+            .settings_store
+            .save_setting_json(SETTING_KEY, &config)?;
     }
-    state
-        .settings_store
-        .save_setting_json(SETTING_KEY, &config)?;
     Ok(())
 }
 
 fn load_or_default(state: &AppState) -> AppResult<ClientControlConfig> {
+    let revision = state.settings_store.settings_revision();
+    if let Some(mut config) = state
+        .client_control_cache
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|(cached_revision, _)| *cached_revision == revision)
+        .map(|(_, config)| config.clone())
+    {
+        if prune_inactive_rate_limit_blocks(&mut config, now_seconds()) {
+            state
+                .settings_store
+                .save_setting_json(SETTING_KEY, &config)?;
+            let revision = state.settings_store.settings_revision();
+            *state
+                .client_control_cache
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some((revision, config.clone()));
+        }
+        return Ok(config);
+    }
+
     let mut config = state
         .settings_store
         .load_setting_json(SETTING_KEY)?
         .unwrap_or_else(default_config);
     migrate_webhook_config(&mut config);
     let mut changed = normalize_client_rule_records(&mut config);
+    changed |= normalize_client_control_limits(&mut config);
     changed |= prune_inactive_rate_limit_blocks(&mut config, now_seconds());
     if changed {
         state
             .settings_store
             .save_setting_json(SETTING_KEY, &config)?;
     }
+    let revision = state.settings_store.settings_revision();
+    *state
+        .client_control_cache
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((revision, config.clone()));
     Ok(config)
 }
 
@@ -726,6 +777,34 @@ fn default_playback_rate_limit_action() -> String {
 
 fn default_concurrent_playback_limit_max() -> u64 {
     3
+}
+
+fn normalize_client_control_limits(config: &mut ClientControlConfig) -> bool {
+    let previous = (
+        config.playback_rate_limit_window_seconds,
+        config.playback_rate_limit_max_requests,
+        config.playback_rate_limit_block_seconds,
+        config.concurrent_playback_limit_max,
+    );
+    config.playback_rate_limit_window_seconds = config
+        .playback_rate_limit_window_seconds
+        .clamp(1, PLAYBACK_RATE_MAX_WINDOW_SECONDS);
+    config.playback_rate_limit_max_requests = config
+        .playback_rate_limit_max_requests
+        .clamp(1, PLAYBACK_RATE_MAX_REQUESTS);
+    config.playback_rate_limit_block_seconds = config
+        .playback_rate_limit_block_seconds
+        .clamp(1, PLAYBACK_RATE_MAX_BLOCK_SECONDS);
+    config.concurrent_playback_limit_max = config
+        .concurrent_playback_limit_max
+        .clamp(1, CONCURRENT_PLAYBACK_MAX);
+    previous
+        != (
+            config.playback_rate_limit_window_seconds,
+            config.playback_rate_limit_max_requests,
+            config.playback_rate_limit_block_seconds,
+            config.concurrent_playback_limit_max,
+        )
 }
 
 fn default_webhook_name() -> String {
@@ -1025,7 +1104,23 @@ fn prune_inactive_rate_limit_blocks(config: &mut ClientControlConfig, now: u64) 
     config.rate_limit_blocks.retain(|record| {
         record.enabled && record.blocked_until.parse::<u64>().unwrap_or_default() > now
     });
+    if config.rate_limit_blocks.len() > PLAYBACK_RATE_STATE_CAPACITY {
+        config
+            .rate_limit_blocks
+            .sort_by_key(|record| record.blocked_until.parse::<u64>().unwrap_or_default());
+        let excess = config.rate_limit_blocks.len() - PLAYBACK_RATE_STATE_CAPACITY;
+        config.rate_limit_blocks.drain(..excess);
+    }
     config.rate_limit_blocks.len() != before_len
+}
+
+fn make_room_for_rate_state<T>(entries: &mut HashMap<String, T>, key: &str) {
+    if entries.contains_key(key) || entries.len() < PLAYBACK_RATE_STATE_CAPACITY {
+        return;
+    }
+    if let Some(evicted) = entries.keys().next().cloned() {
+        entries.remove(&evicted);
+    }
 }
 
 fn upsert_rate_limit_block(
@@ -1073,6 +1168,15 @@ fn upsert_rate_limit_block_with_note(
         existing.blocked_until = blocked_until.to_string();
         existing.note = note;
         return;
+    }
+    if config.rate_limit_blocks.len() >= PLAYBACK_RATE_STATE_CAPACITY
+        && let Some((index, _)) = config
+            .rate_limit_blocks
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, record)| record.blocked_until.parse::<u64>().unwrap_or_default())
+    {
+        config.rate_limit_blocks.remove(index);
     }
     config.rate_limit_blocks.push(PlaybackRateBlockRecord {
         id: new_id(),
@@ -1318,20 +1422,30 @@ pub async fn enforce_playback_rate_limit(
     }
     {
         let mut bans = state.playback_rate_bans.lock().await;
+        if bans
+            .get(playback_user)
+            .is_some_and(|blocked_until| *blocked_until <= now)
+        {
+            bans.remove(playback_user);
+        }
         if let Some(blocked_until) = bans.get(playback_user).copied() {
             if blocked_until > now {
                 return Ok(true);
             }
-            bans.remove(playback_user);
         }
     }
     {
         let mut ip_bans = state.playback_rate_ip_bans.lock().await;
+        if ip_bans
+            .get(playback_ip)
+            .is_some_and(|blocked_until| *blocked_until <= now)
+        {
+            ip_bans.remove(playback_ip);
+        }
         if let Some(blocked_until) = ip_bans.get(playback_ip).copied() {
             if blocked_until > now {
                 return Ok(true);
             }
-            ip_bans.remove(playback_ip);
         }
     }
 
@@ -1341,9 +1455,11 @@ pub async fn enforce_playback_rate_limit(
     if !event_key.is_empty() {
         let recent_key = format!("{}:{playback_ip}:{event_key}", input.server_id);
         let mut recent_events = state.playback_rate_recent_events.lock().await;
-        recent_events.retain(|_, timestamp| {
-            now.saturating_sub(*timestamp) < PLAYBACK_RATE_RECENT_EVENT_TTL_SECONDS
-        });
+        if recent_events.get(&recent_key).is_some_and(|timestamp| {
+            now.saturating_sub(*timestamp) >= PLAYBACK_RATE_RECENT_EVENT_TTL_SECONDS
+        }) {
+            recent_events.remove(&recent_key);
+        }
         let has_recent_event = recent_events.get(&recent_key).is_some_and(|timestamp| {
             now.saturating_sub(*timestamp) < PLAYBACK_RATE_RECENT_EVENT_TTL_SECONDS
         });
@@ -1351,14 +1467,24 @@ pub async fn enforce_playback_rate_limit(
             return Ok(false);
         }
         if input.record_recent_event {
+            if !recent_events.contains_key(&recent_key)
+                && recent_events.len() >= PLAYBACK_RATE_STATE_CAPACITY
+            {
+                recent_events.retain(|_, timestamp| {
+                    now.saturating_sub(*timestamp) < PLAYBACK_RATE_RECENT_EVENT_TTL_SECONDS
+                });
+            }
+            make_room_for_rate_state(&mut recent_events, &recent_key);
             recent_events.insert(recent_key, now);
         }
     } else if input.skip_recent_event || input.record_recent_event {
         let recent_key = format!("{}:{playback_ip}:playback-start", input.server_id);
         let mut recent_events = state.playback_rate_recent_events.lock().await;
-        recent_events.retain(|_, timestamp| {
-            now.saturating_sub(*timestamp) < PLAYBACK_RATE_RECENT_EVENT_TTL_SECONDS
-        });
+        if recent_events.get(&recent_key).is_some_and(|timestamp| {
+            now.saturating_sub(*timestamp) >= PLAYBACK_RATE_RECENT_EVENT_TTL_SECONDS
+        }) {
+            recent_events.remove(&recent_key);
+        }
         let has_recent_event = recent_events.get(&recent_key).is_some_and(|timestamp| {
             now.saturating_sub(*timestamp) < PLAYBACK_RATE_RECENT_EVENT_TTL_SECONDS
         });
@@ -1366,6 +1492,14 @@ pub async fn enforce_playback_rate_limit(
             return Ok(false);
         }
         if input.record_recent_event {
+            if !recent_events.contains_key(&recent_key)
+                && recent_events.len() >= PLAYBACK_RATE_STATE_CAPACITY
+            {
+                recent_events.retain(|_, timestamp| {
+                    now.saturating_sub(*timestamp) < PLAYBACK_RATE_RECENT_EVENT_TTL_SECONDS
+                });
+            }
+            make_room_for_rate_state(&mut recent_events, &recent_key);
             recent_events.insert(recent_key, now);
         }
     }
@@ -1373,6 +1507,18 @@ pub async fn enforce_playback_rate_limit(
     let key = format!("{}:{}", input.server_id, playback_ip);
     let should_block = {
         let mut hits = state.playback_rate_hits.lock().await;
+        if !hits.contains_key(&key) && hits.len() >= PLAYBACK_RATE_STATE_CAPACITY {
+            hits.retain(|_, timestamps| {
+                while timestamps
+                    .front()
+                    .is_some_and(|hit| now.saturating_sub(hit.timestamp) >= window)
+                {
+                    timestamps.pop_front();
+                }
+                !timestamps.is_empty()
+            });
+        }
+        make_room_for_rate_state(&mut hits, &key);
         let timestamps = hits.entry(key).or_default();
         while timestamps
             .front()
@@ -1389,7 +1535,7 @@ pub async fn enforce_playback_rate_limit(
 
     if should_block {
         let block_seconds = config.playback_rate_limit_block_seconds.max(1);
-        let blocked_until = now + block_seconds;
+        let blocked_until = now.saturating_add(block_seconds);
         let notify_enabled = config.notify_enabled;
         let webhooks = config.webhooks.clone();
         if action_disables_user(&action) && has_playback_user {
@@ -1424,18 +1570,20 @@ pub async fn enforce_playback_rate_limit(
                     ),
                 );
             }
-            state
-                .playback_rate_bans
-                .lock()
-                .await
-                .insert(playback_user.to_string(), blocked_until);
+            let mut bans = state.playback_rate_bans.lock().await;
+            if !bans.contains_key(playback_user) && bans.len() >= PLAYBACK_RATE_STATE_CAPACITY {
+                bans.retain(|_, blocked_until| *blocked_until > now);
+            }
+            make_room_for_rate_state(&mut bans, playback_user);
+            bans.insert(playback_user.to_string(), blocked_until);
         }
         if action_blocks_ip(&action) {
-            state
-                .playback_rate_ip_bans
-                .lock()
-                .await
-                .insert(playback_ip.to_string(), blocked_until);
+            let mut ip_bans = state.playback_rate_ip_bans.lock().await;
+            if !ip_bans.contains_key(playback_ip) && ip_bans.len() >= PLAYBACK_RATE_STATE_CAPACITY {
+                ip_bans.retain(|_, blocked_until| *blocked_until > now);
+            }
+            make_room_for_rate_state(&mut ip_bans, playback_ip);
+            ip_bans.insert(playback_ip.to_string(), blocked_until);
             state.activity_log.record(
                 crate::activity_log::ActivityKind::General,
                 crate::activity_log::ActivityLevel::Warn,
@@ -1555,11 +1703,16 @@ pub async fn enforce_concurrent_playback_limit(
     }
     {
         let mut ip_bans = state.playback_rate_ip_bans.lock().await;
+        if ip_bans
+            .get(playback_ip)
+            .is_some_and(|blocked_until| *blocked_until <= now)
+        {
+            ip_bans.remove(playback_ip);
+        }
         if let Some(blocked_until) = ip_bans.get(playback_ip).copied() {
             if blocked_until > now {
                 return Ok(true);
             }
-            ip_bans.remove(playback_ip);
         }
     }
 
@@ -1611,14 +1764,17 @@ pub async fn enforce_concurrent_playback_limit(
     }
 
     let block_seconds = config.playback_rate_limit_block_seconds.max(1);
-    let blocked_until = now + block_seconds;
+    let blocked_until = now.saturating_add(block_seconds);
     let notify_enabled = config.notify_enabled;
     let webhooks = config.webhooks.clone();
-    state
-        .playback_rate_ip_bans
-        .lock()
-        .await
-        .insert(playback_ip.to_string(), blocked_until);
+    {
+        let mut ip_bans = state.playback_rate_ip_bans.lock().await;
+        if !ip_bans.contains_key(playback_ip) && ip_bans.len() >= PLAYBACK_RATE_STATE_CAPACITY {
+            ip_bans.retain(|_, blocked_until| *blocked_until > now);
+        }
+        make_room_for_rate_state(&mut ip_bans, playback_ip);
+        ip_bans.insert(playback_ip.to_string(), blocked_until);
+    }
     upsert_rate_limit_block_with_note(
         &mut config,
         input.server_id,
@@ -1935,5 +2091,46 @@ mod tests {
         assert_eq!(config.records[0].user_agent, "Infuse-Direct");
         assert_eq!(config.records[0].user_name, "王德发");
         assert!(config.records[0].enabled);
+    }
+
+    #[test]
+    fn normalizes_client_control_resource_limits() {
+        let mut config = default_config();
+        config.playback_rate_limit_window_seconds = u64::MAX;
+        config.playback_rate_limit_max_requests = u64::MAX;
+        config.playback_rate_limit_block_seconds = u64::MAX;
+        config.concurrent_playback_limit_max = u64::MAX;
+
+        assert!(normalize_client_control_limits(&mut config));
+        assert_eq!(
+            config.playback_rate_limit_window_seconds,
+            PLAYBACK_RATE_MAX_WINDOW_SECONDS
+        );
+        assert_eq!(
+            config.playback_rate_limit_max_requests,
+            PLAYBACK_RATE_MAX_REQUESTS
+        );
+        assert_eq!(
+            config.playback_rate_limit_block_seconds,
+            PLAYBACK_RATE_MAX_BLOCK_SECONDS
+        );
+        assert_eq!(
+            config.concurrent_playback_limit_max,
+            CONCURRENT_PLAYBACK_MAX
+        );
+    }
+
+    #[test]
+    fn rate_limit_runtime_state_stays_bounded() {
+        let mut entries = HashMap::new();
+        for index in 0..PLAYBACK_RATE_STATE_CAPACITY {
+            entries.insert(format!("client-{index}"), index);
+        }
+
+        make_room_for_rate_state(&mut entries, "new-client");
+        entries.insert("new-client".to_string(), usize::MAX);
+
+        assert_eq!(entries.len(), PLAYBACK_RATE_STATE_CAPACITY);
+        assert_eq!(entries.get("new-client"), Some(&usize::MAX));
     }
 }
