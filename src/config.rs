@@ -121,6 +121,13 @@ impl Config {
             .unwrap_or_else(|| self.clone())
     }
 
+    pub fn server_label(&self) -> (String, String) {
+        self.servers
+            .first()
+            .map(|server| (server.id.clone(), server.name.clone()))
+            .unwrap_or_else(|| ("default".to_string(), "默认服务器".to_string()))
+    }
+
     pub fn emby_url(&self, path_and_query: &str) -> AppResult<Url> {
         join_base_and_path(&self.emby_host, path_and_query)
     }

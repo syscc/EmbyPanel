@@ -107,13 +107,13 @@ pub async fn media_overview(
     for (config, result) in collect_server_queries(queries).await {
         match result {
             Ok(mut overview) => {
-                let (server_id, server_name) = server_label(&config);
+                let (server_id, server_name) = config.server_label();
                 overview.server_id = server_id;
                 overview.server_name = server_name;
                 overviews.push(overview);
             }
             Err(err) => {
-                let (server_id, server_name) = server_label(&config);
+                let (server_id, server_name) = config.server_label();
                 state.activity_log.record(
                     ActivityKind::General,
                     ActivityLevel::Error,
@@ -123,7 +123,7 @@ pub async fn media_overview(
                     safe_error_message(&err),
                 );
                 tracing::warn!(
-                    server = server_name,
+                    server = %server_name,
                     error = %safe_error_message(&err),
                     "failed to fetch media overview"
                 );
@@ -201,7 +201,7 @@ pub async fn list_playback_sessions(
                 sessions.extend(server_sessions);
             }
             Err(err) => {
-                let (server_id, server_name) = server_label(&config);
+                let (server_id, server_name) = config.server_label();
                 state.activity_log.record(
                     ActivityKind::General,
                     ActivityLevel::Error,
@@ -211,7 +211,7 @@ pub async fn list_playback_sessions(
                     safe_error_message(&err),
                 );
                 tracing::warn!(
-                    server = server_name,
+                    server = %server_name,
                     error = %safe_error_message(&err),
                     "failed to fetch playback sessions"
                 );
@@ -540,7 +540,7 @@ async fn record_runtime_info(state: &AppState) {
 
     let config = state.config.read().await.clone();
     for config in playback_configs(&config) {
-        let (server_id, server_name) = server_label(&config);
+        let (server_id, server_name) = config.server_label();
         state.activity_log.record(
             ActivityKind::General,
             ActivityLevel::Info,
@@ -657,14 +657,6 @@ fn is_valid_item_id(item_id: &str) -> bool {
         && item_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-}
-
-fn server_label(config: &Config) -> (String, String) {
-    config
-        .servers
-        .first()
-        .map(|server| (server.id.clone(), server.name.clone()))
-        .unwrap_or_else(|| ("default".to_string(), "默认服务器".to_string()))
 }
 
 fn percent(used: u64, total: u64) -> u8 {

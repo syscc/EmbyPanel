@@ -1,5 +1,31 @@
 # 版本更新日志
 
+## v0.2.6
+
+发布时间：2026-08-08
+
+### 新增
+
+- 无。
+
+### 优化
+
+- 用户策略转换收敛到 `frontend/src/lib/user-policy.ts` 的 `policyFromUser`，页面不再手写重复字段映射。
+- 用户详情页时间显示改为复用现有 `formatTimestamp`，避免本地格式化分叉。
+- 服务器标识收敛到 `Config::server_label()`，`users_api` 和 `monitoring` 复用同一契约。
+- 补充并同步项目级模块复用约束，避免前后端再写重复 helper。
+
+### 修复
+
+- 修复用户详情页中两处重复的策略摊平逻辑，降低新增策略字段时漏改的风险。
+- 修复 `server_label` 在多个 Rust 模块中的重复实现。
+
+### 验证
+
+- `cd frontend && npx vue-tsc -b --noEmit`
+- `cargo check`
+- 源码模式重启服务并验证 `http://localhost:8090/ui/` 与 `http://127.0.0.1:18090/ui/` 可访问。
+
 ## v0.2.5
 
 发布时间：2026-08-05
