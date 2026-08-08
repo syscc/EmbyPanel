@@ -23,24 +23,19 @@ import {
   Timer,
   Trash2,
   Waypoints,
-  X,
   Zap,
 } from '@lucide/vue'
-import {
-  DialogClose,
-  DialogContent,
-  DialogDescription,
-  DialogOverlay,
-  DialogPortal,
-  DialogRoot,
-  DialogTitle,
-} from 'reka-ui'
+import { DialogClose } from 'reka-ui'
+import CheckboxField from '@/components/ui/CheckboxField.vue'
+import SettingsDialogShell from '@/components/ui/SettingsDialogShell.vue'
+import UiSwitch from '@/components/ui/UiSwitch.vue'
 import { usePanelContext } from '@/composables/panel-context'
 import type { EmbyServerConfig } from '@/types/panel'
 
 const {
   settings,
   saving,
+  error,
   restartingServerId,
   validationResults,
   defaultCdnHeaders,
@@ -48,6 +43,7 @@ const {
   proxyStatusById,
   strmMappingPlaceholder,
   t,
+  confirmAction,
   addServer,
   validateSettings,
   saveSettings,
@@ -67,6 +63,8 @@ const {
   validationClass,
   localizeValidationText,
 } = usePanelContext()
+
+const removingServerId = ref('')
 
 type SettingEditorKey =
   | 'cache_domain_filter_mode'
@@ -222,6 +220,9 @@ const editorNumberDraft = ref(0)
 const serverEditorOpen = ref(false)
 const serverDraft = ref<EmbyServerConfig | null>(null)
 const serverEditorIsNew = ref(false)
+const serverEditorError = ref('')
+const validationDialogOpen = ref(false)
+const validationRunning = ref(false)
 
 const activeSettingCard = computed(
   () => allSettingCards.find((card) => card.key === activeSettingKey.value) ?? null,
@@ -367,6 +368,7 @@ function openServerEditor(server: EmbyServerConfig) {
 function openServerEditorFor(server: EmbyServerConfig, isNew: boolean) {
   serverDraft.value = { ...server }
   serverEditorIsNew.value = isNew
+  serverEditorError.value = ''
   serverEditorOpen.value = true
 }
 
@@ -386,27 +388,76 @@ function handleServerEditorOpenChange(open: boolean) {
   if (!open) {
     serverDraft.value = null
     serverEditorIsNew.value = false
+    serverEditorError.value = ''
   }
   serverEditorOpen.value = open
+}
+
+function validateServerDraft(draft: EmbyServerConfig) {
+  if (!draft.name.trim()) return t('服务器名称不能为空')
+  if (!draft.emby_host.trim()) return t('请填写 Emby 地址')
+  if (serverEditorIsNew.value && !draft.emby_api_key.trim()) {
+    return t('新增服务器必须填写 Emby API Key')
+  }
+  const port = Number(draft.port)
+  if (!Number.isInteger(port) || port < 1 || port > 65535 || port === 8090) {
+    return t('反代端口无效或被管理端口占用')
+  }
+  return ''
 }
 
 async function applyServerEditor() {
   if (saving.value) return
   const draft = serverDraft.value
   if (!draft) return
+  serverEditorError.value = validateServerDraft(draft)
+  if (serverEditorError.value) return
   const target = settings.servers.find((server) => server.id === draft.id)
   if (target) Object.assign(target, draft)
+  error.value = ''
+  serverEditorError.value = ''
+  await saveSettings()
+  if (error.value) {
+    serverEditorError.value = error.value
+    error.value = ''
+    return
+  }
   serverEditorIsNew.value = false
   serverEditorOpen.value = false
-  await saveSettings()
+}
+
+async function runValidation() {
+  if (saving.value || validationRunning.value) return
+  validationDialogOpen.value = true
+  validationRunning.value = true
+  try {
+    await validateSettings()
+  } finally {
+    validationRunning.value = false
+  }
 }
 
 async function removeServerAndSave(serverId: string) {
-  if (saving.value) return
-  const previousCount = settings.servers.length
-  removeServer(serverId)
-  if (settings.servers.length === previousCount) return
-  await saveSettings()
+  if (saving.value || removingServerId.value) return
+  const server = settings.servers.find((item) => item.id === serverId)
+  if (!server) return
+  removingServerId.value = serverId
+  try {
+    const confirmed = await confirmAction({
+      title: t('删除服务器'),
+      description: `${server.name || t('服务器')}：${t('确定删除这个服务器配置吗？对应反代端口保存后会停止监听。')}`,
+      confirmText: t('确认删除'),
+      cancelText: t('取消'),
+      tone: 'danger',
+    })
+    if (!confirmed || saving.value) return
+    const previousCount = settings.servers.length
+    removeServer(serverId)
+    if (settings.servers.length === previousCount) return
+    await saveSettings()
+  } finally {
+    removingServerId.value = ''
+  }
 }
 </script>
 
@@ -435,7 +486,8 @@ async function removeServerAndSave(serverId: string) {
           class="secondary"
           type="button"
           :disabled="saving"
-          @click="validateSettings"
+          aria-haspopup="dialog"
+          @click="runValidation"
         >
           <ShieldCheck :size="15" />{{ t('测试配置') }}
         </button>
@@ -490,7 +542,7 @@ async function removeServerAndSave(serverId: string) {
             <button
               class="danger-button"
               type="button"
-              :disabled="saving"
+              :disabled="saving || removingServerId !== ''"
               @click="removeServerAndSave(server.id)"
             >
               <Trash2 :size="15" />{{ t('删除') }}
@@ -569,21 +621,13 @@ async function removeServerAndSave(serverId: string) {
               aria-hidden="true"
             />
           </component>
-          <button
+          <UiSwitch
             v-if="card.toggleKey"
-            type="button"
-            class="settings-card-switch"
-            :class="{ 'is-on': settingBooleanValue(card) }"
-            role="switch"
-            :aria-checked="settingBooleanValue(card)"
-            :aria-label="`${t(card.label)}：${t(settingBooleanValue(card) ? '已开启' : '已关闭')}`"
+            :model-value="settingBooleanValue(card)"
+            :label="`${t(card.label)}：${t(settingBooleanValue(card) ? '已开启' : '已关闭')}`"
             :disabled="saving"
-            @click="toggleBooleanSetting(card)"
-          >
-            <span class="settings-card-switch-track">
-              <span class="settings-card-switch-knob" />
-            </span>
-          </button>
+            @update:model-value="toggleBooleanSetting(card)"
+          />
         </article>
       </div>
     </section>
@@ -624,83 +668,27 @@ async function removeServerAndSave(serverId: string) {
               aria-hidden="true"
             />
           </component>
-          <button
+          <UiSwitch
             v-if="card.toggleKey"
-            type="button"
-            class="settings-card-switch"
-            :class="{ 'is-on': settingBooleanValue(card) }"
-            role="switch"
-            :aria-checked="settingBooleanValue(card)"
-            :aria-label="`${t(card.label)}：${t(settingBooleanValue(card) ? '已开启' : '已关闭')}`"
+            :model-value="settingBooleanValue(card)"
+            :label="`${t(card.label)}：${t(settingBooleanValue(card) ? '已开启' : '已关闭')}`"
             :disabled="saving"
-            @click="toggleBooleanSetting(card)"
-          >
-            <span class="settings-card-switch-track">
-              <span class="settings-card-switch-knob" />
-            </span>
-          </button>
+            @update:model-value="toggleBooleanSetting(card)"
+          />
         </article>
       </div>
     </section>
 
-    <section class="config-tools single">
-      <div class="tool-block">
-        <div class="panel-head compact">
-          <h3>{{ t('配置测试结果') }}</h3>
-          <button
-            class="secondary"
-            type="button"
-            :disabled="saving"
-            @click="validateSettings"
-          >
-            <RefreshCw :size="15" />{{ t('重新测试') }}
-          </button>
-        </div>
-        <div v-if="validationResults.length" class="validation-list">
-          <div
-            v-for="result in validationResults"
-            :key="`${result.scope}-${result.message}-${result.detail}`"
-            :class="['validation-row', validationClass(result)]"
-          >
-            <strong>{{ localizeValidationText(result.scope) }}</strong>
-            <span>{{ localizeValidationText(result.message) }}</span>
-            <small>{{
-              result.detail ? localizeValidationText(result.detail) : '--'
-            }}</small>
-          </div>
-        </div>
-        <div v-else class="empty-state compact">
-          {{ t('还没有运行配置测试。') }}
-        </div>
-      </div>
-    </section>
-
-    <DialogRoot v-model:open="settingEditorOpen">
-    <DialogPortal>
-      <DialogOverlay class="settings-dialog-overlay" />
-      <DialogContent v-if="activeSettingCard" class="settings-dialog-content">
-        <header class="settings-dialog-head">
-          <span class="settings-dialog-icon" aria-hidden="true">
+    <SettingsDialogShell
+      v-if="activeSettingCard"
+      v-model:open="settingEditorOpen"
+      :title="t(activeSettingCard.label)"
+      :description="t('点击应用后会自动保存配置。')"
+      :close-label="t('关闭')"
+    >
+      <template #icon>
             <component :is="activeSettingCard.icon" :size="19" />
-          </span>
-          <div class="settings-dialog-heading">
-            <DialogTitle class="settings-dialog-title">
-              {{ t(activeSettingCard.label) }}
-            </DialogTitle>
-            <DialogDescription class="settings-dialog-description">
-              {{ t('点击应用后会自动保存配置。') }}
-            </DialogDescription>
-          </div>
-          <DialogClose as-child>
-            <button
-              class="icon-button settings-dialog-close"
-              type="button"
-              :aria-label="t('关闭')"
-            >
-              <X :size="17" aria-hidden="true" />
-            </button>
-          </DialogClose>
-        </header>
+      </template>
 
         <form class="settings-dialog-form" @submit.prevent="applySettingEditor">
           <label v-if="activeSettingCard.editor === 'select'">
@@ -761,48 +749,104 @@ async function removeServerAndSave(serverId: string) {
               <Check :size="15" aria-hidden="true" />{{ t('保存') }}
             </button>
           </div>
-        </form>
-      </DialogContent>
-    </DialogPortal>
-    </DialogRoot>
+          </form>
+    </SettingsDialogShell>
 
-    <DialogRoot
+    <SettingsDialogShell
+      v-model:open="validationDialogOpen"
+      :title="t('配置测试结果')"
+      :description="t('测试结果按配置检查顺序显示。')"
+      :close-label="t('关闭')"
+      content-class="validation-dialog-content"
+      show-description
+    >
+      <template #icon>
+        <ShieldCheck :size="19" />
+      </template>
+
+      <div
+        class="validation-dialog-body"
+        aria-live="polite"
+        :aria-busy="validationRunning"
+      >
+        <div v-if="validationRunning" class="validation-dialog-progress">
+          <LoaderCircle
+            class="secret-toggle-spinner"
+            :size="18"
+            aria-hidden="true"
+          />
+          <span>{{ t('测试中') }}</span>
+        </div>
+        <p v-else-if="error" class="notice error" role="alert">{{ error }}</p>
+        <div
+          v-else-if="validationResults.length"
+          class="validation-list"
+          role="list"
+        >
+          <div
+            v-for="result in validationResults"
+            :key="`${result.scope}-${result.message}-${result.detail}`"
+            :class="['validation-row', validationClass(result)]"
+            role="listitem"
+          >
+            <strong>{{ localizeValidationText(result.scope) }}</strong>
+            <span>{{ localizeValidationText(result.message) }}</span>
+            <small>{{
+              result.detail ? localizeValidationText(result.detail) : '--'
+            }}</small>
+          </div>
+        </div>
+        <div v-else class="empty-state compact">
+          {{ t('还没有运行配置测试。') }}
+        </div>
+      </div>
+
+      <template #footer>
+        <DialogClose as-child>
+          <button class="secondary" type="button">{{ t('关闭') }}</button>
+        </DialogClose>
+        <button
+          class="primary"
+          type="button"
+          :disabled="saving || validationRunning"
+          @click="runValidation"
+        >
+          <LoaderCircle
+            v-if="validationRunning"
+            class="secret-toggle-spinner"
+            :size="15"
+            aria-hidden="true"
+          />
+          <RefreshCw v-else :size="15" aria-hidden="true" />
+          {{ validationRunning ? t('测试中') : t('重新测试') }}
+        </button>
+      </template>
+    </SettingsDialogShell>
+
+    <SettingsDialogShell
+      v-if="serverDraft"
       :open="serverEditorOpen"
+      :title="t(serverEditorIsNew ? '添加服务器' : '编辑服务器配置')"
+      :description="t('点击应用后会自动保存配置。')"
+      :close-label="t('关闭')"
+      content-class="server-dialog-content"
       @update:open="handleServerEditorOpenChange"
     >
-      <DialogPortal>
-        <DialogOverlay class="settings-dialog-overlay" />
-        <DialogContent
-          v-if="serverDraft"
-          class="settings-dialog-content server-dialog-content"
-        >
-          <header class="settings-dialog-head">
-            <span class="settings-dialog-icon" aria-hidden="true">
+      <template #icon>
               <Server :size="19" />
-            </span>
-            <div class="settings-dialog-heading">
-              <DialogTitle class="settings-dialog-title">
-                {{ t(serverEditorIsNew ? '添加服务器' : '编辑服务器配置') }}
-              </DialogTitle>
-              <DialogDescription class="settings-dialog-description">
-                {{ t('点击应用后会自动保存配置。') }}
-              </DialogDescription>
-            </div>
-            <DialogClose as-child>
-              <button
-                class="icon-button settings-dialog-close"
-                type="button"
-                :aria-label="t('关闭')"
-              >
-                <X :size="17" aria-hidden="true" />
-              </button>
-            </DialogClose>
-          </header>
+      </template>
 
           <form
             class="settings-dialog-form server-dialog-form"
             @submit.prevent="applyServerEditor"
           >
+            <p
+              v-if="serverEditorError"
+              class="notice error server-editor-error"
+              role="alert"
+            >
+              {{ serverEditorError }}
+            </p>
             <div class="grid server-grid">
               <label>
                 <span>{{ t('名称') }}</span>
@@ -872,10 +916,11 @@ async function removeServerAndSave(serverId: string) {
               </label>
             </div>
 
-            <label class="check server-option">
-              <input v-model="serverDraft.block_web_ui" type="checkbox" />
-              <span>{{ t('屏蔽 Emby Web UI') }}</span>
-            </label>
+            <CheckboxField
+              v-model="serverDraft.block_web_ui"
+              class="server-option"
+              :label="t('屏蔽 Emby Web UI')"
+            />
 
             <div class="grid real-ip-grid">
               <label>
@@ -943,8 +988,6 @@ async function removeServerAndSave(serverId: string) {
               </button>
             </div>
           </form>
-        </DialogContent>
-      </DialogPortal>
-    </DialogRoot>
+    </SettingsDialogShell>
   </div>
 </template>

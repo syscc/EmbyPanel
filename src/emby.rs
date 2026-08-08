@@ -7,6 +7,27 @@ use crate::{
     ip_location::IpLocation,
 };
 
+fn emby_api_url(config: &Config, path: &str) -> AppResult<url::Url> {
+    let mut url = config.emby_url(path)?;
+    url.query_pairs_mut()
+        .append_pair("api_key", &config.emby_api_key);
+    Ok(url)
+}
+
+async fn send_checked(
+    request: reqwest::RequestBuilder,
+    operation: &str,
+) -> AppResult<reqwest::Response> {
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        return Err(AppError::BadGateway(format!(
+            "{operation} failed with status {}",
+            response.status()
+        )));
+    }
+    Ok(response)
+}
+
 #[derive(Debug, Deserialize)]
 struct ItemsResponse {
     #[serde(rename = "Items", default)]
@@ -34,23 +55,16 @@ pub async fn get_media_path(
     media_source_id: Option<&str>,
     user_agent: &str,
 ) -> AppResult<Option<String>> {
-    let mut url = config.emby_url("/Items")?;
+    let mut url = emby_api_url(config, "/Items")?;
     url.query_pairs_mut()
         .append_pair("Ids", item_id)
-        .append_pair("Fields", "Path,MediaSources")
-        .append_pair("api_key", &config.emby_api_key);
+        .append_pair("Fields", "Path,MediaSources");
 
     let mut request = client.get(url);
     if !user_agent.trim().is_empty() {
         request = request.header(reqwest::header::USER_AGENT, user_agent);
     }
-    let response = request.send().await?;
-    if !response.status().is_success() {
-        return Err(AppError::BadGateway(format!(
-            "Emby item query failed with status {}",
-            response.status()
-        )));
-    }
+    let response = send_checked(request, "Emby item query").await?;
 
     let data = response.json::<ItemsResponse>().await?;
     let Some(item) = data.items.first() else {
@@ -68,7 +82,7 @@ pub async fn get_media_path(
     Ok(source.and_then(|source| source.path.clone()))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PlaybackSession {
     pub server_id: String,
     pub server_name: String,
@@ -144,6 +158,209 @@ struct UserResponse {
     name: Option<String>,
     #[serde(rename = "Policy")]
     policy: Option<serde_json::Value>,
+}
+
+/// Fetches the raw user objects needed by the management API. The caller is
+/// responsible for projecting these values into a response so Emby secrets or
+/// unrelated policy fields are never exposed to the browser.
+pub async fn list_users(
+    client: &reqwest::Client,
+    config: &Config,
+) -> AppResult<Vec<serde_json::Value>> {
+    let mut url = emby_api_url(config, "/Users")?;
+    url.query_pairs_mut()
+        .append_pair("Fields", "Policy")
+        .append_pair("Limit", "1000")
+        .append_pair("SortBy", "Name");
+    let response = send_checked(client.get(url), "Emby users query").await?;
+    Ok(response.json::<UsersResponse>().await?.into_values())
+}
+
+pub async fn create_user(
+    client: &reqwest::Client,
+    config: &Config,
+    name: &str,
+) -> AppResult<serde_json::Value> {
+    let url = emby_api_url(config, "/Users/New")?;
+    let response = send_checked(
+        client
+            .post(url)
+            .json(&serde_json::json!({ "Name": name.trim() })),
+        "Emby user creation",
+    )
+    .await?;
+    Ok(response.json().await?)
+}
+
+pub async fn delete_user(
+    client: &reqwest::Client,
+    config: &Config,
+    user_id: &str,
+) -> AppResult<()> {
+    let user_id = validate_user_id(user_id)?;
+    let url = emby_api_url(config, &format!("/Users/{user_id}"))?;
+    send_checked(client.delete(url), "Emby user deletion").await?;
+    Ok(())
+}
+
+pub async fn set_user_password(
+    client: &reqwest::Client,
+    config: &Config,
+    user_id: &str,
+    current_password: &str,
+    new_password: &str,
+) -> AppResult<()> {
+    let user_id = validate_user_id(user_id)?;
+    let url = emby_api_url(config, &format!("/Users/{user_id}/Password"))?;
+    send_checked(
+        client.post(url).json(&serde_json::json!({
+            "CurrentPw": current_password,
+            "NewPw": new_password,
+            "ResetPassword": false,
+        })),
+        "Emby user password update",
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn get_user_profile_value(
+    client: &reqwest::Client,
+    config: &Config,
+    user_id: &str,
+) -> AppResult<serde_json::Value> {
+    let user_id = validate_user_id(user_id)?;
+    let mut url = emby_api_url(config, &format!("/Users/{user_id}"))?;
+    url.query_pairs_mut().append_pair("Fields", "Policy");
+    let response = send_checked(client.get(url), "Emby user query").await?;
+    Ok(response.json().await?)
+}
+
+pub async fn update_user_policy_value(
+    client: &reqwest::Client,
+    config: &Config,
+    user_id: &str,
+    policy: &serde_json::Value,
+) -> AppResult<()> {
+    let user_id = validate_user_id(user_id)?;
+    let url = emby_api_url(config, &format!("/Users/{user_id}/Policy"))?;
+    send_checked(client.post(url).json(policy), "Emby user policy update").await?;
+    Ok(())
+}
+
+pub async fn reset_user_password(
+    client: &reqwest::Client,
+    config: &Config,
+    user_id: &str,
+    new_password: &str,
+) -> AppResult<()> {
+    let user_id = validate_user_id(user_id)?;
+    let profile = get_user_profile_value(client, config, user_id).await?;
+    let mut original_policy = profile
+        .get("Policy")
+        .or_else(|| profile.get("policy"))
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let was_disabled = original_policy
+        .get("IsDisabled")
+        .or_else(|| original_policy.get("is_disabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    original_policy
+        .as_object_mut()
+        .expect("user policy was normalized to an object")
+        .insert("IsDisabled".to_string(), serde_json::json!(was_disabled));
+    let mut disabled_policy = original_policy.clone();
+    disabled_policy
+        .as_object_mut()
+        .expect("user policy was normalized to an object")
+        .insert("IsDisabled".to_string(), serde_json::json!(true));
+    update_user_policy_value(client, config, user_id, &disabled_policy).await?;
+
+    let mut url = config.emby_url(&format!("/Users/{user_id}/Password"))?;
+    url.query_pairs_mut()
+        .append_pair("api_key", &config.emby_api_key);
+    let response = client
+        .post(url.clone())
+        .json(&serde_json::json!({
+            "CurrentPw": "",
+            "NewPw": "",
+            "ResetPassword": true,
+        }))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        update_user_policy_value(client, config, user_id, &original_policy)
+            .await
+            .map_err(|error| {
+                AppError::BadGateway(format!(
+                    "Emby user password reset failed with status {status}, and restoring the original user policy also failed: {}",
+                    error.safe_log_message()
+                ))
+            })?;
+        return Err(AppError::BadGateway(format!(
+            "Emby user password reset failed with status {status}"
+        )));
+    }
+
+    let response = client
+        .post(url)
+        .json(&serde_json::json!({
+            "CurrentPw": "",
+            "NewPw": new_password,
+            "ResetPassword": false,
+        }))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(AppError::BadGateway(format!(
+            "Emby password was cleared, but setting the replacement password failed with status {}; the user remains disabled",
+            response.status()
+        )));
+    }
+
+    update_user_policy_value(client, config, user_id, &original_policy)
+        .await
+        .map_err(|error| {
+            AppError::BadGateway(format!(
+                "Emby password was changed, but restoring the original user policy failed; the user remains disabled: {}",
+                error.safe_log_message()
+            ))
+        })?;
+    Ok(())
+}
+
+pub async fn list_sessions_value(
+    client: &reqwest::Client,
+    config: &Config,
+) -> AppResult<Vec<serde_json::Value>> {
+    let url = emby_api_url(config, "/Sessions")?;
+    let response = send_checked(client.get(url), "Emby sessions query").await?;
+    Ok(response.json().await?)
+}
+
+pub async fn list_virtual_folders_value(
+    client: &reqwest::Client,
+    config: &Config,
+) -> AppResult<Vec<serde_json::Value>> {
+    let url = emby_api_url(config, "/Library/VirtualFolders")?;
+    let response = send_checked(client.get(url), "Emby virtual folders query").await?;
+    Ok(response.json().await?)
+}
+
+fn validate_user_id(user_id: &str) -> AppResult<&str> {
+    let user_id = user_id.trim();
+    if user_id.is_empty()
+        || user_id.len() > 128
+        || !user_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(AppError::Validation("invalid Emby user id".to_string()));
+    }
+    Ok(user_id)
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,17 +442,8 @@ pub async fn get_active_playback_sessions(
     client: &reqwest::Client,
     config: &Config,
 ) -> AppResult<Vec<PlaybackSession>> {
-    let mut url = config.emby_url("/Sessions")?;
-    url.query_pairs_mut()
-        .append_pair("api_key", &config.emby_api_key);
-
-    let response = client.get(url).send().await?;
-    if !response.status().is_success() {
-        return Err(AppError::BadGateway(format!(
-            "Emby sessions query failed with status {}",
-            response.status()
-        )));
-    }
+    let url = emby_api_url(config, "/Sessions")?;
+    let response = send_checked(client.get(url), "Emby sessions query").await?;
 
     let sessions = response.json::<Vec<SessionResponse>>().await?;
     let (server_id, server_name) = playback_server_label(config);
@@ -317,17 +525,8 @@ pub async fn get_user_name_by_device_id(
         return Ok(None);
     }
 
-    let mut url = config.emby_url("/Sessions")?;
-    url.query_pairs_mut()
-        .append_pair("api_key", &config.emby_api_key);
-
-    let response = client.get(url).send().await?;
-    if !response.status().is_success() {
-        return Err(AppError::BadGateway(format!(
-            "Emby sessions query failed with status {}",
-            response.status()
-        )));
-    }
+    let url = emby_api_url(config, "/Sessions")?;
+    let response = send_checked(client.get(url), "Emby sessions query").await?;
 
     let sessions = response.json::<Vec<SessionResponse>>().await?;
     Ok(sessions
@@ -348,17 +547,8 @@ pub async fn get_user_name_by_user_id(
         return Ok(None);
     }
 
-    let mut url = config.emby_url(&format!("/Users/{user_id}"))?;
-    url.query_pairs_mut()
-        .append_pair("api_key", &config.emby_api_key);
-
-    let response = client.get(url).send().await?;
-    if !response.status().is_success() {
-        return Err(AppError::BadGateway(format!(
-            "Emby user query failed with status {}",
-            response.status()
-        )));
-    }
+    let url = emby_api_url(config, &format!("/Users/{user_id}"))?;
+    let response = send_checked(client.get(url), "Emby user query").await?;
 
     Ok(response
         .json::<UserResponse>()
@@ -402,17 +592,8 @@ pub async fn find_user_by_name(
         return Ok(None);
     }
 
-    let mut url = config.emby_url("/Users/Query")?;
-    url.query_pairs_mut()
-        .append_pair("api_key", &config.emby_api_key);
-
-    let response = client.get(url).send().await?;
-    if !response.status().is_success() {
-        return Err(AppError::BadGateway(format!(
-            "Emby users query failed with status {}",
-            response.status()
-        )));
-    }
+    let url = emby_api_url(config, "/Users/Query")?;
+    let response = send_checked(client.get(url), "Emby users query").await?;
 
     let users = response.json::<UsersResponse>().await?;
     for value in users.into_values() {
@@ -446,16 +627,8 @@ pub async fn set_user_disabled(
         object.insert("IsDisabled".to_string(), serde_json::json!(disabled));
     }
 
-    let mut url = config.emby_url(&format!("/Users/{user_id}/Policy"))?;
-    url.query_pairs_mut()
-        .append_pair("api_key", &config.emby_api_key);
-    let response = client.post(url).json(&policy).send().await?;
-    if !response.status().is_success() {
-        return Err(AppError::BadGateway(format!(
-            "Emby user policy update failed with status {}",
-            response.status()
-        )));
-    }
+    let url = emby_api_url(config, &format!("/Users/{user_id}/Policy"))?;
+    send_checked(client.post(url).json(&policy), "Emby user policy update").await?;
     Ok(())
 }
 
@@ -484,16 +657,8 @@ async fn get_user_profile(
     config: &Config,
     user_id: &str,
 ) -> AppResult<UserResponse> {
-    let mut url = config.emby_url(&format!("/Users/{user_id}"))?;
-    url.query_pairs_mut()
-        .append_pair("api_key", &config.emby_api_key);
-    let response = client.get(url).send().await?;
-    if !response.status().is_success() {
-        return Err(AppError::BadGateway(format!(
-            "Emby user query failed with status {}",
-            response.status()
-        )));
-    }
+    let url = emby_api_url(config, &format!("/Users/{user_id}"))?;
+    let response = send_checked(client.get(url), "Emby user query").await?;
     Ok(response.json::<UserResponse>().await?)
 }
 
@@ -602,30 +767,14 @@ async fn get_item_counts(
     client: &reqwest::Client,
     config: &Config,
 ) -> AppResult<ItemCountsResponse> {
-    let mut url = config.emby_url("/Items/Counts")?;
-    url.query_pairs_mut()
-        .append_pair("api_key", &config.emby_api_key);
-    let response = client.get(url).send().await?;
-    if !response.status().is_success() {
-        return Err(AppError::BadGateway(format!(
-            "Emby item counts query failed with status {}",
-            response.status()
-        )));
-    }
+    let url = emby_api_url(config, "/Items/Counts")?;
+    let response = send_checked(client.get(url), "Emby item counts query").await?;
     Ok(response.json::<ItemCountsResponse>().await?)
 }
 
 async fn get_user_count(client: &reqwest::Client, config: &Config) -> AppResult<i64> {
-    let mut url = config.emby_url("/Users/Query")?;
-    url.query_pairs_mut()
-        .append_pair("api_key", &config.emby_api_key);
-    let response = client.get(url).send().await?;
-    if !response.status().is_success() {
-        return Err(AppError::BadGateway(format!(
-            "Emby users query failed with status {}",
-            response.status()
-        )));
-    }
+    let url = emby_api_url(config, "/Users/Query")?;
+    let response = send_checked(client.get(url), "Emby users query").await?;
     let users = response.json::<UsersResponse>().await?;
     Ok(match users {
         UsersResponse::Array(items) => items.len() as i64,
@@ -637,30 +786,14 @@ async fn get_system_info(
     client: &reqwest::Client,
     config: &Config,
 ) -> AppResult<SystemInfoResponse> {
-    let mut url = config.emby_url("/System/Info")?;
-    url.query_pairs_mut()
-        .append_pair("api_key", &config.emby_api_key);
-    let response = client.get(url).send().await?;
-    if !response.status().is_success() {
-        return Err(AppError::BadGateway(format!(
-            "Emby system info query failed with status {}",
-            response.status()
-        )));
-    }
+    let url = emby_api_url(config, "/System/Info")?;
+    let response = send_checked(client.get(url), "Emby system info query").await?;
     Ok(response.json::<SystemInfoResponse>().await?)
 }
 
 async fn get_library_count(client: &reqwest::Client, config: &Config) -> AppResult<i64> {
-    let mut url = config.emby_url("/Library/VirtualFolders/Query")?;
-    url.query_pairs_mut()
-        .append_pair("api_key", &config.emby_api_key);
-    let response = client.get(url).send().await?;
-    if !response.status().is_success() {
-        return Err(AppError::BadGateway(format!(
-            "Emby library query failed with status {}",
-            response.status()
-        )));
-    }
+    let url = emby_api_url(config, "/Library/VirtualFolders/Query")?;
+    let response = send_checked(client.get(url), "Emby library query").await?;
     let views = response.json::<ViewsResponse>().await?;
     Ok(views.items.len() as i64)
 }
@@ -676,7 +809,24 @@ fn playback_percent(position_ticks: Option<i64>, runtime_ticks: Option<i64>) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::emby_playback_mode;
+    use super::{emby_api_url, emby_playback_mode};
+    use crate::config::Config;
+
+    #[test]
+    fn api_url_adds_key_without_dropping_path() {
+        let mut config = Config::default_runtime();
+        config.emby_host = "http://emby.example.test/base".to_string();
+        config.emby_api_key = "secret key".to_string();
+
+        let url = emby_api_url(&config, "/Users").expect("valid Emby URL");
+        assert_eq!(url.path(), "/Users");
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "api_key")
+                .map(|(_, value)| value.into_owned()),
+            Some("secret key".to_string())
+        );
+    }
 
     #[test]
     fn playback_mode_normalizes_emby_methods_and_transcoding() {

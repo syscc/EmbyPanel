@@ -8,7 +8,9 @@ import {
   Trash2,
   Users,
 } from '@lucide/vue'
+import CheckboxField from '@/components/ui/CheckboxField.vue'
 import { usePanelContext } from '@/composables/panel-context'
+import UiSwitch from '@/components/ui/UiSwitch.vue'
 
 const {
   clientControl,
@@ -75,24 +77,15 @@ const {
         {{ clientControlError }}
       </div>
       <div class="client-toolbar">
-        <label class="check">
-          <input v-model="clientControl.enabled" type="checkbox" />
-          <span>{{ t('启用 UA 拦截') }}</span>
-        </label>
-        <label class="check">
-          <input
-            v-model="clientControl.playback_rate_limit_enabled"
-            type="checkbox"
-          />
-          <span>{{ t('启用播放频率限制') }}</span>
-        </label>
-        <label class="check">
-          <input
-            v-model="clientControl.concurrent_playback_limit_enabled"
-            type="checkbox"
-          />
-          <span>{{ t('启用同时播放限制') }}</span>
-        </label>
+        <CheckboxField v-model="clientControl.enabled" :label="t('启用 UA 拦截')" />
+        <CheckboxField
+          v-model="clientControl.playback_rate_limit_enabled"
+          :label="t('启用播放频率限制')"
+        />
+        <CheckboxField
+          v-model="clientControl.concurrent_playback_limit_enabled"
+          :label="t('启用同时播放限制')"
+        />
       </div>
       <div class="rate-limit-grid">
         <label>
@@ -157,10 +150,10 @@ const {
             </thead>
             <tbody>
               <tr v-for="record in activeRateLimitBlocks" :key="record.id">
-                <td>{{ playbackRateActionLabel(record.action) }}</td>
-                <td>{{ rateLimitBlockReason(record) }}</td>
-                <td>{{ record.server_name }}</td>
-                <td>
+                <td :data-label="t('封禁方式')">{{ playbackRateActionLabel(record.action) }}</td>
+                <td :data-label="t('封禁原因')">{{ rateLimitBlockReason(record) }}</td>
+                <td :data-label="t('服务器')">{{ record.server_name }}</td>
+                <td :data-label="t('IP')">
                   <strong>{{ rateLimitBlockIp(record) }}</strong>
                   <small
                     v-if="formatIpLocation(record.ip_location)"
@@ -168,9 +161,9 @@ const {
                     >{{ formatIpLocation(record.ip_location) }}</small
                   >
                 </td>
-                <td>{{ record.user_name || '--' }}</td>
-                <td>{{ formatTimestamp(record.blocked_until) }}</td>
-                <td>
+                <td :data-label="t('用户')">{{ record.user_name || '--' }}</td>
+                <td :data-label="t('到期时间')">{{ formatTimestamp(record.blocked_until) }}</td>
+                <td :data-label="t('操作')">
                   <button class="secondary" @click="unblockRateLimit(record)">
                     <ShieldCheck :size="15" />{{ t('解除封禁') }}
                   </button>
@@ -220,8 +213,8 @@ const {
               v-for="row in rateLimitWindows"
               :key="`${row.server_id}-${row.ip}`"
             >
-              <td>{{ formatServerName(row.server_id) }}</td>
-              <td>
+              <td :data-label="t('服务器')">{{ formatServerName(row.server_id) }}</td>
+              <td :data-label="t('IP')">
                 <strong>{{ row.ip }}</strong>
                 <small
                   v-if="formatIpLocation(row.ip_location)"
@@ -229,13 +222,13 @@ const {
                   >{{ formatIpLocation(row.ip_location) }}</small
                 >
               </td>
-              <td>{{ row.user_name || '--' }}</td>
-              <td>{{ row.current_count }}</td>
-              <td>{{ row.threshold }}</td>
-              <td>{{ row.remaining }}</td>
-              <td>{{ row.window_seconds }}s</td>
-              <td>{{ formatTimestamp(row.reset_at) }}</td>
-              <td>
+              <td :data-label="t('用户')">{{ row.user_name || '--' }}</td>
+              <td :data-label="t('当前次数')">{{ row.current_count }}</td>
+              <td :data-label="t('阈值')">{{ row.threshold }}</td>
+              <td :data-label="t('剩余')">{{ row.remaining }}</td>
+              <td :data-label="t('窗口')">{{ row.window_seconds }}s</td>
+              <td :data-label="t('重置时间')">{{ formatTimestamp(row.reset_at) }}</td>
+              <td :data-label="t('状态')">
                 <span
                   :class="['client-badge', row.blocked ? 'blocked' : 'allowed']"
                 >
@@ -354,12 +347,12 @@ const {
           </thead>
           <tbody>
             <tr v-for="record in clientRuleRows" :key="record.id">
-              <td>
+              <td :data-label="t('关键字')">
                 <strong :title="clientKeyword(record)">{{
                   clientKeyword(record)
                 }}</strong>
               </td>
-              <td>
+              <td :data-label="t('描述')">
                 <span
                   :title="
                     record.note ||
@@ -376,7 +369,7 @@ const {
                   }}
                 </span>
               </td>
-              <td>
+              <td :data-label="t('状态')">
                 <span
                   :class="[
                     'client-badge',
@@ -386,22 +379,18 @@ const {
                   {{ record.enabled ? t('已禁用') : t('允许播放') }}
                 </span>
               </td>
-              <td class="client-time-cell">
+              <td class="client-time-cell" :data-label="t('记录时间')">
                 {{ formatTimestamp(record.created_at) }}
               </td>
-              <td>
+              <td :data-label="t('操作')">
                 <div class="rule-actions">
-                  <button
-                    type="button"
-                    :class="['switch-button', { active: record.enabled }]"
-                    :aria-pressed="record.enabled"
-                    :aria-label="
-                      record.enabled ? t('关闭 UA 拦截') : t('开启 UA 拦截')
-                    "
-                    @click="toggleClientRule(record)"
-                  >
-                    <span />
-                  </button>
+                  <UiSwitch
+                    size="compact"
+                    tone="danger"
+                    :model-value="record.enabled"
+                    :label="record.enabled ? t('关闭 UA 拦截') : t('开启 UA 拦截')"
+                    @update:model-value="toggleClientRule(record)"
+                  />
                   <button
                     type="button"
                     class="danger-button"

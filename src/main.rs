@@ -18,6 +18,7 @@ mod proxy;
 mod rewrite;
 mod settings_api;
 mod url_mapping;
+mod users_api;
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -32,7 +33,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Query, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Query, Request, State},
     http::{Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::{any, get},
@@ -61,6 +62,7 @@ use block_log::BlockLogStore;
 use file_log::FileLogStore;
 
 const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BACKUP_IMPORT_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_POOL_MAX_IDLE_PER_HOST: usize = 16;
@@ -68,6 +70,7 @@ const PROXY_RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const PROXY_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const PROXY_REBIND_TIMEOUT: Duration = Duration::from_secs(2);
 const PASSWORD_TASK_CONCURRENCY_LIMIT: usize = 4;
+const USER_PASSWORD_RESET_CONCURRENCY_LIMIT: usize = 2;
 const PLAYBACK_PATH_STATE_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const PLAYBACK_PATH_STATE_CAPACITY: usize = 256;
 const PLAYBACK_USER_CACHE_TTL: Duration = Duration::from_secs(12 * 60 * 60);
@@ -189,7 +192,11 @@ struct AppState {
     settings_store: SettingsStore,
     telemetry_writes: TelemetryWriteQueue,
     client_control_cache: Arc<StdRwLock<Option<(u64, client_control::ClientControlConfig)>>>,
+    user_policies_cache: Arc<StdRwLock<Option<(u64, users_api::UserPoliciesDocument)>>>,
+    rate_limit_updates: Arc<Mutex<()>>,
+    playback_sessions_cache: Arc<Mutex<HashMap<String, (Instant, Vec<emby::PlaybackSession>)>>>,
     password_tasks: Arc<Semaphore>,
+    user_password_tasks: Arc<Semaphore>,
     crypto_keys: CryptoKeys,
     activity_log: Arc<ActivityLogStore>,
     file_log: Arc<FileLogStore>,
@@ -679,7 +686,11 @@ async fn main() -> AppResult<()> {
         settings_store,
         telemetry_writes,
         client_control_cache: Arc::new(StdRwLock::new(None)),
+        user_policies_cache: Arc::new(StdRwLock::new(None)),
+        rate_limit_updates: Arc::new(Mutex::new(())),
+        playback_sessions_cache: Arc::new(Mutex::new(HashMap::new())),
         password_tasks: Arc::new(Semaphore::new(PASSWORD_TASK_CONCURRENCY_LIMIT)),
+        user_password_tasks: Arc::new(Semaphore::new(USER_PASSWORD_RESET_CONCURRENCY_LIMIT)),
         crypto_keys: CryptoKeys::generate()?,
         activity_log: Arc::new(ActivityLogStore::new(800)),
         file_log,
@@ -1135,6 +1146,32 @@ fn build_management_app(state: AppState) -> Router {
             "/api/profile",
             get(auth::get_profile).put(auth::update_profile),
         )
+        .route("/api/users", get(users_api::list_users))
+        .route(
+            "/api/users/{server_id}",
+            axum::routing::post(users_api::create_user),
+        )
+        .route(
+            "/api/users/{server_id}/{user_id}",
+            get(users_api::get_user).delete(users_api::delete_user),
+        )
+        .route(
+            "/api/users/{server_id}/{user_id}/policy",
+            axum::routing::put(users_api::update_user_policy),
+        )
+        .route(
+            "/api/users/{server_id}/{user_id}/password",
+            axum::routing::post(users_api::reset_user_password),
+        )
+        .route("/api/user-templates", get(users_api::list_user_templates))
+        .route(
+            "/api/user-templates/{server_id}",
+            axum::routing::post(users_api::save_user_template),
+        )
+        .route(
+            "/api/user-templates/{server_id}/{template_id}",
+            axum::routing::delete(users_api::delete_user_template),
+        )
         .route(
             "/api/monitoring/plays",
             get(monitoring::list_playback_sessions),
@@ -1221,7 +1258,8 @@ fn build_management_app(state: AppState) -> Router {
         )
         .route(
             "/api/settings/backup/import",
-            axum::routing::post(settings_api::import_backup),
+            axum::routing::post(settings_api::import_backup)
+                .layer(DefaultBodyLimit::max(MAX_BACKUP_IMPORT_REQUEST_BYTES)),
         )
         .nest_service(
             "/ui",
@@ -1984,6 +2022,7 @@ async fn handle_video_stream(
                 playback_user: &playback_user,
                 playback_ip: &playback_ip,
                 item_id: &item_id,
+                device_id: device_id.as_deref(),
             },
         )
         .await?;
@@ -2927,7 +2966,11 @@ mod tests {
             settings_store,
             telemetry_writes,
             client_control_cache: Arc::new(StdRwLock::new(None)),
+            user_policies_cache: Arc::new(StdRwLock::new(None)),
+            rate_limit_updates: Arc::new(Mutex::new(())),
+            playback_sessions_cache: Arc::new(Mutex::new(HashMap::new())),
             password_tasks: Arc::new(Semaphore::new(PASSWORD_TASK_CONCURRENCY_LIMIT)),
+            user_password_tasks: Arc::new(Semaphore::new(USER_PASSWORD_RESET_CONCURRENCY_LIMIT)),
             crypto_keys: CryptoKeys::generate().unwrap(),
             activity_log: Arc::new(ActivityLogStore::new(100)),
             block_log: Arc::new(BlockLogStore::new()),
@@ -3300,6 +3343,7 @@ mod tests {
                 playback_user: "test",
                 playback_ip: "10.0.0.88",
                 item_id: "item-4",
+                device_id: None,
             },
         )
         .await
@@ -3311,7 +3355,7 @@ mod tests {
                 .playback_rate_ip_bans
                 .lock()
                 .await
-                .get("10.0.0.88")
+                .get("default:10.0.0.88")
                 .is_some(),
             true
         );
@@ -3363,6 +3407,7 @@ mod tests {
                 playback_user: "test",
                 playback_ip: "10.0.0.89",
                 item_id: "item-1",
+                device_id: None,
             },
         )
         .await

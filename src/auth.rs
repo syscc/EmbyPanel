@@ -104,14 +104,12 @@ pub async fn setup(
             "admin already initialized".to_string(),
         ));
     };
-    if let Err(err) = state.settings_store.record_audit(
+    state.settings_store.record_audit_best_effort(
         Some(admin_user_id),
         "account.setup",
         "初始化管理员账户",
         "success",
-    ) {
-        tracing::error!(error = %err.safe_log_message(), "failed to record account setup audit");
-    }
+    );
     Ok(Json(AuthResponse { token }).into_response())
 }
 
@@ -219,14 +217,12 @@ pub async fn change_password(
             "invalid or expired session".to_string(),
         ));
     }
-    if let Err(err) = state.settings_store.record_audit(
+    state.settings_store.record_audit_best_effort(
         Some(admin_user_id),
         "account.password",
         "修改管理员密码",
         "success",
-    ) {
-        tracing::error!(error = %err.safe_log_message(), "failed to record password change audit");
-    }
+    );
     Ok(Json(PasswordChangedResponse {
         changed: true,
         token,
@@ -242,14 +238,12 @@ pub async fn logout(
         .settings_store
         .revoke_session(&token_hash, now_ts())?
         .ok_or_else(|| AppError::Unauthorized("invalid or expired session".to_string()))?;
-    if let Err(err) = state.settings_store.record_audit(
+    state.settings_store.record_audit_best_effort(
         Some(admin_user_id),
         "account.logout",
         "管理员退出登录",
         "success",
-    ) {
-        tracing::error!(error = %err.safe_log_message(), "failed to record logout audit");
-    }
+    );
     Ok(Json(LogoutResponse { logged_out: true }))
 }
 

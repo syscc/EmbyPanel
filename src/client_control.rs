@@ -6,7 +6,10 @@ use axum::{
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
 use url::Url;
 
 use crate::{
@@ -51,6 +54,7 @@ pub struct ConcurrentPlaybackLimitInput<'a> {
     pub playback_user: &'a str,
     pub playback_ip: &'a str,
     pub item_id: &'a str,
+    pub device_id: Option<&'a str>,
 }
 
 struct RateLimitNotification<'a> {
@@ -226,6 +230,7 @@ pub async fn update_client_control(
     let payload: UpdateClientControlRequest = state
         .crypto_keys
         .decrypt_named(&request, "client_control")?;
+    let _updates = state.rate_limit_updates.lock().await;
     let mut config = load_or_default(&state)?;
     config.enabled = payload.enabled;
     config.notify_enabled = payload.notify_enabled;
@@ -265,6 +270,7 @@ pub async fn update_client_control(
     state
         .settings_store
         .save_setting_json(SETTING_KEY, &config)?;
+    drop(_updates);
     state.settings_store.record_audit(
         Some(admin_user_id),
         "client_control.update",
@@ -282,6 +288,7 @@ pub async fn add_user_agent_rule(
     let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
     let payload: AddUserAgentRuleRequest =
         state.crypto_keys.decrypt_named(&request, "client_rule")?;
+    let _updates = state.rate_limit_updates.lock().await;
     let mut config = load_or_default(&state)?;
     let user_agent = normalize_manual_user_agent_rule(&payload.user_agent);
     if user_agent.is_empty() {
@@ -323,6 +330,7 @@ pub async fn add_user_agent_rule(
     state
         .settings_store
         .save_setting_json(SETTING_KEY, &config)?;
+    drop(_updates);
     state.settings_store.record_audit(
         Some(admin_user_id),
         "client_rule.add",
@@ -340,6 +348,7 @@ pub async fn toggle_client_rule(
     let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
     let payload: ToggleClientRuleRequest =
         state.crypto_keys.decrypt_named(&request, "client_rule")?;
+    let _updates = state.rate_limit_updates.lock().await;
     let mut config = load_or_default(&state)?;
     if let Some(record) = config
         .records
@@ -354,6 +363,7 @@ pub async fn toggle_client_rule(
     state
         .settings_store
         .save_setting_json(SETTING_KEY, &config)?;
+    drop(_updates);
     state.settings_store.record_audit(
         Some(admin_user_id),
         "client_rule.toggle",
@@ -371,6 +381,7 @@ pub async fn delete_client_rule(
     let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
     let payload: DeleteClientRuleRequest =
         state.crypto_keys.decrypt_named(&request, "client_rule")?;
+    let _updates = state.rate_limit_updates.lock().await;
     let mut config = load_or_default(&state)?;
     let before_len = config.records.len();
     config.records.retain(|record| record.id != payload.id);
@@ -380,6 +391,7 @@ pub async fn delete_client_rule(
     state
         .settings_store
         .save_setting_json(SETTING_KEY, &config)?;
+    drop(_updates);
     state.settings_store.record_audit(
         Some(admin_user_id),
         "client_rule.delete",
@@ -416,8 +428,20 @@ pub async fn unblock_rate_limit(
     let ip = record.ip.clone();
     let user_name = record.user_name.clone();
     let blocked_until = record.blocked_until.clone();
-    state.playback_rate_ip_bans.lock().await.remove(&ip);
-    state.playback_rate_bans.lock().await.remove(&user_name);
+    if action_blocks_ip(&action) {
+        state
+            .playback_rate_ip_bans
+            .lock()
+            .await
+            .remove(&server_ip_key(&server_id, &ip));
+    }
+    if action_uses_user_key(&action) {
+        state
+            .playback_rate_bans
+            .lock()
+            .await
+            .remove(&server_user_key(&server_id, &user_name));
+    }
 
     if action_disables_user(&action) && !user_name.trim().is_empty() && user_name != "--" {
         let runtime_config = state
@@ -432,9 +456,17 @@ pub async fn unblock_rate_limit(
         }
     }
 
-    state
-        .settings_store
-        .save_setting_json(SETTING_KEY, &config)?;
+    let config = {
+        let _updates = state.rate_limit_updates.lock().await;
+        let mut latest = load_or_default(&state)?;
+        latest
+            .rate_limit_blocks
+            .retain(|current| current.id != record.id);
+        state
+            .settings_store
+            .save_setting_json(SETTING_KEY, &latest)?;
+        latest
+    };
     state.settings_store.record_audit(
         Some(admin_user_id),
         "rate_limit.unblock",
@@ -739,6 +771,45 @@ fn load_or_default(state: &AppState) -> AppResult<ClientControlConfig> {
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((revision, config.clone()));
     Ok(config)
+}
+
+pub(crate) fn backup_config(state: &AppState) -> AppResult<ClientControlConfig> {
+    Ok(prepare_backup_config(
+        load_or_default(state)?,
+        now_seconds(),
+    ))
+}
+
+pub(crate) fn prepare_backup_config(
+    mut config: ClientControlConfig,
+    now: u64,
+) -> ClientControlConfig {
+    config
+        .records
+        .retain(|record| record.enabled || matches!(&record.source, ClientRuleSource::Manual));
+    prune_inactive_rate_limit_blocks(&mut config, now);
+    config
+}
+
+pub(crate) fn normalize_restored_config(
+    config: Option<ClientControlConfig>,
+) -> ClientControlConfig {
+    let mut config = config.unwrap_or_else(default_config);
+    migrate_webhook_config(&mut config);
+    normalize_client_rule_records(&mut config);
+    normalize_client_control_limits(&mut config);
+    config.playback_rate_limit_action =
+        normalize_playback_rate_limit_action(&config.playback_rate_limit_action);
+    prune_inactive_rate_limit_blocks(&mut config, now_seconds());
+    config
+}
+
+pub(crate) async fn clear_restored_runtime_state(state: &AppState) {
+    state.playback_rate_hits.lock().await.clear();
+    state.playback_rate_recent_events.lock().await.clear();
+    state.playback_rate_bans.lock().await.clear();
+    state.playback_rate_ip_bans.lock().await.clear();
+    state.playback_sessions_cache.lock().await.clear();
 }
 
 fn default_config() -> ClientControlConfig {
@@ -1052,13 +1123,14 @@ fn active_webhooks(webhooks: Vec<WebhookNotifyConfig>) -> Vec<WebhookNotifyConfi
 fn normalize_playback_rate_limit_action(action: &str) -> String {
     match action.trim().to_ascii_lowercase().as_str() {
         "disable_user" | "user" | "disable" => "disable_user".to_string(),
+        "block_user" | "user_block" => "block_user".to_string(),
         "mixed" | "both" | "all" | "disable_user_and_block_ip" => "mixed".to_string(),
         _ => "block_ip".to_string(),
     }
 }
 
 fn action_requires_user(action: &str) -> bool {
-    action == "disable_user"
+    action == "disable_user" || action == "block_user"
 }
 
 fn action_disables_user(action: &str) -> bool {
@@ -1070,12 +1142,13 @@ fn action_blocks_ip(action: &str) -> bool {
 }
 
 fn action_uses_user_key(action: &str) -> bool {
-    action == "disable_user"
+    action == "disable_user" || action == "block_user"
 }
 
 fn rate_limit_action_label(action: &str) -> &'static str {
     match action {
         "disable_user" => "禁用用户",
+        "block_user" => "封禁用户",
         "mixed" => "混合模式",
         _ => "屏蔽 IP",
     }
@@ -1123,25 +1196,20 @@ fn make_room_for_rate_state<T>(entries: &mut HashMap<String, T>, key: &str) {
     }
 }
 
-fn upsert_rate_limit_block(
-    config: &mut ClientControlConfig,
-    server_id: &str,
-    server_name: &str,
-    action: &str,
-    ip: &str,
-    user_name: &str,
-    blocked_until: u64,
-) {
-    upsert_rate_limit_block_with_note(
-        config,
-        server_id,
-        server_name,
-        action,
-        ip,
-        user_name,
-        blocked_until,
-        rate_limit_block_note(action, ip, user_name),
-    );
+fn server_user_key(server_id: &str, user_name: &str) -> String {
+    format!("{}:{}", server_id.trim(), user_name.trim().to_lowercase())
+}
+
+fn server_ip_key(server_id: &str, ip: &str) -> String {
+    format!("{}:{}", server_id.trim(), ip.trim())
+}
+
+fn rate_limit_subject(user_level: bool, user_name: &str, ip: &str) -> String {
+    if user_level && !user_name.trim().is_empty() && user_name.trim() != "--" {
+        format!("user:{}", user_name.trim().to_lowercase())
+    } else {
+        format!("ip:{}", ip.trim())
+    }
 }
 
 fn upsert_rate_limit_block_with_note(
@@ -1196,13 +1264,130 @@ fn upsert_rate_limit_block_with_note(
 fn rate_limit_block_note(action: &str, ip: &str, user_name: &str) -> String {
     match action {
         "disable_user" => format!("频率超限禁用用户 {user_name}"),
+        "block_user" => format!("限制超限封禁用户 {user_name}"),
         "mixed" => format!("频率超限禁用用户 {user_name} 并屏蔽 IP {ip}"),
         _ => format!("频率超限屏蔽 IP {ip}"),
     }
 }
 
 fn concurrent_limit_block_note(ip: &str, user_name: &str) -> String {
-    format!("同时播放超限屏蔽用户 {user_name} 的 IP {ip}")
+    format!("同时播放超限封禁用户 {user_name}（来源 IP {ip}）")
+}
+
+const PLAYBACK_SESSION_CACHE_TTL: Duration = Duration::from_secs(2);
+const PLAYBACK_SESSION_CACHE_CAPACITY: usize = 128;
+
+async fn persist_rate_limit_pruning(state: &AppState) -> AppResult<()> {
+    let _updates = state.rate_limit_updates.lock().await;
+    let _ = load_or_default(state)?;
+    Ok(())
+}
+
+fn persist_rate_limit_block_locked(
+    state: &AppState,
+    server_id: &str,
+    server_name: &str,
+    action: &str,
+    ip: &str,
+    user_name: &str,
+    blocked_until: u64,
+    note: String,
+) -> AppResult<()> {
+    let mut config = load_or_default(state)?;
+    upsert_rate_limit_block_with_note(
+        &mut config,
+        server_id,
+        server_name,
+        action,
+        ip,
+        user_name,
+        blocked_until,
+        note,
+    );
+    state.settings_store.save_setting_json(SETTING_KEY, &config)
+}
+
+async fn active_playback_sessions(
+    state: &AppState,
+    server_id: &str,
+    config: &Config,
+) -> AppResult<Vec<emby::PlaybackSession>> {
+    let now = Instant::now();
+    {
+        let cache = state.playback_sessions_cache.lock().await;
+        if let Some((fetched_at, sessions)) = cache.get(server_id)
+            && now.duration_since(*fetched_at) < PLAYBACK_SESSION_CACHE_TTL
+        {
+            return Ok(sessions.clone());
+        }
+    }
+
+    let sessions = emby::get_active_playback_sessions(&state.client, config).await?;
+    let mut cache = state.playback_sessions_cache.lock().await;
+    if cache.len() >= PLAYBACK_SESSION_CACHE_CAPACITY && !cache.contains_key(server_id) {
+        if let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, (fetched_at, _))| *fetched_at)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest_key);
+        }
+    }
+    cache.insert(server_id.to_string(), (now, sessions.clone()));
+    Ok(sessions)
+}
+
+fn count_active_playback_sessions(
+    sessions: &[emby::PlaybackSession],
+    server_id: &str,
+    playback_user: &str,
+    item_id: &str,
+    device_id: Option<&str>,
+) -> u64 {
+    let requested_device_id = device_id.map(str::trim).filter(|value| !value.is_empty());
+    let device_id = requested_device_id.filter(|device_id| {
+        sessions.iter().any(|session| {
+            session.server_id == server_id
+                && session.user_name.trim().eq_ignore_ascii_case(playback_user)
+                && session.device_id.as_deref().map(str::trim) == Some(*device_id)
+        })
+    });
+    let current_item_id = item_id.trim();
+    let mut skipped_same_item = false;
+    let mut count = 0_u64;
+    for session in sessions {
+        if session.server_id != server_id
+            || !session.user_name.trim().eq_ignore_ascii_case(playback_user)
+        {
+            continue;
+        }
+        if let Some(device_id) = device_id {
+            if session.device_id.as_deref().map(str::trim) == Some(device_id) {
+                continue;
+            }
+        } else if !current_item_id.is_empty()
+            && session.item_id.trim() == current_item_id
+            && !skipped_same_item
+        {
+            skipped_same_item = true;
+            continue;
+        }
+        count += 1;
+    }
+    count
+}
+
+fn effective_concurrent_playback_limit(
+    global_limit: Option<u64>,
+    user_limit: Option<u64>,
+) -> Option<u64> {
+    match (global_limit, user_limit) {
+        (Some(global), Some(user)) => Some(global.min(user)),
+        (Some(global), None) => Some(global),
+        (None, Some(user)) => Some(user),
+        (None, None) => None,
+    }
+    .map(|limit| limit.max(1))
 }
 
 fn empty_audit_value(value: &str) -> &str {
@@ -1386,11 +1571,40 @@ pub async fn enforce_playback_rate_limit(
     input: PlaybackRateLimitInput<'_>,
 ) -> AppResult<bool> {
     let mut config = load_or_default(state)?;
-    if !config.playback_rate_limit_enabled {
+    let user_policy =
+        crate::users_api::user_policy_for(state, input.server_id, input.playback_user.trim())?;
+    let user_rate_enabled = user_policy
+        .as_ref()
+        .is_some_and(|policy| policy.rate_limit_enabled);
+    if !config.playback_rate_limit_enabled && !user_rate_enabled {
         return Ok(false);
     }
 
-    let action = normalize_playback_rate_limit_action(&config.playback_rate_limit_action);
+    let action = user_policy
+        .as_ref()
+        .filter(|policy| policy.rate_limit_enabled)
+        .map(|policy| normalize_playback_rate_limit_action(&policy.rate_limit_action))
+        .unwrap_or_else(|| {
+            normalize_playback_rate_limit_action(&config.playback_rate_limit_action)
+        });
+    let effective_window = user_policy
+        .as_ref()
+        .filter(|policy| policy.rate_limit_enabled)
+        .map_or(config.playback_rate_limit_window_seconds, |policy| {
+            policy.rate_limit_window_seconds
+        });
+    let effective_max_requests = user_policy
+        .as_ref()
+        .filter(|policy| policy.rate_limit_enabled)
+        .map_or(config.playback_rate_limit_max_requests, |policy| {
+            policy.rate_limit_max_requests
+        });
+    let effective_block_seconds = user_policy
+        .as_ref()
+        .filter(|policy| policy.rate_limit_enabled)
+        .map_or(config.playback_rate_limit_block_seconds, |policy| {
+            policy.rate_limit_block_seconds
+        });
     let playback_user = input.playback_user.trim();
     let playback_ip = input.playback_ip.trim();
     if playback_ip.is_empty() || playback_ip == "--" {
@@ -1402,58 +1616,59 @@ pub async fn enforce_playback_rate_limit(
     }
 
     let now = now_seconds();
-    let mut changed = prune_inactive_rate_limit_blocks(&mut config, now);
+    let changed = prune_inactive_rate_limit_blocks(&mut config, now);
     if config.rate_limit_blocks.iter().any(|record| {
         record.enabled
             && record.server_id == input.server_id
             && record.blocked_until.parse::<u64>().unwrap_or_default() > now
             && if action_uses_user_key(&action) {
-                record.user_name == playback_user
+                record.user_name.eq_ignore_ascii_case(playback_user)
             } else {
                 record.ip == playback_ip
             }
     }) {
         if changed {
-            state
-                .settings_store
-                .save_setting_json(SETTING_KEY, &config)?;
+            persist_rate_limit_pruning(state).await?;
         }
         return Ok(true);
     }
     {
+        let user_ban_key = server_user_key(input.server_id, playback_user);
         let mut bans = state.playback_rate_bans.lock().await;
         if bans
-            .get(playback_user)
+            .get(&user_ban_key)
             .is_some_and(|blocked_until| *blocked_until <= now)
         {
-            bans.remove(playback_user);
+            bans.remove(&user_ban_key);
         }
-        if let Some(blocked_until) = bans.get(playback_user).copied() {
+        if let Some(blocked_until) = bans.get(&user_ban_key).copied() {
             if blocked_until > now {
                 return Ok(true);
             }
         }
     }
     {
+        let ip_ban_key = server_ip_key(input.server_id, playback_ip);
         let mut ip_bans = state.playback_rate_ip_bans.lock().await;
         if ip_bans
-            .get(playback_ip)
+            .get(&ip_ban_key)
             .is_some_and(|blocked_until| *blocked_until <= now)
         {
-            ip_bans.remove(playback_ip);
+            ip_bans.remove(&ip_ban_key);
         }
-        if let Some(blocked_until) = ip_bans.get(playback_ip).copied() {
+        if let Some(blocked_until) = ip_bans.get(&ip_ban_key).copied() {
             if blocked_until > now {
                 return Ok(true);
             }
         }
     }
 
-    let window = config.playback_rate_limit_window_seconds.max(1);
-    let max_requests = config.playback_rate_limit_max_requests.max(1);
+    let window = effective_window.max(1);
+    let max_requests = effective_max_requests.max(1);
     let event_key = input.playback_event.trim();
     if !event_key.is_empty() {
-        let recent_key = format!("{}:{playback_ip}:{event_key}", input.server_id);
+        let rate_subject = rate_limit_subject(user_rate_enabled, playback_user, playback_ip);
+        let recent_key = format!("{}:{rate_subject}:{event_key}", input.server_id);
         let mut recent_events = state.playback_rate_recent_events.lock().await;
         if recent_events.get(&recent_key).is_some_and(|timestamp| {
             now.saturating_sub(*timestamp) >= PLAYBACK_RATE_RECENT_EVENT_TTL_SECONDS
@@ -1478,7 +1693,8 @@ pub async fn enforce_playback_rate_limit(
             recent_events.insert(recent_key, now);
         }
     } else if input.skip_recent_event || input.record_recent_event {
-        let recent_key = format!("{}:{playback_ip}:playback-start", input.server_id);
+        let rate_subject = rate_limit_subject(user_rate_enabled, playback_user, playback_ip);
+        let recent_key = format!("{}:{rate_subject}:playback-start", input.server_id);
         let mut recent_events = state.playback_rate_recent_events.lock().await;
         if recent_events.get(&recent_key).is_some_and(|timestamp| {
             now.saturating_sub(*timestamp) >= PLAYBACK_RATE_RECENT_EVENT_TTL_SECONDS
@@ -1504,7 +1720,11 @@ pub async fn enforce_playback_rate_limit(
         }
     }
 
-    let key = format!("{}:{}", input.server_id, playback_ip);
+    let key = format!(
+        "{}:{}",
+        input.server_id,
+        rate_limit_subject(user_rate_enabled, playback_user, playback_ip)
+    );
     let should_block = {
         let mut hits = state.playback_rate_hits.lock().await;
         if !hits.contains_key(&key) && hits.len() >= PLAYBACK_RATE_STATE_CAPACITY {
@@ -1534,10 +1754,71 @@ pub async fn enforce_playback_rate_limit(
     };
 
     if should_block {
-        let block_seconds = config.playback_rate_limit_block_seconds.max(1);
+        let block_seconds = effective_block_seconds.max(1);
         let blocked_until = now.saturating_add(block_seconds);
         let notify_enabled = config.notify_enabled;
         let webhooks = config.webhooks.clone();
+        let already_blocked = {
+            let _updates = state.rate_limit_updates.lock().await;
+            let mut latest = load_or_default(state)?;
+            let pruned = prune_inactive_rate_limit_blocks(&mut latest, now);
+            let already_blocked = latest.rate_limit_blocks.iter().any(|record| {
+                record.enabled
+                    && record.server_id == input.server_id
+                    && record.blocked_until.parse::<u64>().unwrap_or_default() > now
+                    && if action_uses_user_key(&action) {
+                        record.user_name.eq_ignore_ascii_case(playback_user)
+                    } else {
+                        record.ip == playback_ip
+                    }
+            });
+            if already_blocked {
+                if pruned {
+                    state
+                        .settings_store
+                        .save_setting_json(SETTING_KEY, &latest)?;
+                }
+                true
+            } else {
+                persist_rate_limit_block_locked(
+                    state,
+                    input.server_id,
+                    input.server_name,
+                    &action,
+                    playback_ip,
+                    playback_user,
+                    blocked_until,
+                    rate_limit_block_note(&action, playback_ip, playback_user),
+                )?;
+                if action_disables_user(&action) && has_playback_user {
+                    let user_ban_key = server_user_key(input.server_id, playback_user);
+                    let mut bans = state.playback_rate_bans.lock().await;
+                    if !bans.contains_key(&user_ban_key)
+                        && bans.len() >= PLAYBACK_RATE_STATE_CAPACITY
+                    {
+                        bans.retain(|_, blocked_until| *blocked_until > now);
+                    }
+                    make_room_for_rate_state(&mut bans, &user_ban_key);
+                    bans.insert(user_ban_key, blocked_until);
+                }
+                if action_blocks_ip(&action) {
+                    let ip_ban_key = server_ip_key(input.server_id, playback_ip);
+                    let mut ip_bans = state.playback_rate_ip_bans.lock().await;
+                    if !ip_bans.contains_key(&ip_ban_key)
+                        && ip_bans.len() >= PLAYBACK_RATE_STATE_CAPACITY
+                    {
+                        ip_bans.retain(|_, blocked_until| *blocked_until > now);
+                    }
+                    make_room_for_rate_state(&mut ip_bans, &ip_ban_key);
+                    ip_bans.insert(ip_ban_key, blocked_until);
+                }
+                false
+            }
+        };
+        if already_blocked {
+            return Ok(true);
+        }
+
         if action_disables_user(&action) && has_playback_user {
             if let Err(err) =
                 disable_emby_user_by_name(input.client, input.runtime_config, playback_user).await
@@ -1570,20 +1851,8 @@ pub async fn enforce_playback_rate_limit(
                     ),
                 );
             }
-            let mut bans = state.playback_rate_bans.lock().await;
-            if !bans.contains_key(playback_user) && bans.len() >= PLAYBACK_RATE_STATE_CAPACITY {
-                bans.retain(|_, blocked_until| *blocked_until > now);
-            }
-            make_room_for_rate_state(&mut bans, playback_user);
-            bans.insert(playback_user.to_string(), blocked_until);
         }
         if action_blocks_ip(&action) {
-            let mut ip_bans = state.playback_rate_ip_bans.lock().await;
-            if !ip_bans.contains_key(playback_ip) && ip_bans.len() >= PLAYBACK_RATE_STATE_CAPACITY {
-                ip_bans.retain(|_, blocked_until| *blocked_until > now);
-            }
-            make_room_for_rate_state(&mut ip_bans, playback_ip);
-            ip_bans.insert(playback_ip.to_string(), blocked_until);
             state.activity_log.record(
                 crate::activity_log::ActivityKind::General,
                 crate::activity_log::ActivityLevel::Warn,
@@ -1599,15 +1868,6 @@ pub async fn enforce_playback_rate_limit(
                 ),
             );
         }
-        upsert_rate_limit_block(
-            &mut config,
-            input.server_id,
-            input.server_name,
-            &action,
-            playback_ip,
-            playback_user,
-            blocked_until,
-        );
         let ip_location_text = state
             .ip_location
             .lookup(playback_ip)
@@ -1634,8 +1894,6 @@ pub async fn enforce_playback_rate_limit(
                 "窗口: {window}s; 阈值: {max_requests}; 封禁: {block_seconds}s; 到期: {blocked_until}"
             ),
         });
-        changed = true;
-
         if notify_enabled {
             notify_rate_limit_block(
                 state,
@@ -1657,9 +1915,7 @@ pub async fn enforce_playback_rate_limit(
     }
 
     if changed {
-        state
-            .settings_store
-            .save_setting_json(SETTING_KEY, &config)?;
+        persist_rate_limit_pruning(state).await?;
     }
 
     Ok(should_block)
@@ -1670,9 +1926,21 @@ pub async fn enforce_concurrent_playback_limit(
     input: ConcurrentPlaybackLimitInput<'_>,
 ) -> AppResult<bool> {
     let mut config = load_or_default(state)?;
-    if !config.concurrent_playback_limit_enabled {
+    let user_policy =
+        crate::users_api::user_policy_for(state, input.server_id, input.playback_user.trim())?;
+    let user_concurrent_limit = user_policy
+        .as_ref()
+        .filter(|policy| policy.concurrent_playback_limit_enabled)
+        .map(|policy| policy.concurrent_playback_limit_max);
+    let user_concurrent_enabled = user_concurrent_limit.is_some();
+    let Some(max_concurrent) = effective_concurrent_playback_limit(
+        config
+            .concurrent_playback_limit_enabled
+            .then_some(config.concurrent_playback_limit_max),
+        user_concurrent_limit,
+    ) else {
         return Ok(false);
-    }
+    };
 
     let playback_user = input.playback_user.trim();
     let playback_ip = input.playback_ip.trim();
@@ -1684,32 +1952,53 @@ pub async fn enforce_concurrent_playback_limit(
         return Ok(false);
     }
 
-    let action = "block_ip";
+    let action = if user_concurrent_enabled {
+        "block_user"
+    } else {
+        "block_ip"
+    };
     let now = now_seconds();
-    let mut changed = prune_inactive_rate_limit_blocks(&mut config, now);
+    let changed = prune_inactive_rate_limit_blocks(&mut config, now);
     if config.rate_limit_blocks.iter().any(|record| {
         record.enabled
             && record.server_id == input.server_id
             && record.action == action
-            && record.ip == playback_ip
+            && if action_uses_user_key(action) {
+                record.user_name.eq_ignore_ascii_case(playback_user)
+            } else {
+                record.ip == playback_ip
+            }
             && record.blocked_until.parse::<u64>().unwrap_or_default() > now
     }) {
         if changed {
-            state
-                .settings_store
-                .save_setting_json(SETTING_KEY, &config)?;
+            persist_rate_limit_pruning(state).await?;
         }
         return Ok(true);
     }
-    {
-        let mut ip_bans = state.playback_rate_ip_bans.lock().await;
-        if ip_bans
-            .get(playback_ip)
+    if action_uses_user_key(action) {
+        let user_ban_key = server_user_key(input.server_id, playback_user);
+        let mut bans = state.playback_rate_bans.lock().await;
+        if bans
+            .get(&user_ban_key)
             .is_some_and(|blocked_until| *blocked_until <= now)
         {
-            ip_bans.remove(playback_ip);
+            bans.remove(&user_ban_key);
         }
-        if let Some(blocked_until) = ip_bans.get(playback_ip).copied() {
+        if let Some(blocked_until) = bans.get(&user_ban_key).copied() {
+            if blocked_until > now {
+                return Ok(true);
+            }
+        }
+    } else {
+        let ip_ban_key = server_ip_key(input.server_id, playback_ip);
+        let mut ip_bans = state.playback_rate_ip_bans.lock().await;
+        if ip_bans
+            .get(&ip_ban_key)
+            .is_some_and(|blocked_until| *blocked_until <= now)
+        {
+            ip_bans.remove(&ip_ban_key);
+        }
+        if let Some(blocked_until) = ip_bans.get(&ip_ban_key).copied() {
             if blocked_until > now {
                 return Ok(true);
             }
@@ -1717,7 +2006,7 @@ pub async fn enforce_concurrent_playback_limit(
     }
 
     let sessions =
-        match emby::get_active_playback_sessions(&state.client, input.runtime_config).await {
+        match active_playback_sessions(state, input.server_id, input.runtime_config).await {
             Ok(sessions) => sessions,
             Err(err) => {
                 state.activity_log.record(
@@ -1732,59 +2021,93 @@ pub async fn enforce_concurrent_playback_limit(
                     ),
                 );
                 if changed {
-                    state
-                        .settings_store
-                        .save_setting_json(SETTING_KEY, &config)?;
+                    persist_rate_limit_pruning(state).await?;
                 }
                 return Ok(false);
             }
         };
-    let current_item_id = input.item_id.trim();
-    let active_count = sessions
-        .iter()
-        .filter(|session| {
-            session.server_id == input.server_id
-                && session.user_name.trim().eq_ignore_ascii_case(playback_user)
-                && {
-                    let session_item_id = session.item_id.trim();
-                    current_item_id.is_empty()
-                        || session_item_id.is_empty()
-                        || session_item_id != current_item_id
-                }
-        })
-        .count() as u64;
-    let max_concurrent = config.concurrent_playback_limit_max.max(1);
+    let active_count = count_active_playback_sessions(
+        &sessions,
+        input.server_id,
+        playback_user,
+        input.item_id,
+        input.device_id,
+    );
     if active_count < max_concurrent {
         if changed {
-            state
-                .settings_store
-                .save_setting_json(SETTING_KEY, &config)?;
+            persist_rate_limit_pruning(state).await?;
         }
         return Ok(false);
     }
 
-    let block_seconds = config.playback_rate_limit_block_seconds.max(1);
+    let block_seconds = user_policy
+        .as_ref()
+        .filter(|policy| policy.concurrent_playback_limit_enabled)
+        .map_or(config.playback_rate_limit_block_seconds, |policy| {
+            policy.rate_limit_block_seconds
+        })
+        .max(1);
     let blocked_until = now.saturating_add(block_seconds);
     let notify_enabled = config.notify_enabled;
     let webhooks = config.webhooks.clone();
-    {
-        let mut ip_bans = state.playback_rate_ip_bans.lock().await;
-        if !ip_bans.contains_key(playback_ip) && ip_bans.len() >= PLAYBACK_RATE_STATE_CAPACITY {
-            ip_bans.retain(|_, blocked_until| *blocked_until > now);
+    let already_blocked = {
+        let _updates = state.rate_limit_updates.lock().await;
+        let mut latest = load_or_default(state)?;
+        let pruned = prune_inactive_rate_limit_blocks(&mut latest, now);
+        let already_blocked = latest.rate_limit_blocks.iter().any(|record| {
+            record.enabled
+                && record.server_id == input.server_id
+                && record.action == action
+                && if action_uses_user_key(action) {
+                    record.user_name.eq_ignore_ascii_case(playback_user)
+                } else {
+                    record.ip == playback_ip
+                }
+                && record.blocked_until.parse::<u64>().unwrap_or_default() > now
+        });
+        if already_blocked {
+            if pruned {
+                state
+                    .settings_store
+                    .save_setting_json(SETTING_KEY, &latest)?;
+            }
+            true
+        } else {
+            persist_rate_limit_block_locked(
+                state,
+                input.server_id,
+                input.server_name,
+                action,
+                playback_ip,
+                playback_user,
+                blocked_until,
+                concurrent_limit_block_note(playback_ip, playback_user),
+            )?;
+            if action_uses_user_key(action) {
+                let user_ban_key = server_user_key(input.server_id, playback_user);
+                let mut bans = state.playback_rate_bans.lock().await;
+                if !bans.contains_key(&user_ban_key) && bans.len() >= PLAYBACK_RATE_STATE_CAPACITY {
+                    bans.retain(|_, blocked_until| *blocked_until > now);
+                }
+                make_room_for_rate_state(&mut bans, &user_ban_key);
+                bans.insert(user_ban_key, blocked_until);
+            } else {
+                let ip_ban_key = server_ip_key(input.server_id, playback_ip);
+                let mut ip_bans = state.playback_rate_ip_bans.lock().await;
+                if !ip_bans.contains_key(&ip_ban_key)
+                    && ip_bans.len() >= PLAYBACK_RATE_STATE_CAPACITY
+                {
+                    ip_bans.retain(|_, blocked_until| *blocked_until > now);
+                }
+                make_room_for_rate_state(&mut ip_bans, &ip_ban_key);
+                ip_bans.insert(ip_ban_key, blocked_until);
+            }
+            false
         }
-        make_room_for_rate_state(&mut ip_bans, playback_ip);
-        ip_bans.insert(playback_ip.to_string(), blocked_until);
+    };
+    if already_blocked {
+        return Ok(true);
     }
-    upsert_rate_limit_block_with_note(
-        &mut config,
-        input.server_id,
-        input.server_name,
-        action,
-        playback_ip,
-        playback_user,
-        blocked_until,
-        concurrent_limit_block_note(playback_ip, playback_user),
-    );
     let ip_location_text = state
         .ip_location
         .lookup(playback_ip)
@@ -1796,9 +2119,10 @@ pub async fn enforce_concurrent_playback_limit(
         crate::activity_log::ActivityLevel::Warn,
         Some(input.server_id),
         "同时播放限制",
-        "屏蔽 IP",
+        rate_limit_action_label(action),
         format!(
-            "用户 {playback_user} 已有 {active_count} 路播放，超过允许同时播放 {max_concurrent} 路，屏蔽 IP {playback_ip} {block_seconds}s"
+            "用户 {playback_user} 已有 {active_count} 路播放，超过允许同时播放 {max_concurrent} 路，{} {block_seconds}s",
+            rate_limit_action_label(action)
         ),
     );
     state.block_log.record(crate::block_log::BlockLogInsert {
@@ -1811,7 +2135,7 @@ pub async fn enforce_concurrent_playback_limit(
         path: "concurrent_limit/block",
         path_type: "rate_limit_action",
         status_code: 429,
-        outcome: "屏蔽 IP",
+        outcome: rate_limit_action_label(action),
         duration_ms: 0,
         playback_user,
         playback_ip,
@@ -1821,8 +2145,6 @@ pub async fn enforce_concurrent_playback_limit(
             "当前播放: {active_count}; 允许同时播放: {max_concurrent}; 封禁: {block_seconds}s; 到期: {blocked_until}"
         ),
     });
-    changed = true;
-
     if notify_enabled {
         notify_concurrent_playback_block(
             state,
@@ -1841,12 +2163,6 @@ pub async fn enforce_concurrent_playback_limit(
             active_count,
         )
         .await;
-    }
-
-    if changed {
-        state
-            .settings_store
-            .save_setting_json(SETTING_KEY, &config)?;
     }
 
     Ok(true)
@@ -1960,6 +2276,35 @@ fn rule_matches(record: &ClientRuleRecord, user_agent: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn playback_session(item_id: &str, device_id: Option<&str>) -> emby::PlaybackSession {
+        emby::PlaybackSession {
+            server_id: "server-a".to_string(),
+            server_name: "Server A".to_string(),
+            id: format!("session-{item_id}-{}", device_id.unwrap_or("none")),
+            item_id: item_id.to_string(),
+            series_id: None,
+            season_number: None,
+            episode_number: None,
+            item_type: None,
+            media_source_id: None,
+            device_id: device_id.map(str::to_string),
+            user_name: "alice".to_string(),
+            client: "test".to_string(),
+            device_name: "device".to_string(),
+            user_agent: "test".to_string(),
+            playback_ip: None,
+            ip_location: None,
+            item_name: item_id.to_string(),
+            series_name: None,
+            position_ticks: None,
+            runtime_ticks: None,
+            percent: None,
+            play_method: None,
+            playback_mode: "unknown".to_string(),
+            transcoding: false,
+        }
+    }
 
     fn rule(user_agent: &str, client_name: &str) -> ClientRuleRecord {
         ClientRuleRecord {
@@ -2132,5 +2477,69 @@ mod tests {
 
         assert_eq!(entries.len(), PLAYBACK_RATE_STATE_CAPACITY);
         assert_eq!(entries.get("new-client"), Some(&usize::MAX));
+    }
+
+    #[test]
+    fn concurrent_limit_excludes_only_current_device() {
+        let sessions = vec![
+            playback_session("item-1", Some("device-a")),
+            playback_session("item-1", Some("device-b")),
+            playback_session("item-2", Some("device-c")),
+        ];
+
+        assert_eq!(
+            count_active_playback_sessions(
+                &sessions,
+                "server-a",
+                "alice",
+                "item-1",
+                Some("device-a")
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn concurrent_limit_without_device_excludes_only_one_same_item() {
+        let sessions = vec![
+            playback_session("item-1", Some("device-a")),
+            playback_session("item-1", Some("device-b")),
+            playback_session("item-2", Some("device-c")),
+        ];
+
+        assert_eq!(
+            count_active_playback_sessions(&sessions, "server-a", "alice", "item-1", None),
+            2
+        );
+    }
+
+    #[test]
+    fn concurrent_limit_uses_lowest_enabled_value() {
+        assert_eq!(
+            effective_concurrent_playback_limit(Some(3), Some(10)),
+            Some(3)
+        );
+        assert_eq!(
+            effective_concurrent_playback_limit(Some(10), Some(3)),
+            Some(3)
+        );
+        assert_eq!(effective_concurrent_playback_limit(Some(3), None), Some(3));
+        assert_eq!(
+            effective_concurrent_playback_limit(None, Some(10)),
+            Some(10)
+        );
+        assert_eq!(effective_concurrent_playback_limit(None, None), None);
+    }
+
+    #[test]
+    fn user_concurrent_action_is_not_an_ip_action() {
+        assert_eq!(
+            normalize_playback_rate_limit_action("block_user"),
+            "block_user"
+        );
+        assert!(action_requires_user("block_user"));
+        assert!(action_uses_user_key("block_user"));
+        assert!(!action_blocks_ip("block_user"));
+        assert!(!action_disables_user("block_user"));
     }
 }

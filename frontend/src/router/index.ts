@@ -21,6 +21,11 @@ export const pageRoutes: RouteRecordRaw[] = [
     component: () => import('@/pages/ClientsPage.vue'),
   },
   {
+    path: '/users',
+    name: 'users',
+    component: () => import('@/pages/UsersPage.vue'),
+  },
+  {
     path: '/notifications',
     name: 'notifications',
     component: () => import('@/pages/NotificationsPage.vue'),

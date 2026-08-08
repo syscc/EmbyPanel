@@ -522,9 +522,9 @@ onBeforeUnmount(() => {
               v-for="row in rateLimitWindows.slice(0, 5)"
               :key="`home-${row.server_id}-${row.ip}`"
             >
-              <td>{{ playbackRateActionLabel(row.block_action) }}</td>
-              <td>{{ formatServerName(row.server_id) }}</td>
-              <td>
+              <td :data-label="t('封禁方式')">{{ playbackRateActionLabel(row.block_action) }}</td>
+              <td :data-label="t('服务器')">{{ formatServerName(row.server_id) }}</td>
+              <td :data-label="t('IP')">
                 <strong>{{ row.ip }}</strong>
                 <small
                   v-if="formatIpLocation(row.ip_location)"
@@ -532,17 +532,17 @@ onBeforeUnmount(() => {
                   >{{ formatIpLocation(row.ip_location) }}</small
                 >
               </td>
-              <td>{{ row.user_name || '--' }}</td>
-              <td>{{ row.current_count }}/{{ row.threshold }}</td>
-              <td>{{ row.window_seconds }}s</td>
-              <td>
+              <td :data-label="t('用户')">{{ row.user_name || '--' }}</td>
+              <td :data-label="t('命中')">{{ row.current_count }}/{{ row.threshold }}</td>
+              <td :data-label="t('窗口')">{{ row.window_seconds }}s</td>
+              <td :data-label="t('状态')">
                 <span
                   :class="['client-badge', row.blocked ? 'blocked' : 'allowed']"
                 >
                   {{ row.blocked ? t('已封禁') : t('观察中') }}
                 </span>
               </td>
-              <td>
+              <td :data-label="t('操作')">
                 <button
                   v-if="row.blocked && row.block_id"
                   type="button"

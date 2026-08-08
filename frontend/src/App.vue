@@ -14,6 +14,7 @@ import {
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterView } from 'vue-router'
 import ParticleBackdrop from '@/components/ParticleBackdrop.vue'
+import ActionDialogHost from '@/components/ActionDialogHost.vue'
 import PreferenceControls from '@/components/ui/PreferenceControls.vue'
 import { providePanelContext } from '@/composables/panel-context'
 import { usePanelController } from '@/composables/usePanelController'
@@ -363,6 +364,8 @@ onBeforeUnmount(() => {
           </template>
         </section>
       </div>
+
+      <ActionDialogHost />
     </section>
   </main>
 </template>

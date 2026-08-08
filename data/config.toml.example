@@ -1,9 +1,11 @@
 emby_host = "http://localhost:8096"
 emby_api_key = "your_emby_api_key"
 port = 18096
+cache_enabled = true
 cache_ttl_seconds = 180
 enable_internal_redirect = false
 internal_redirect_timeout_seconds = 15
+strm_url_mapping_enabled = true
 strm_url_mappings = """
 # 每行一个映射：原地址 => 新地址
 https://source.example.com => http://media-gateway.local:5244

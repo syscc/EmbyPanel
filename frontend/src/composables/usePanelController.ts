@@ -1,13 +1,27 @@
-import type * as Forge from 'node-forge'
 import { Archive, Bell, FileText, LayoutDashboard, Server, UserRound, Users } from '@lucide/vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 
 import { useRoute, useRouter } from 'vue-router'
+import { useActionDialog } from '@/composables/useActionDialog'
+import { useBackupController } from '@/composables/useBackupController'
+import { usePayloadEncryption } from '@/composables/usePayloadEncryption'
+import { createApiClient } from '@/lib/api-client'
+import {
+  emptyToNull,
+  formatBytes,
+  formatLogTime as formatLogTimeValue,
+  formatTicks,
+  formatTimestamp as formatTimestampValue,
+  formatTimestampMs as formatTimestampMsValue,
+  formatUptime as formatUptimeValue,
+  isHttpUrl,
+  requestOutcomeClass,
+} from '@/lib/panel-formatters'
+import { translations } from '@/lib/translations'
 import type {
   Settings,
   RealIpMode,
   EmbyServerConfig,
-  PublicKeyResponse,
   AppInfo,
   Profile,
   PlaybackSession,
@@ -37,7 +51,6 @@ import type {
   LogKindFilter,
   LogViewFilter,
   Locale,
-  EncryptionPublicKey,
 } from '@/types/panel'
 
 export function usePanelController() {
@@ -45,10 +58,11 @@ export function usePanelController() {
   const pageKey = 'embypanel_page'
   const themeKey = 'embypanel_theme'
   const localeKey = 'embypanel_locale'
-  const validPages: Page[] = ['home', 'server', 'clients', 'logs', 'notifications', 'backup', 'account']
+  const validPages: Page[] = ['home', 'server', 'clients', 'users', 'logs', 'notifications', 'backup', 'account']
   const mode = ref<AuthMode>('loading')
   const route = useRoute()
   const router = useRouter()
+  const { confirmAction, promptAction } = useActionDialog()
   const page = computed<Page>(() => {
     const routeName = route.name
     return typeof routeName === 'string' && validPages.includes(routeName as Page)
@@ -69,7 +83,6 @@ export function usePanelController() {
   const savingAccount = ref(false)
   const error = ref('')
   const notice = ref('')
-  const publicKey = ref<EncryptionPublicKey | null>(null)
   const playbackSessions = ref<PlaybackSession[]>([])
   const playbackLoading = ref(false)
   const playbackError = ref('')
@@ -104,6 +117,19 @@ export function usePanelController() {
   const selectedAuditAction = ref('all')
   const overviewError = ref('')
   const healthError = ref('')
+
+  const api = createApiClient({
+    getToken: () => token.value,
+    onUnauthorized(path, requestToken) {
+      if (path !== '/api/change-password' && passwordChangeToken === requestToken) {
+        deferredAuthExpiredToken = requestToken
+      } else {
+        handleAuthExpired(requestToken)
+      }
+    },
+  })
+  const { encryptPayload, warmPublicKey, randomId } = usePayloadEncryption({ api, translate: t })
+
   const clientControl = reactive<ClientControlConfig>({
     enabled: false,
     notify_enabled: false,
@@ -134,8 +160,6 @@ export function usePanelController() {
   const revealedApiKeys = ref<Record<string, string>>({})
   const revealingApiKeyServers = ref<Record<string, boolean>>({})
   const expandedServerCards = ref<Record<string, boolean>>({})
-  const backupError = ref('')
-  const backupFileInput = ref<HTMLInputElement | null>(null)
   const logConfig = reactive<SystemLogConfig>({
     debug_mode: false,
     level: 'info',
@@ -162,7 +186,6 @@ export function usePanelController() {
   let settingsRequest: Promise<void> | undefined
   let clientControlRequest: Promise<void> | undefined
   let logConfigRequest: Promise<void> | undefined
-  let forgeRequest: Promise<typeof import('node-forge')> | undefined
 
   const credentials = reactive({
     username: '',
@@ -192,399 +215,6 @@ export function usePanelController() {
     ui_path: '/ui/',
   })
 
-  const translations: Record<string, string> = {
-    '加载中': 'Loading',
-    '首次初始化': 'First-time setup',
-    '管理员登录': 'Administrator sign in',
-    '用户名': 'Username',
-    '密码': 'Password',
-    '处理中': 'Working',
-    '创建并进入': 'Create and enter',
-    '登录': 'Sign in',
-    '首页': 'Overview',
-    '服务器': 'Servers',
-    '客户端': 'Clients',
-    '日志': 'Logs',
-    '通知': 'Notifications',
-    '备份': 'Backups',
-    '账户': 'Account',
-    '退出登录': 'Sign out',
-    '登出': 'Sign out',
-    '切换到浅色模式': 'Switch to light mode',
-    '切换到暗夜模式': 'Switch to dark mode',
-    '浅色模式': 'Light mode',
-    '暗夜模式': 'Dark mode',
-    '中文': 'Chinese',
-    '英文': 'English',
-    '简体中文': 'Simplified Chinese',
-    '切换语言': 'Change language',
-    'English': 'English',
-    '检查更新': 'Check for updates',
-    '正在检查更新': 'Checking for updates',
-    '点击检查更新': 'Click to check for updates',
-    '有新版本': 'New version available',
-    '检查失败': 'Update check failed',
-    '版本读取中': 'Reading version',
-    '检查中': 'Checking',
-    '有更新': 'Update available',
-    '最新': 'Up to date',
-    '失败': 'Failed',
-    '媒体库总览': 'Media overview',
-    '在线': 'Online',
-    '电影': 'Movies',
-    '剧集': 'Series',
-    '总集数': 'Episodes',
-    '集数': 'Episodes',
-    '个媒体库': 'libraries',
-    '用户': 'Users',
-    '服务器状态': 'System health',
-    '运行': 'Uptime',
-    '内存': 'Memory',
-    '磁盘': 'Disk',
-    '核': 'cores',
-    '运维概览': 'Operations',
-    '健康检查、反代监听和今日请求统计。': 'Health checks, proxy listeners, and today\'s traffic.',
-    '刷新': 'Refresh',
-    '刷新中': 'Refreshing',
-    '今日请求': 'Requests today',
-    '重定向': 'Redirects',
-    '缓存命中': 'Cache hits',
-    '拦截 / 错误': 'Blocks / errors',
-    '健康': 'Healthy',
-    '待检查': 'Needs check',
-    'STRM 直链': 'STRM direct links',
-    '内存直链缓存': 'In-memory direct-link cache',
-    '今日累计': 'Today total',
-    '端口': 'Port',
-    '最近请求': 'Last request',
-    '最近巡检': 'Last check',
-    '耗时': 'Latency',
-    '反代': 'Proxy',
-    '最近自动重启': 'Last automatic restart',
-    '播放频率限制': 'Playback rate limit',
-    '活跃窗口': 'Active windows',
-    '已封禁': 'Blocked',
-    '最高命中': 'Peak count',
-    '实时播放': 'Live playback',
-    '转码': 'Transcoding',
-    '直放': 'Direct play',
-    '直链播放': 'Direct link',
-    '服务器代理播放': 'Server proxy',
-    '服务器转码': 'Server transcoding',
-    'Emby 直接播放': 'Emby direct play',
-    'Emby 直接串流': 'Emby direct stream',
-    '播放路径待确认': 'Detecting route',
-    '服务器配置': 'Server configuration',
-    '添加服务器': 'Add server',
-    '测试配置': 'Test configuration',
-    '保存配置': 'Save configuration',
-    '保存中': 'Saving',
-    '收起配置': 'Collapse',
-    '展开配置': 'Configure',
-    '关闭服务器': 'Disable server',
-    '开启服务器': 'Enable server',
-    '屏蔽 Emby Web UI': 'Block Emby Web UI',
-    '开启后禁止通过当前反代端口访问 /web 页面，不影响 Emby API 和播放。': 'Blocks /web through this proxy port without affecting Emby APIs or playback.',
-    '重启服务器': 'Restart server',
-    '重启中': 'Restarting',
-    '删除': 'Delete',
-    '名称': 'Name',
-    'Emby 地址': 'Emby address',
-    '反代端口': 'Proxy port',
-    '真实 IP 获取方式': 'Client IP strategy',
-    '可信代理 IP / CIDR': 'Trusted proxy IPs / CIDRs',
-    '缓存秒数': 'Cache TTL (seconds)',
-    '缓存最大条数': 'Cache capacity',
-    '缓存与巡检': 'Cache and monitoring',
-    '直链与重定向': 'Direct links and redirects',
-    '取消': 'Cancel',
-    '应用': 'Apply',
-    '已配置': 'Configured',
-    '秒': 'seconds',
-    '修改后需保存配置才会生效。': 'Changes take effect after saving the configuration.',
-    'OpenList 地址': 'OpenList address',
-    'OpenList Token': 'OpenList token',
-    '客户端管控': 'Client controls',
-    '通知配置': 'Notification settings',
-    '配置备份': 'Configuration backup',
-    '账户资料': 'Profile',
-    '账户与安全': 'Account and security',
-    '用户名留空保持不变；密码字段全部留空时不修改密码。': 'Leave the username blank to keep it unchanged; leave all password fields blank to keep the current password.',
-    '留空则保持当前用户名不变。': 'Leave blank to keep the current username.',
-    '修改密码': 'Change password',
-    '密码字段全部留空时不会修改密码。': 'Leave all password fields blank to keep the current password.',
-    '配置审计': 'Configuration audit',
-    '保存': 'Save',
-    '导出 CSV': 'Export CSV',
-    '筛选': 'Filter',
-    '搜索': 'Search',
-    '添加 Webhook': 'Add webhook',
-    '命中通知': 'Match notifications',
-    '启用': 'Enabled',
-    '密钥（可选）': 'Secret (optional)',
-    'Webhook 使用 POST JSON 发送：{ title, text }。命中通知包含播放频率屏蔽和 UA 拦截命中。': 'Webhooks send POST JSON with { title, text } for rate-limit and UA block events.',
-    '例如：企业微信通知': 'e.g. Operations notification',
-    '可选密钥': 'Optional secret',
-    '请求体固定为 {"title":"${title}","text":"${text}"}，密钥会通过 `X-Webhook-Secret` 头发送。': 'The request body is {"title":"${title}","text":"${text}"}; the secret is sent in the X-Webhook-Secret header.',
-    '导出备份': 'Export',
-    '还原': 'Restore',
-    '关闭': 'Close',
-    '成功': 'Success',
-    '警告': 'Warning',
-    '错误': 'Error',
-    '信息': 'Info',
-    '正常': 'Normal',
-    '异常': 'Issue',
-    '未启动': 'Stopped',
-    '未启用': 'Disabled',
-    '监听中': 'Listening',
-    '未监听': 'Not listening',
-    '未巡检': 'Not checked',
-    '未配置': 'Not configured',
-    '无失败': 'No failures',
-    '暂无详情': 'No details',
-    '暂无审计记录。': 'No audit records.',
-    '主导航': 'Primary navigation',
-    '系统在线': 'System online',
-    '打开导航': 'Open navigation',
-    '播放日志': 'Playback logs',
-    '拦截日志': 'Blocked logs',
-    '反代请求': 'Proxy requests',
-    '运行日志': 'Runtime logs',
-    '实时刷新': 'Live refresh',
-    '日志文件配置': 'Log file settings',
-    '系统识别': 'Automatic detection',
-    '从 HTTP Header 中获取': 'Read from an HTTP header',
-    '从 Header 列表中获取': 'Read from a header list',
-    '获取 X-Forwarded-For 的上一级代理地址': 'Use the previous X-Forwarded-For hop',
-    '获取 X-Forwarded-For 的上上一级代理地址': 'Use the second previous X-Forwarded-For hop',
-    '获取 X-Forwarded-For 的上上上一级代理地址': 'Use the third previous X-Forwarded-For hop',
-    '屏蔽 IP': 'Block IP',
-    '禁用用户': 'Disable user',
-    '混合模式': 'Mixed mode',
-    '屏蔽频繁播放的 IP': 'Block high-frequency playback IPs',
-    '通过 API 禁用该用户': 'Disable the user through the API',
-    '同时禁用用户并屏蔽频繁播放的 IP': 'Disable the user and block the IP',
-    '全部级别': 'All levels',
-    '已拦截': 'Blocked',
-    '封禁变更': 'Ban changes',
-    'REDIRECT - 直链/跳转': 'REDIRECT - direct link / redirect',
-    'CACHE - 缓存命中': 'CACHE - cache hit',
-    'WARNING - 警告': 'WARNING - warning',
-    'BLOCKED - 已拦截': 'BLOCKED - blocked',
-    'INFO - 信息': 'INFO - info',
-    'SUCCESS - 成功': 'SUCCESS - success',
-    'ERROR - 错误': 'ERROR - error',
-    'DEBUG - 调试': 'DEBUG - debug',
-    'CRITICAL - 严重': 'CRITICAL - critical',
-    '正在读取媒体库总览': 'Reading media overview',
-    '正在读取服务器状态': 'Reading system health',
-    '首页直接查看当前窗口命中和封禁情况。': 'Monitor active windows and blocks at a glance.',
-    '当前监控中的 IP': 'IPs currently being monitored',
-    '屏蔽 IP / 禁用用户': 'Blocked IPs / disabled users',
-    '当前窗口最大次数': 'Highest count in the current window',
-    '封禁方式': 'Action',
-    '命中': 'Hits',
-    '窗口': 'Window',
-    '状态': 'Status',
-    '条': 'records',
-    '解除封禁': 'Unblock',
-    '观察中': 'Watching',
-    '当前没有播放频率窗口数据。': 'No playback rate windows.',
-    '正在读取 Emby 播放会话': 'Reading Emby sessions',
-    '当前没有正在播放的媒体': 'No media is playing',
-    '每个 Emby 服务器使用独立反代端口，保存后自动监听。': 'Each Emby server uses an independent proxy port and starts listening after save.',
-    '例如：主服务器': 'e.g. Main server',
-    '启动': 'Started',
-    '隐藏 Emby API Key': 'Hide Emby API key',
-    '显示 Emby API Key': 'Show Emby API key',
-    '例如：x-real-ip': 'e.g. x-real-ip',
-    '从下列常用 CDN 携带真实 IP 的 HTTP Header 中获取，按顺序取第一个能获取到的值。': 'Check the common CDN client-IP headers below and use the first available value.',
-    '默认使用系统识别。经过 CDN 或多层反代后 IP 不准时再配置，保存后只会差量同步受影响的反代监听器。': 'Use automatic detection by default. Configure this only when a CDN or proxy chain reports the wrong IP; saving updates only affected proxy listeners.',
-    '只有来自可信代理地址的转发头才会被接受；留空时忽略所有转发头并使用连接来源 IP。': 'Forwarded headers are accepted only from trusted proxy addresses. When empty, all forwarded headers are ignored and the connection peer IP is used.',
-    '可选': 'Optional',
-    '启用服务器连通性巡检': 'Enable connectivity checks',
-    '巡检间隔秒数': 'Check interval (seconds)',
-    '单项超时秒数': 'Check timeout (seconds)',
-    '反代无响应自动重启秒数': 'Proxy auto-restart delay (seconds)',
-    '填 0 表示不自动重启；只在反代端口连续无响应时触发。': 'Use 0 to disable automatic restarts. It only triggers after continuous proxy failures.',
-    '缓存过滤模式': 'Cache filter mode',
-    '不过滤': 'No filter',
-    '白名单：命中才缓存': 'Allowlist: cache matches only',
-    '黑名单：命中不缓存': 'Blocklist: skip matching hosts',
-    '缓存过滤域名': 'Cache host filters',
-    '支持多个域名、通配符或关键字；每行一个，例如：*.115cdn.* 或 115': 'One host, wildcard, or keyword per line, such as *.115cdn.* or 115',
-    '只匹配直链域名部分。白名单命中才缓存；黑名单命中不缓存，其他直链正常缓存。': 'Filters match direct-link hosts only. Allowlist matches are cached; blocklist matches are skipped.',
-    '开启内部重定向 HEAD 解析': 'Resolve internal redirects with HEAD',
-    'HEAD 超时秒数': 'HEAD timeout (seconds)',
-    'STRM URL 映射': 'STRM URL mappings',
-    '配置测试结果': 'Configuration test results',
-    '重新测试': 'Run again',
-    '还没有运行配置测试。': 'No configuration test has run yet.',
-    '自动记录播放设备和 UA，也可以按播放频率临时禁用账号。': 'Track playback devices and user agents, with temporary rate-based blocks.',
-    '启用 UA 拦截': 'Enable UA blocking',
-    '启用播放频率限制': 'Enable playback rate limiting',
-    '启用同时播放限制': 'Enable concurrent playback limit',
-    '屏蔽方式': 'Block action',
-    '封禁原因': 'Block reason',
-    '同时播放超限': 'Concurrent playback limit',
-    '到期时间': 'Expires',
-    '检测时间窗口（秒）': 'Detection window (seconds)',
-    '最大播放次数': 'Maximum play requests',
-    '封禁时长（秒）': 'Block duration (seconds)',
-    '允许同时播放数': 'Concurrent play limit',
-    '当前次数': 'Current count',
-    '阈值': 'Threshold',
-    '剩余': 'Remaining',
-    '重置时间': 'Resets',
-    '暂无频率限制封禁。': 'No active rate-limit blocks.',
-    '播放频率窗口': 'Playback rate windows',
-    '显示当前检测窗口内各 IP 的播放请求计数。': 'Request counts for each IP in the current detection window.',
-    '客户端记录': 'Client records',
-    '手动添加 UA 拦截': 'Add a UA block',
-    '输入 UA 完整内容或关键字，保存后默认进入禁用状态。': 'Enter a full UA or keyword. New rules start in blocked mode.',
-    'UA 关键字': 'UA keyword',
-    '描述': 'Description',
-    '例如：Infuse / Fileball / okhttp': 'e.g. Infuse / Fileball / okhttp',
-    '例如：临时禁用某客户端': 'e.g. Temporarily block a client',
-    '日期说明': 'Date reference',
-    '时间为该 UA 第一次出现或手动添加的时间；后台更新时间只在规则状态、备注或客户端信息变化时刷新，同一 UA 重复请求不会每次刷新。': 'The date is when this UA first appeared or was added. Repeated requests do not continually update it.',
-    '关键字': 'Keyword',
-    '记录时间': 'Recorded at',
-    '操作': 'Actions',
-    '自动记录播放设备': 'Automatically detected playback device',
-    '手动 UA 拦截': 'Manual UA block',
-    '关闭 UA 拦截': 'Disable UA blocking',
-    '开启 UA 拦截': 'Enable UA blocking',
-    '当前筛选没有匹配的客户端。': 'No clients match the current filters.',
-    '暂无客户端记录，开始播放后会自动出现，也可以手动添加 UA 拦截。': 'No client records yet. Playback devices appear automatically, or you can add a UA block.',
-    '添加拦截': 'Add block',
-    '添加中': 'Adding',
-    '搜索 UA': 'Search UA',
-    '清空筛选': 'Clear filters',
-    '全部': 'All',
-    '已禁用': 'Disabled',
-    '允许播放': 'Allowed',
-    '保存通知': 'Save notifications',
-    '测试连接': 'Test connection',
-    '测试中': 'Testing',
-    '配置文件备份 / 还原': 'Backup / restore',
-    '导出配置文件，或从电脑选择配置文件还原运行配置。': 'Export a configuration file or restore one from this device.',
-    '备份范围': 'Backup scope',
-    'Emby 地址、API Key、反代端口、真实 IP、缓存和映射规则': 'Emby address, API key, proxy port, client IP, cache, and mapping rules',
-    'UA 拦截、播放频率限制、封禁列表和客户端规则': 'UA blocks, playback limits, ban lists, and client rules',
-    'Webhook 地址、启用状态和密钥': 'Webhook URLs, enabled state, and secrets',
-    '日志配置': 'Log settings',
-    '日志级别、文件大小、保留数量和格式': 'Log level, file size, retention count, and format',
-    '备份文件会使用备份密码加密；不包含面板管理员用户名、密码、登录会话、运行日志文件和请求统计数据。': 'Backups are encrypted with your password and exclude administrator credentials, sessions, runtime logs, and request statistics.',
-    '输入备份密码后生成加密的 `embypanel-config-时间.json` 并弹出浏览器下载。': 'Enter a password to create and download an encrypted embypanel-config timestamp file.',
-    '点击后选择本机配置文件，加密备份需要输入对应密码，读取成功后自动还原并差量同步受影响的反代监听器。': 'Choose a local configuration file. Encrypted backups require their password; restoring updates only affected proxy listeners.',
-    '日志类型': 'Log type',
-    '单列表查看播放日志、拦截日志、反代请求和运行日志，页面打开时每 3 秒自动刷新。': 'Review playback, blocked, proxy, and runtime logs in one stream with a three-second live refresh.',
-    '级别': 'Level',
-    '全部服务器': 'All servers',
-    '请求类型': 'Request type',
-    '全部请求': 'All requests',
-    '关键词': 'Keyword',
-    '搜索用户 / IP / URL / 信息': 'Search user / IP / URL / message',
-    '开始时间': 'Start time',
-    '结束时间': 'End time',
-    '加载更多': 'Load more',
-    '单次最多': 'Up to',
-    '保留': 'retained for',
-    '天或最近': 'days or the latest',
-    '内存最多保留最近': 'Memory retains the latest',
-    '条可视化日志': 'visual log records',
-    '点击复制链接': 'Click to copy link',
-    '未命中': 'Miss',
-    '已解除': 'Unblocked',
-    '未拦截': 'Not blocked',
-    '已显示': 'Showing',
-    '暂无': 'No',
-    '保存日志配置': 'Save log settings',
-    '日志级别': 'Log level',
-    '单文件最大 MB': 'Maximum file size (MB)',
-    '保留文件数': 'Files to retain',
-    '日志格式': 'Log format',
-    '日志写入 data/logs/embypanel.log，默认 INFO 级别。': 'Logs are written to data/logs/embypanel.log at INFO level by default.',
-    '操作类型': 'Action type',
-    '记录配置、账户、通知、备份恢复等管理操作，不保存敏感明文。': 'Tracks configuration, account, notification, and restore actions without storing sensitive plaintext.',
-    '当前密码': 'Current password',
-    '新密码': 'New password',
-    '确认新密码': 'Confirm new password',
-    '全部操作': 'All actions',
-    '搜索管理员 / 操作 / 摘要': 'Search admin / action / summary',
-    '审计记录加载失败': 'Unable to load audit records',
-    '链接已复制': 'Link copied',
-    '复制失败，请手动复制': 'Copy failed. Copy it manually.',
-    '配置测试通过': 'Configuration test passed',
-    '配置测试完成，请查看警告项': 'Configuration test finished. Review warnings.',
-    '日志配置已保存': 'Log settings saved',
-    '账户资料已更新': 'Profile updated',
-    '客户端管控规则已保存': 'Client control rules saved',
-    'Webhook URL 不能为空': 'Webhook URL is required',
-    'Webhook 测试发送成功': 'Webhook test sent',
-    'EmbyPanel 通知测试': 'EmbyPanel notification test',
-    'Webhook POST 测试成功': 'Webhook POST test succeeded',
-    '新建 Webhook': 'New webhook',
-    'UA 关键字不能为空': 'UA keyword is required',
-    'UA 拦截规则已添加': 'UA block added',
-    '新密码不能为空': 'New password is required',
-    '当前密码不能为空': 'Current password is required',
-    '当前密码不正确': 'The current password is incorrect',
-    '确认新密码不能为空': 'Confirm your new password',
-    '两次输入的新密码不一致': 'The new passwords do not match',
-    '管理员密码已更新': 'Administrator password updated',
-    '保存账户设置': 'Save account settings',
-    '账户设置已更新': 'Account settings updated',
-    '未检测到需要保存的修改': 'No changes to save',
-    '密码已更新，但用户名修改失败': 'The password was updated, but the username change failed',
-    'UA 规则已删除': 'UA rule deleted',
-    '登录已过期，请重新登录': 'Your session expired. Sign in again.',
-    '退出登录失败，请重试': 'Unable to sign out. Please try again.',
-    '页面加载失败，请刷新后重试': 'Unable to load the page. Refresh and try again.',
-    '重试': 'Retry',
-    '加密请求失败': 'Unable to encrypt the request',
-    '反代服务已重启': 'Proxy service restarted',
-    '已开启': 'enabled',
-    '已关闭': 'disabled',
-    '确定删除这个服务器配置吗？对应反代端口保存后会停止监听。': 'Delete this server configuration? Its proxy port will stop listening after save.',
-    '服务器配置已保存，反代监听器已差量同步': 'Server configuration saved. Affected proxy listeners were updated.',
-    '请输入备份密码（至少 4 位），用于加密配置文件': 'Enter a backup password (at least 4 characters).',
-    '备份密码至少需要 4 位': 'Backup passwords need at least 4 characters.',
-    '加密配置备份已生成，请妥善保存备份密码': 'Encrypted backup created. Keep the password safe.',
-    '配置文件内容为空': 'The configuration file is empty.',
-    '还原配置文件会覆盖当前配置，并差量同步受影响的反代监听器，确定继续吗？': 'Restoring will overwrite the current configuration and update affected proxy listeners. Continue?',
-    '请输入该加密备份的密码': 'Enter the password for this encrypted backup.',
-    '加密备份密码不能为空': 'The encrypted backup password cannot be empty.',
-    '配置文件已还原，反代监听器已差量同步': 'Configuration restored. Affected proxy listeners were updated.',
-    '用户封禁已解除': 'User ban lifted',
-    '混合封禁已解除': 'Mixed ban lifted',
-    'IP 屏蔽已解除': 'IP block lifted',
-    '封禁动作': 'Ban action',
-    '封禁': 'Block',
-    '解除封禁动作': 'Unblock action',
-    '缓存': 'Cache',
-    '跳转': 'Redirect',
-    '视频流': 'Video stream',
-    '播放信息': 'Playback info',
-    '系统信息': 'System info',
-    '播放器脚本': 'Player script',
-    '普通代理': 'Standard proxy',
-    '配置': 'Configuration',
-    '本地配置校验通过': 'Local configuration passed',
-    '本地配置校验失败': 'Local configuration failed',
-    '反代端口重复': 'Duplicate proxy port',
-    '反代端口正在由当前服务监听': 'The current service is listening on this proxy port',
-    '反代端口可用': 'Proxy port is available',
-    '反代端口已被占用': 'Proxy port is already in use',
-    'Emby API Key 可用': 'Emby API key is valid',
-    'Emby 连接失败': 'Emby connection failed',
-    'OpenList 连接可用': 'OpenList connection is available',
-    'OpenList 连接失败': 'OpenList connection failed',
-    '未配置，已跳过': 'Not configured; skipped',
-  }
-
   const manualClientRule = reactive({
     user_agent: '',
     note: '',
@@ -612,10 +242,34 @@ export function usePanelController() {
     connectivity_auto_restart_seconds: 180,
   })
 
+  const {
+    backupError,
+    backupBusy,
+    backupFileInput,
+    exportBackup,
+    importBackup,
+    handleBackupFileSelected,
+  } = useBackupController({
+    api,
+    encryptPayload,
+    translate: t,
+    showNotice,
+    clearNotice,
+    confirmAction,
+    promptAction,
+    onImported(response) {
+      resetResourceCache()
+      Object.assign(settings, response)
+      normalizeSettingsServers()
+      settingsLoaded = true
+    },
+  })
+
   const menu = [
     { id: 'home' as const, label: '首页', icon: LayoutDashboard },
     { id: 'server' as const, label: '服务器', icon: Server },
     { id: 'clients' as const, label: '客户端', icon: Users },
+    { id: 'users' as const, label: '用户', icon: UserRound },
     { id: 'logs' as const, label: '日志', icon: FileText },
     { id: 'notifications' as const, label: '通知', icon: Bell },
     { id: 'backup' as const, label: '备份', icon: Archive },
@@ -844,11 +498,6 @@ export function usePanelController() {
     noticeTimer = window.setTimeout(clearNotice, 3500)
   }
 
-  function isHttpUrl(value: string): boolean {
-    const trimmed = value.trim()
-    return trimmed.startsWith('http://') || trimmed.startsWith('https://')
-  }
-
   async function copyText(value: string) {
     const text = value.trim()
     if (!text) {
@@ -960,7 +609,7 @@ export function usePanelController() {
     error.value = ''
     try {
       await refreshAppInfo()
-      publicKey.value = await fetchPublicKey()
+      await warmPublicKey()
       const status = await api<{ initialized: boolean }>('/api/setup-status')
       if (!status.initialized) {
         mode.value = 'setup'
@@ -1108,6 +757,8 @@ export function usePanelController() {
       case 'clients':
         await Promise.all([ensureSettings(), ensureClientControl()])
         await refreshRateLimitStatus()
+        break
+      case 'users':
         break
       case 'notifications':
         await ensureClientControl()
@@ -1308,101 +959,6 @@ export function usePanelController() {
     }
   }
 
-  async function exportBackup() {
-    backupError.value = ''
-    clearNotice()
-    const password = window.prompt(t('请输入备份密码（至少 4 位），用于加密配置文件'))
-    if (password === null) return
-    if (password.trim().length < 4) {
-      backupError.value = t('备份密码至少需要 4 位')
-      return
-    }
-    try {
-      const response = await api<{ backup: string }>('/api/settings/backup/export', {
-        method: 'POST',
-        body: JSON.stringify(await encryptPayload('backup_export', { password })),
-      })
-      downloadTextFile(response.backup, backupFileName())
-      showNotice(t('加密配置备份已生成，请妥善保存备份密码'))
-    } catch (err) {
-      backupError.value = err instanceof Error ? err.message : String(err)
-    }
-  }
-
-  async function importBackup() {
-    backupError.value = ''
-    clearNotice()
-    backupFileInput.value?.click()
-  }
-
-  async function handleBackupFileSelected(event: Event) {
-    const input = event.target as HTMLInputElement
-    const file = input.files?.[0]
-    input.value = ''
-    if (!file) return
-    backupError.value = ''
-    clearNotice()
-    try {
-      const backup = await file.text()
-      await importBackupText(backup)
-    } catch (err) {
-      backupError.value = err instanceof Error ? err.message : String(err)
-    }
-  }
-
-  async function importBackupText(backupText: string) {
-    backupError.value = ''
-    clearNotice()
-    const backup = backupText.trim()
-    if (!backup) {
-      backupError.value = t('配置文件内容为空')
-      return
-    }
-    const confirmed = window.confirm(t('还原配置文件会覆盖当前配置，并差量同步受影响的反代监听器，确定继续吗？'))
-    if (!confirmed) return
-    const encryptedBackup = backup.startsWith('{') && backup.includes('"cipher"')
-    const password = encryptedBackup ? window.prompt(t('请输入该加密备份的密码')) : null
-    if (encryptedBackup && password === null) return
-    const backupPassword = password?.trim() || ''
-    if (encryptedBackup && !backupPassword) {
-      backupError.value = t('加密备份密码不能为空')
-      return
-    }
-    try {
-      const response = await api<Settings>('/api/settings/backup/import', {
-        method: 'POST',
-        body: JSON.stringify(await encryptPayload('backup', { backup, password: backupPassword || null })),
-      })
-      resetResourceCache()
-      Object.assign(settings, response)
-      normalizeSettingsServers()
-      settingsLoaded = true
-      showNotice(t('配置文件已还原，反代监听器已差量同步'))
-    } catch (err) {
-      backupError.value = err instanceof Error ? err.message : String(err)
-    }
-  }
-
-  function downloadTextFile(content: string, filename: string) {
-    const blob = new Blob([content], { type: 'application/json;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = filename
-    document.body.appendChild(link)
-    link.click()
-    link.remove()
-    URL.revokeObjectURL(url)
-  }
-
-  function backupFileName() {
-    const timestamp = new Date()
-      .toISOString()
-      .replace(/\.\d{3}Z$/, '')
-      .replace(/[-:T]/g, '')
-    return `embypanel-config-${timestamp}.json`
-  }
-
   async function saveLogConfig() {
     if (!logConfigLoaded) {
       logsError.value = t('页面加载失败，请刷新后重试')
@@ -1509,7 +1065,16 @@ export function usePanelController() {
         real_ip_header: server.real_ip_header.trim(),
         trusted_proxy_cidrs: server.trusted_proxy_cidrs.trim(),
       }))
-      .filter((server) => server.emby_host || server.emby_api_key)
+    const incompleteServer = servers.find(
+      (server) =>
+        !server.emby_host ||
+        (!server.emby_api_key && !persistedServerIds.has(server.id)),
+    )
+    if (incompleteServer) {
+      throw new Error(
+        `${incompleteServer.name || t('服务器')}：${t('请填写 Emby 地址和 API Key')}`,
+      )
+    }
     const primary = servers.find((server) => server.enabled) ?? servers[0]
     return {
       ...settings,
@@ -1575,8 +1140,6 @@ export function usePanelController() {
   }
 
   function removeServer(serverId: string) {
-    const confirmed = window.confirm(t('确定删除这个服务器配置吗？对应反代端口保存后会停止监听。'))
-    if (!confirmed) return
     settings.servers = settings.servers.filter((server) => server.id !== serverId)
     persistedServerIds.delete(serverId)
     clearApiKeyRevealState()
@@ -1585,8 +1148,7 @@ export function usePanelController() {
   }
 
   function newServerId() {
-    const bytes = randomBytes(8)
-    return `server-${bytesToBase64Url(bytes)}`
+    return randomId('server')
   }
 
   function isApiKeyVisible(serverId: string) {
@@ -1912,8 +1474,7 @@ export function usePanelController() {
   }
 
   function newWebhookId() {
-    const bytes = randomBytes(8)
-    return `webhook-${bytesToBase64Url(bytes)}`
+    return randomId('webhook')
   }
 
   async function addClientRule() {
@@ -1997,11 +1558,16 @@ export function usePanelController() {
 
   async function deleteClientRule(record: ClientRuleRecord) {
     clientControlError.value = ''
-    const confirmed = window.confirm(
-      locale.value === 'en-US'
-        ? `Delete the UA rule "${clientKeyword(record)}"?`
-        : `确定删除 UA 规则「${clientKeyword(record)}」吗？`,
-    )
+    const keyword = clientKeyword(record)
+    const confirmed = await confirmAction({
+      title: t('删除 UA 规则'),
+      description: locale.value === 'en-US'
+        ? `Delete the UA rule "${keyword}"?`
+        : `确定删除 UA 规则「${keyword}」吗？`,
+      confirmText: t('确认删除'),
+      cancelText: t('取消'),
+      tone: 'danger',
+    })
     if (!confirmed) return
     try {
       const response = await api<ClientControlConfig>('/api/client-control/rules', {
@@ -2038,6 +1604,7 @@ export function usePanelController() {
   }
 
   function playbackRateActionLabel(action?: string) {
+    if (action === 'block_user') return t('封禁用户')
     if (action === 'disable_user') return t('禁用用户')
     if (action === 'mixed') return t('混合模式')
     if (action === 'block_ip') return t('屏蔽 IP')
@@ -2045,6 +1612,7 @@ export function usePanelController() {
   }
 
   function playbackRateUnblockNotice(action?: string) {
+    if (action === 'block_user') return t('用户封禁已解除')
     if (action === 'disable_user') return t('用户封禁已解除')
     if (action === 'mixed') return t('混合封禁已解除')
     return t('IP 屏蔽已解除')
@@ -2390,30 +1958,6 @@ export function usePanelController() {
     }
   }
 
-  async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
-    const requestToken = token.value
-    const headers = new Headers(init.headers)
-    headers.set('Content-Type', 'application/json')
-    if (requestToken) headers.set('Authorization', `Bearer ${requestToken}`)
-    const response = await fetch(path, { ...init, headers })
-    if (!response.ok) {
-      const message = await response.text()
-      if (response.status === 401 && requestToken && !isAuthBootstrapPath(path)) {
-        if (path !== '/api/change-password' && passwordChangeToken === requestToken) {
-          deferredAuthExpiredToken = requestToken
-        } else {
-          handleAuthExpired(requestToken)
-        }
-      }
-      throw new Error(message)
-    }
-    return response.json() as Promise<T>
-  }
-
-  function isAuthBootstrapPath(path: string) {
-    return path === '/api/login' || path === '/api/setup' || path === '/api/setup-status'
-  }
-
   function handleAuthExpired(expiredToken: string) {
     if (!expiredToken || token.value !== expiredToken) return
     accountSaveOperation += 1
@@ -2438,217 +1982,11 @@ export function usePanelController() {
     passwordForm.confirm_password = ''
   }
 
-  async function fetchPublicKey() {
-    const response = await api<PublicKeyResponse>('/api/public-key')
-    if (!hasWebCrypto()) {
-      const forge = await loadForge()
-      return {
-        kind: 'forge' as const,
-        key: forge.pki.publicKeyFromPem(response.public_key_pem),
-      }
-    }
-    return {
-      kind: 'webcrypto' as const,
-      key: await crypto.subtle.importKey(
-        'spki',
-        pemToArrayBuffer(response.public_key_pem),
-        { name: 'RSA-OAEP', hash: 'SHA-256' },
-        false,
-        ['encrypt'],
-      ),
-    }
-  }
-
-  async function encryptPayload(name: string, value: unknown) {
-    publicKey.value = await fetchPublicKey()
-    const aesKey = randomBytes(32)
-    const fieldName = randomFieldName()
-    const iv = randomBytes(12)
-    const plaintext = new TextEncoder().encode(JSON.stringify({ name, value }))
-    const { encryptedKey, encrypted } =
-      publicKey.value.kind === 'webcrypto'
-        ? await encryptWithWebCrypto(publicKey.value.key, aesKey, iv, plaintext)
-        : await encryptWithForge(publicKey.value.key, aesKey, iv, plaintext)
-    return {
-      encrypted_key: bytesToBase64Url(encryptedKey),
-      fields: {
-        [fieldName]: {
-          iv: bytesToBase64Url(iv),
-          value: bytesToBase64Url(encrypted),
-        },
-      },
-    }
-  }
-
-  async function encryptWithWebCrypto(
-    key: CryptoKey,
-    aesKey: Uint8Array,
-    iv: Uint8Array,
-    plaintext: Uint8Array,
-  ) {
-    const cryptoKey = await crypto.subtle.importKey('raw', toArrayBuffer(aesKey), 'AES-GCM', false, [
-      'encrypt',
-    ])
-    const encryptedKey = await crypto.subtle.encrypt(
-      { name: 'RSA-OAEP' },
-      key,
-      toArrayBuffer(aesKey),
-    )
-    const encrypted = await crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv: toArrayBuffer(iv) },
-      cryptoKey,
-      toArrayBuffer(plaintext),
-    )
-    return {
-      encryptedKey: new Uint8Array(encryptedKey),
-      encrypted: new Uint8Array(encrypted),
-    }
-  }
-
-  async function encryptWithForge(
-    key: Forge.pki.rsa.PublicKey,
-    aesKey: Uint8Array,
-    iv: Uint8Array,
-    plaintext: Uint8Array,
-  ) {
-    const forge = await loadForge()
-    const encryptedKey = key.encrypt(bytesToBinary(aesKey), 'RSA-OAEP', {
-      md: forge.md.sha256.create(),
-      mgf1: {
-        md: forge.md.sha256.create(),
-      },
-    })
-    const cipher = forge.cipher.createCipher('AES-GCM', bytesToBinary(aesKey))
-    cipher.start({ iv: bytesToBinary(iv), tagLength: 128 })
-    cipher.update(forge.util.createBuffer(bytesToBinary(plaintext)))
-    if (!cipher.finish()) throw new Error(t('加密请求失败'))
-    return {
-      encryptedKey: binaryToBytes(encryptedKey),
-      encrypted: binaryToBytes(cipher.output.getBytes() + cipher.mode.tag.getBytes()),
-    }
-  }
-
-  function randomFieldName() {
-    return bytesToBase64Url(randomBytes(12))
-  }
-
-  function hasWebCrypto() {
-    return Boolean(
-      typeof window !== 'undefined' &&
-        window.isSecureContext &&
-        globalThis.crypto?.subtle &&
-        globalThis.crypto?.getRandomValues,
-    )
-  }
-
-  function randomBytes(length: number) {
-    const bytes = new Uint8Array(length)
-    if (globalThis.crypto?.getRandomValues) return globalThis.crypto.getRandomValues(bytes)
-    throw new Error(t('加密请求失败'))
-  }
-
-  function loadForge() {
-    forgeRequest ??= import('node-forge')
-    return forgeRequest
-  }
-
-  function pemToArrayBuffer(pem: string) {
-    const base64 = pem
-      .replace('-----BEGIN PUBLIC KEY-----', '')
-      .replace('-----END PUBLIC KEY-----', '')
-      .replace(/\s/g, '')
-    const binary = atob(base64)
-    const bytes = new Uint8Array(binary.length)
-    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
-    return bytes.buffer
-  }
-
-  function bytesToBase64Url(bytes: Uint8Array) {
-    let binary = ''
-    bytes.forEach((byte) => {
-      binary += String.fromCharCode(byte)
-    })
-    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
-  }
-
-  function bytesToBinary(bytes: Uint8Array) {
-    let binary = ''
-    bytes.forEach((byte) => {
-      binary += String.fromCharCode(byte)
-    })
-    return binary
-  }
-
-  function binaryToBytes(binary: string) {
-    const bytes = new Uint8Array(binary.length)
-    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
-    return bytes
-  }
-
-  function toArrayBuffer(bytes: Uint8Array) {
-    const buffer = new ArrayBuffer(bytes.byteLength)
-    new Uint8Array(buffer).set(bytes)
-    return buffer
-  }
-
-  function emptyToNull(value: string | null) {
-    const trimmed = value?.trim() ?? ''
-    return trimmed ? trimmed : null
-  }
-
-  function formatTicks(ticks: number | null) {
-    if (!ticks || ticks < 0) return '--:--'
-    const seconds = Math.floor(ticks / 10_000_000)
-    const minutes = Math.floor(seconds / 60)
-    const hours = Math.floor(minutes / 60)
-    const mm = String(minutes % 60).padStart(2, '0')
-    const ss = String(seconds % 60).padStart(2, '0')
-    return hours > 0 ? `${hours}:${mm}:${ss}` : `${minutes}:${ss}`
-  }
-
-  function formatBytes(bytes: number | undefined) {
-    if (!bytes) return '--'
-    const units = ['B', 'KB', 'MB', 'GB', 'TB']
-    let value = bytes
-    let unit = 0
-    while (value >= 1024 && unit < units.length - 1) {
-      value /= 1024
-      unit += 1
-    }
-    return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`
-  }
-
-  function formatUptime(seconds: number | undefined) {
-    if (!seconds) return '--'
-    const days = Math.floor(seconds / 86400)
-    const hours = Math.floor((seconds % 86400) / 3600)
-    if (locale.value === 'en-US') {
-      return days > 0 ? `${days}d ${hours}h` : `${hours}h`
-    }
-    return days > 0 ? `${days}天${hours}小时` : `${hours}小时`
-  }
-
-  function formatTimestamp(value: string) {
-    const date = parseUnixTimestamp(value)
-    if (!date) return '--'
-    return date.toLocaleString(locale.value)
-  }
-
-  function parseUnixTimestamp(value: string) {
-    const timestamp = Number(value)
-    if (!Number.isFinite(timestamp) || timestamp <= 0) return null
-    return new Date(timestamp * 1000)
-  }
-
-  function formatLogTime(value: number) {
-    if (!Number.isFinite(value) || value <= 0) return '--'
-    return new Date(value).toLocaleString(locale.value)
-  }
-
-  function formatTimestampMs(value: number | null | undefined) {
-    if (!value || !Number.isFinite(value)) return '--'
-    return new Date(value).toLocaleString(locale.value)
-  }
+  const formatUptime = (seconds: number | undefined) => formatUptimeValue(seconds, locale.value)
+  const formatTimestamp = (value: string) => formatTimestampValue(value, locale.value)
+  const formatLogTime = (value: number) => formatLogTimeValue(value, locale.value)
+  const formatTimestampMs = (value: number | null | undefined) =>
+    formatTimestampMsValue(value, locale.value)
 
   function formatServerName(serverId: string) {
     return settings.servers.find((server) => server.id === serverId)?.name || serverId || '--'
@@ -2706,16 +2044,6 @@ export function usePanelController() {
     if (row.event_type === 'block') return `${t('封禁')} ${row.playback_ip || '--'}`
     if (row.event_type === 'unblock') return `${t('解除封禁')} ${row.playback_ip || '--'}`
     return `${row.method} ${row.path}`
-  }
-
-  function requestOutcomeClass(row: ProxyRequestDetail) {
-    if (row.event_type === 'unblock') return 'ok'
-    if (row.blocked) return 'blocked'
-    if (row.cache_hit) return 'cache'
-    if (row.status_code >= 500) return 'error'
-    if (row.status_code >= 400) return 'warn'
-    if (row.status_code >= 300) return 'redirect'
-    return 'ok'
   }
 
   function clientKeyword(record: ClientRuleRecord) {
@@ -2784,6 +2112,10 @@ export function usePanelController() {
     updateChecking,
     updateCheckError,
     t,
+    showNotice,
+    clearNotice,
+    confirmAction,
+    promptAction,
     setLocale,
     closeMobileNav,
     toggleMobileNav,
@@ -2795,6 +2127,8 @@ export function usePanelController() {
     setPage,
     retryPage,
     logout,
+    api,
+    encryptPayload,
     profileForm,
     savingAccount,
     passwordForm,
@@ -2807,6 +2141,7 @@ export function usePanelController() {
     refreshAuditLogs,
     formatTimestampMs,
     backupError,
+    backupBusy,
     backupFileInput,
     exportBackup,
     importBackup,

@@ -1,5 +1,19 @@
 # 版本更新日志
 
+## v0.2.7
+
+发布时间：2026-08-08
+
+### 修复
+
+- 补齐发布提交中遗漏的前端组件、composable、类型和后端源码，修复 GitHub Actions 在干净 checkout 中无法构建的问题。
+- 同步 `Cargo.lock` 与 `Cargo.toml` 版本，修复 Docker 的 `cargo build --release --locked` 锁文件校验失败。
+
+### 验证
+
+- `cargo check`
+- `cd frontend && npx vue-tsc -b --noEmit`
+
 ## v0.2.6
 
 发布时间：2026-08-08

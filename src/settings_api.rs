@@ -15,14 +15,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AppState, DirectLinkCache, auth,
-    client_control::ClientControlConfig,
+    client_control::{self, ClientControlConfig},
     config::Config,
     crypto_api::EncryptedRequest,
     error::{AppError, AppResult, safe_error_message},
     file_log::{SETTING_KEY as SYSTEM_LOG_SETTING_KEY, SystemLogConfig, normalize_config},
+    users_api::{
+        USER_POLICIES_SETTING_KEY, USER_TEMPLATES_SETTING_KEY, UserPoliciesDocument,
+        UserTemplatesDocument, normalize_user_policies, normalize_user_templates,
+    },
 };
 
 const CLIENT_CONTROL_SETTING_KEY: &str = "client_control";
+const BACKUP_SCHEMA_VERSION: u32 = 2;
+const BACKUP_ENVELOPE_VERSION: u32 = 1;
+const BACKUP_SALT_BYTES: usize = 16;
+const BACKUP_NONCE_BYTES: usize = 12;
+const MAX_BACKUP_TEXT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct RestartProxyRequest {
@@ -64,9 +73,19 @@ struct BackupEnvelope {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct BackupPayload {
+    #[serde(default = "legacy_backup_schema_version")]
+    schema_version: u32,
+    #[serde(default)]
+    application_version: Option<String>,
     runtime_config: Config,
-    client_control: Option<serde_json::Value>,
+    #[serde(default)]
+    client_control: Option<ClientControlConfig>,
+    #[serde(default)]
     system_log_config: Option<SystemLogConfig>,
+    #[serde(default)]
+    user_policies: Option<UserPoliciesDocument>,
+    #[serde(default)]
+    user_templates: Option<UserTemplatesDocument>,
 }
 
 #[derive(Debug, Serialize)]
@@ -166,14 +185,12 @@ pub async fn update_settings(
         .validate_for_storage()
         .map_err(|err| AppError::Validation(err.safe_log_message()))?;
     apply_runtime_config(&state, &existing, &payload).await?;
-    if let Err(err) = state.settings_store.record_audit(
+    state.settings_store.record_audit_best_effort(
         Some(admin_user_id),
         "settings.update",
         "保存服务器配置",
         "success",
-    ) {
-        tracing::error!(error = %err.safe_log_message(), "failed to record settings update audit");
-    }
+    );
     Ok(Json(redact_config_secrets(payload)))
 }
 
@@ -192,14 +209,12 @@ pub async fn restart_proxy_server(
             .restart_server(state.clone(), server_id)
             .await?;
     }
-    if let Err(err) = state.settings_store.record_audit(
+    state.settings_store.record_audit_best_effort(
         Some(admin_user_id),
         "settings.restart_proxy",
         &format!("重启反代服务器 {server_id}"),
         "success",
-    ) {
-        tracing::error!(error = %err.safe_log_message(), "failed to record proxy restart audit");
-    }
+    );
     Ok(Json(redact_config_secrets(
         state.config.read().await.clone(),
     )))
@@ -233,7 +248,7 @@ pub async fn toggle_proxy_server(
         .map_err(|err| AppError::Config(err.to_string()))?;
     apply_runtime_config(&state, &existing, &config).await?;
 
-    if let Err(err) = state.settings_store.record_audit(
+    state.settings_store.record_audit_best_effort(
         Some(admin_user_id),
         "settings.toggle_proxy",
         &format!(
@@ -242,9 +257,7 @@ pub async fn toggle_proxy_server(
             server_name
         ),
         "success",
-    ) {
-        tracing::error!(error = %err.safe_log_message(), "failed to record proxy toggle audit");
-    }
+    );
     Ok(Json(redact_config_secrets(config)))
 }
 
@@ -368,17 +381,16 @@ pub async fn update_log_config(
 ) -> AppResult<Json<SystemLogConfig>> {
     let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
     let payload: SystemLogConfig = state.crypto_keys.decrypt_named(&request, "log_config")?;
+    let _config_update = state.config_updates.lock().await;
     let config = state
         .file_log
         .update_config(&state.settings_store, payload)?;
-    if let Err(err) = state.settings_store.record_audit(
+    state.settings_store.record_audit_best_effort(
         Some(admin_user_id),
         "log_config.update",
         "保存日志配置",
         "success",
-    ) {
-        tracing::error!(error = %err.safe_log_message(), "failed to record log config audit");
-    }
+    );
     Ok(Json(config))
 }
 
@@ -391,23 +403,37 @@ pub async fn export_backup(
     let payload: BackupExportRequest =
         state.crypto_keys.decrypt_named(&request, "backup_export")?;
     let password = payload.password.trim();
-    if password.len() < 4 {
-        return Err(AppError::Validation(
-            "backup password must be at least 4 characters".to_string(),
-        ));
-    }
-    let backup = BackupPayload {
-        runtime_config: state.config.read().await.clone(),
-        client_control: backup_client_control_config(&state)?,
-        system_log_config: Some(state.file_log.config()),
+    validate_backup_password(password)?;
+    let backup = {
+        let _config_update = state.config_updates.lock().await;
+        let _rate_limit_update = state.rate_limit_updates.lock().await;
+        BackupPayload {
+            schema_version: BACKUP_SCHEMA_VERSION,
+            application_version: Some(crate::app_version()),
+            runtime_config: state.config.read().await.clone(),
+            client_control: Some(client_control::backup_config(&state)?),
+            system_log_config: Some(state.file_log.config()),
+            user_policies: Some(
+                state
+                    .settings_store
+                    .load_setting_json(USER_POLICIES_SETTING_KEY)?
+                    .unwrap_or_default(),
+            ),
+            user_templates: Some(
+                state
+                    .settings_store
+                    .load_setting_json(USER_TEMPLATES_SETTING_KEY)?
+                    .unwrap_or_default(),
+            ),
+        }
     };
     let backup = encrypt_backup(password, &backup)?;
-    state.settings_store.record_audit(
+    state.settings_store.record_audit_best_effort(
         Some(admin_user_id),
         "backup.export",
         "导出加密配置备份",
         "success",
-    )?;
+    );
     Ok(Json(BackupExportResponse { backup }))
 }
 
@@ -419,11 +445,51 @@ pub async fn import_backup(
     let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
     let payload: BackupImportRequest = state.crypto_keys.decrypt_named(&request, "backup")?;
     let mut backup = parse_backup_text(payload.password.as_deref(), &payload.backup)?;
+    let restore_snapshot = match backup.schema_version {
+        1 => false,
+        BACKUP_SCHEMA_VERSION => true,
+        version => {
+            return Err(AppError::Validation(format!(
+                "unsupported backup schema version {version}"
+            )));
+        }
+    };
     backup
         .runtime_config
         .validate_for_storage()
         .map_err(|err| AppError::Validation(err.safe_log_message()))?;
+    let restored_client_control = if restore_snapshot || backup.client_control.is_some() {
+        Some(client_control::normalize_restored_config(
+            backup.client_control.take(),
+        ))
+    } else {
+        None
+    };
+    let restored_log_config = if restore_snapshot || backup.system_log_config.is_some() {
+        Some(normalize_config(
+            backup.system_log_config.take().unwrap_or_default(),
+        ))
+    } else {
+        None
+    };
+    let restored_user_policies = if restore_snapshot || backup.user_policies.is_some() {
+        let mut document = backup.user_policies.take().unwrap_or_default();
+        normalize_user_policies(&mut document);
+        Some(document)
+    } else {
+        None
+    };
+    let restored_user_templates = if restore_snapshot || backup.user_templates.is_some() {
+        let mut document = backup.user_templates.take().unwrap_or_default();
+        normalize_user_templates(&mut document);
+        Some(document)
+    } else {
+        None
+    };
+    let client_control_changed = restored_client_control.is_some();
+    let user_policies_changed = restored_user_policies.is_some();
     let _config_update = state.config_updates.lock().await;
+    let _rate_limit_update = state.rate_limit_updates.lock().await;
     let existing = state.config.read().await.clone();
     let previous_client_control = state
         .settings_store
@@ -431,11 +497,19 @@ pub async fn import_backup(
     let previous_log_setting = state
         .settings_store
         .load_setting_json::<serde_json::Value>(SYSTEM_LOG_SETTING_KEY)?;
+    let previous_user_policies = state
+        .settings_store
+        .load_setting_json::<serde_json::Value>(USER_POLICIES_SETTING_KEY)?;
+    let previous_user_templates = state
+        .settings_store
+        .load_setting_json::<serde_json::Value>(USER_TEMPLATES_SETTING_KEY)?;
     let previous_log_config = state.file_log.config();
     let mut client_control_applied = false;
     let mut log_config_applied = false;
+    let mut user_policies_applied = false;
+    let mut user_templates_applied = false;
 
-    if let Some(client_control) = backup.client_control.as_ref() {
+    if let Some(client_control) = restored_client_control.as_ref() {
         if let Err(err) = state
             .settings_store
             .save_setting_json(CLIENT_CONTROL_SETTING_KEY, client_control)
@@ -444,31 +518,81 @@ pub async fn import_backup(
         }
         client_control_applied = true;
     }
-    if let Some(log_config) = backup.system_log_config.as_ref() {
+    if let Some(log_config) = restored_log_config.as_ref() {
         if let Err(err) = state
             .file_log
-            .update_config(&state.settings_store, normalize_config(log_config.clone()))
+            .update_config(&state.settings_store, log_config.clone())
         {
             rollback_backup_auxiliary_settings(
                 &state,
                 previous_client_control.as_ref(),
                 previous_log_setting.as_ref(),
+                previous_user_policies.as_ref(),
+                previous_user_templates.as_ref(),
                 &previous_log_config,
                 client_control_applied,
+                false,
+                false,
                 false,
             )?;
             return Err(err);
         }
         log_config_applied = true;
     }
+    if let Some(user_policies) = restored_user_policies.as_ref() {
+        if let Err(err) = state
+            .settings_store
+            .save_setting_json(USER_POLICIES_SETTING_KEY, user_policies)
+        {
+            rollback_backup_auxiliary_settings(
+                &state,
+                previous_client_control.as_ref(),
+                previous_log_setting.as_ref(),
+                previous_user_policies.as_ref(),
+                previous_user_templates.as_ref(),
+                &previous_log_config,
+                client_control_applied,
+                log_config_applied,
+                false,
+                false,
+            )?;
+            return Err(err);
+        }
+        user_policies_applied = true;
+    }
+    if let Some(user_templates) = restored_user_templates.as_ref() {
+        if let Err(err) = state
+            .settings_store
+            .save_setting_json(USER_TEMPLATES_SETTING_KEY, user_templates)
+        {
+            rollback_backup_auxiliary_settings(
+                &state,
+                previous_client_control.as_ref(),
+                previous_log_setting.as_ref(),
+                previous_user_policies.as_ref(),
+                previous_user_templates.as_ref(),
+                &previous_log_config,
+                client_control_applied,
+                log_config_applied,
+                user_policies_applied,
+                false,
+            )?;
+            return Err(err);
+        }
+        user_templates_applied = true;
+    }
     if let Err(err) = apply_runtime_config(&state, &existing, &backup.runtime_config).await {
         if let Err(rollback_error) = rollback_backup_auxiliary_settings(
             &state,
             previous_client_control.as_ref(),
             previous_log_setting.as_ref(),
+            previous_user_policies.as_ref(),
+            previous_user_templates.as_ref(),
             &previous_log_config,
             client_control_applied,
             log_config_applied,
+            user_policies_applied,
+            user_templates_applied,
         ) {
             tracing::error!(
                 import_error = %err.safe_log_message(),
@@ -481,14 +605,15 @@ pub async fn import_backup(
         }
         return Err(err);
     }
-    if let Err(err) = state.settings_store.record_audit(
+    if client_control_changed || user_policies_changed {
+        client_control::clear_restored_runtime_state(&state).await;
+    }
+    state.settings_store.record_audit_best_effort(
         Some(admin_user_id),
         "backup.import",
         "还原配置文件",
         "success",
-    ) {
-        tracing::error!(error = %err.safe_log_message(), "failed to record backup import audit");
-    }
+    );
     Ok(Json(redact_config_secrets(backup.runtime_config)))
 }
 
@@ -496,9 +621,13 @@ fn rollback_backup_auxiliary_settings(
     state: &AppState,
     previous_client_control: Option<&serde_json::Value>,
     previous_log_setting: Option<&serde_json::Value>,
+    previous_user_policies: Option<&serde_json::Value>,
+    previous_user_templates: Option<&serde_json::Value>,
     previous_log_config: &SystemLogConfig,
     restore_client_control: bool,
     restore_log_config: bool,
+    restore_user_policies: bool,
+    restore_user_templates: bool,
 ) -> AppResult<()> {
     let mut first_error = None;
     if restore_client_control
@@ -526,6 +655,26 @@ fn rollback_backup_auxiliary_settings(
         {
             first_error = Some(err);
         }
+    }
+    if restore_user_policies
+        && let Err(err) = restore_setting_snapshot(
+            &state.settings_store,
+            USER_POLICIES_SETTING_KEY,
+            previous_user_policies,
+        )
+        && first_error.is_none()
+    {
+        first_error = Some(err);
+    }
+    if restore_user_templates
+        && let Err(err) = restore_setting_snapshot(
+            &state.settings_store,
+            USER_TEMPLATES_SETTING_KEY,
+            previous_user_templates,
+        )
+        && first_error.is_none()
+    {
+        first_error = Some(err);
     }
     first_error.map_or(Ok(()), Err)
 }
@@ -620,52 +769,27 @@ fn err_result(scope: &str, message: &str, detail: &str) -> ValidationResult {
     }
 }
 
-fn backup_client_control_config(state: &AppState) -> AppResult<Option<serde_json::Value>> {
-    let config = state
-        .settings_store
-        .load_setting_json::<ClientControlConfig>(CLIENT_CONTROL_SETTING_KEY)?;
-    backup_client_control_value(config)
-}
-
-fn backup_client_control_value(
-    config: Option<ClientControlConfig>,
-) -> AppResult<Option<serde_json::Value>> {
-    let Some(mut config) = config else {
-        return Ok(None);
-    };
-    let now = now_seconds();
-    config.records.retain(|record| record.enabled);
-    config.rate_limit_blocks.retain(|record| {
-        record.enabled && record.blocked_until.parse::<u64>().unwrap_or_default() > now
-    });
-    serde_json::to_value(config).map(Some).map_err(Into::into)
-}
-
-fn now_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 fn parse_backup_text(password: Option<&str>, value: &str) -> AppResult<BackupPayload> {
-    match serde_json::from_str::<BackupPayload>(value) {
-        Ok(payload) => Ok(payload),
-        Err(plain_err) => {
-            if let Some(password) = password.filter(|value| !value.trim().is_empty()) {
-                decrypt_backup(password, value)
-            } else {
-                Err(AppError::Validation(format!(
-                    "invalid backup config text: {plain_err}"
-                )))
-            }
-        }
+    let value = value.trim();
+    validate_backup_text_size(value)?;
+    let root: serde_json::Value = serde_json::from_str(value)
+        .map_err(|err| AppError::Validation(format!("invalid backup config text: {err}")))?;
+    if root.get("cipher").is_some() {
+        let password = password
+            .map(str::trim)
+            .filter(|password| !password.is_empty())
+            .ok_or_else(|| AppError::Validation("backup password is required".to_string()))?;
+        decrypt_backup(password, value)
+    } else {
+        serde_json::from_value(root)
+            .map_err(|err| AppError::Validation(format!("invalid backup config: {err}")))
     }
 }
 
 fn encrypt_backup(password: &str, payload: &BackupPayload) -> AppResult<String> {
-    let mut salt = [0_u8; 16];
-    let mut nonce = [0_u8; 12];
+    validate_backup_password(password)?;
+    let mut salt = [0_u8; BACKUP_SALT_BYTES];
+    let mut nonce = [0_u8; BACKUP_NONCE_BYTES];
     rand::rng().fill_bytes(&mut salt);
     rand::rng().fill_bytes(&mut nonce);
     let key = backup_key(password, &salt)?;
@@ -676,19 +800,26 @@ fn encrypt_backup(password: &str, payload: &BackupPayload) -> AppResult<String> 
         .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
         .map_err(|_| AppError::Internal("backup encryption failed".to_string()))?;
     let envelope = BackupEnvelope {
-        version: 1,
+        version: BACKUP_ENVELOPE_VERSION,
         kdf: "argon2id".to_string(),
         cipher: "aes-256-gcm".to_string(),
         salt: STANDARD.encode(salt),
         nonce: STANDARD.encode(nonce),
         data: STANDARD.encode(ciphertext),
     };
-    serde_json::to_string_pretty(&envelope).map_err(Into::into)
+    let backup = serde_json::to_string_pretty(&envelope)?;
+    validate_backup_text_size(&backup)?;
+    Ok(backup)
 }
 
 fn decrypt_backup(password: &str, value: &str) -> AppResult<BackupPayload> {
-    let envelope: BackupEnvelope = serde_json::from_str(value)?;
-    if envelope.version != 1 || envelope.cipher != "aes-256-gcm" {
+    validate_backup_password(password)?;
+    let envelope: BackupEnvelope = serde_json::from_str(value)
+        .map_err(|_| AppError::Validation("invalid encrypted backup envelope".to_string()))?;
+    if envelope.version != BACKUP_ENVELOPE_VERSION
+        || envelope.kdf != "argon2id"
+        || envelope.cipher != "aes-256-gcm"
+    {
         return Err(AppError::Validation(
             "unsupported backup format".to_string(),
         ));
@@ -702,13 +833,47 @@ fn decrypt_backup(password: &str, value: &str) -> AppResult<BackupPayload> {
     let data = STANDARD
         .decode(envelope.data)
         .map_err(|err| AppError::Validation(format!("invalid backup data: {err}")))?;
+    if salt.len() != BACKUP_SALT_BYTES {
+        return Err(AppError::Validation(
+            "invalid backup salt length".to_string(),
+        ));
+    }
+    if nonce.len() != BACKUP_NONCE_BYTES {
+        return Err(AppError::Validation(
+            "invalid backup nonce length".to_string(),
+        ));
+    }
     let key = backup_key(password, &salt)?;
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|err| AppError::Internal(format!("backup cipher error: {err}")))?;
     let plaintext = cipher
         .decrypt(Nonce::from_slice(&nonce), data.as_ref())
         .map_err(|_| AppError::Validation("backup password is invalid".to_string()))?;
-    serde_json::from_slice(&plaintext).map_err(Into::into)
+    serde_json::from_slice(&plaintext)
+        .map_err(|err| AppError::Validation(format!("invalid backup payload: {err}")))
+}
+
+fn validate_backup_password(password: &str) -> AppResult<()> {
+    let length = password.chars().count();
+    if !(4..=256).contains(&length) {
+        return Err(AppError::Validation(
+            "backup password must be between 4 and 256 characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_backup_text_size(value: &str) -> AppResult<()> {
+    if value.len() > MAX_BACKUP_TEXT_BYTES {
+        return Err(AppError::PayloadTooLarge(
+            "backup file is larger than 8 MiB".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn legacy_backup_schema_version() -> u32 {
+    1
 }
 
 fn backup_key(password: &str, salt: &[u8]) -> AppResult<[u8; 32]> {
@@ -722,15 +887,46 @@ fn backup_key(password: &str, salt: &[u8]) -> AppResult<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client_control::{ClientRuleRecord, ClientRuleSource, WebhookNotifyConfig};
+    use crate::{
+        client_control::{
+            ClientRuleRecord, ClientRuleSource, PlaybackRateBlockRecord, WebhookNotifyConfig,
+        },
+        users_api::{UserPolicyRecord, UserPolicyUpdate, UserTemplate},
+    };
+
+    fn test_client_control() -> ClientControlConfig {
+        ClientControlConfig {
+            enabled: true,
+            notify_enabled: false,
+            playback_rate_limit_enabled: true,
+            playback_rate_limit_window_seconds: 60,
+            playback_rate_limit_max_requests: 20,
+            playback_rate_limit_block_seconds: 1800,
+            playback_rate_limit_action: "block_ip".to_string(),
+            concurrent_playback_limit_enabled: true,
+            concurrent_playback_limit_max: 3,
+            rate_limit_blocks: Vec::new(),
+            webhook: WebhookNotifyConfig::default(),
+            webhooks: Vec::new(),
+            records: Vec::new(),
+        }
+    }
+
+    fn test_payload() -> BackupPayload {
+        BackupPayload {
+            schema_version: BACKUP_SCHEMA_VERSION,
+            application_version: Some("v-test".to_string()),
+            runtime_config: Config::default_runtime(),
+            client_control: Some(test_client_control()),
+            system_log_config: Some(SystemLogConfig::default()),
+            user_policies: Some(UserPoliciesDocument::default()),
+            user_templates: Some(UserTemplatesDocument::default()),
+        }
+    }
 
     #[test]
     fn backup_round_trip_restores_payload() {
-        let payload = BackupPayload {
-            runtime_config: Config::default_runtime(),
-            client_control: Some(serde_json::json!({ "enabled": true })),
-            system_log_config: Some(SystemLogConfig::default()),
-        };
+        let payload = test_payload();
 
         let backup = encrypt_backup("strong-password", &payload).unwrap();
         let restored = decrypt_backup("strong-password", &backup).unwrap();
@@ -739,22 +935,104 @@ mod tests {
             restored.runtime_config.cache_ttl_seconds,
             payload.runtime_config.cache_ttl_seconds
         );
-        assert_eq!(restored.client_control, payload.client_control);
+        assert_eq!(restored.schema_version, BACKUP_SCHEMA_VERSION);
+        assert_eq!(restored.application_version.as_deref(), Some("v-test"));
+        assert!(restored.client_control.as_ref().unwrap().enabled);
         assert!(restored.system_log_config.is_some());
     }
 
     #[test]
+    fn backup_round_trip_keeps_user_policies() {
+        let mut payload = test_payload();
+        payload.user_policies = Some(UserPoliciesDocument {
+            policies: vec![UserPolicyRecord {
+                server_id: "server-a".to_string(),
+                user_id: "user-a".to_string(),
+                rate_limit_enabled: true,
+                ..UserPolicyRecord::default()
+            }],
+        });
+        payload.user_templates = Some(UserTemplatesDocument {
+            templates: vec![UserTemplate {
+                id: "template-a".to_string(),
+                server_id: "server-a".to_string(),
+                name: "家庭用户".to_string(),
+                policy: UserPolicyUpdate {
+                    is_administrator: Some(false),
+                    ..UserPolicyUpdate::default()
+                },
+            }],
+        });
+
+        let backup = encrypt_backup("strong-password", &payload).unwrap();
+        let restored = decrypt_backup("strong-password", &backup).unwrap();
+
+        let policy = &restored.user_policies.unwrap().policies[0];
+        assert_eq!(policy.server_id, "server-a");
+        assert_eq!(policy.user_id, "user-a");
+        assert!(policy.rate_limit_enabled);
+        let template = &restored.user_templates.unwrap().templates[0];
+        assert_eq!(template.id, "template-a");
+        assert_eq!(template.policy.is_administrator, Some(false));
+    }
+
+    #[test]
     fn backup_rejects_wrong_password() {
-        let payload = BackupPayload {
-            runtime_config: Config::default_runtime(),
-            client_control: None,
-            system_log_config: None,
-        };
+        let payload = test_payload();
 
         let backup = encrypt_backup("correct-password", &payload).unwrap();
         let err = decrypt_backup("wrong-password", &backup).unwrap_err();
 
         assert!(err.to_string().contains("backup password is invalid"));
+    }
+
+    #[test]
+    fn legacy_plain_backup_defaults_to_schema_one() {
+        let value = serde_json::json!({
+            "runtime_config": Config::default_runtime()
+        });
+
+        let restored = parse_backup_text(None, &value.to_string()).unwrap();
+
+        assert_eq!(restored.schema_version, 1);
+        assert!(restored.client_control.is_none());
+        assert!(restored.user_policies.is_none());
+    }
+
+    #[test]
+    fn backup_rejects_short_password() {
+        let err = encrypt_backup("abc", &test_payload()).unwrap_err();
+
+        assert!(err.to_string().contains("between 4 and 256"));
+    }
+
+    #[test]
+    fn backup_rejects_invalid_nonce_length() {
+        let envelope = BackupEnvelope {
+            version: BACKUP_ENVELOPE_VERSION,
+            kdf: "argon2id".to_string(),
+            cipher: "aes-256-gcm".to_string(),
+            salt: STANDARD.encode([0_u8; BACKUP_SALT_BYTES]),
+            nonce: STANDARD.encode([0_u8; 1]),
+            data: STANDARD.encode([0_u8; 16]),
+        };
+
+        let err = decrypt_backup(
+            "strong-password",
+            &serde_json::to_string(&envelope).unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("invalid backup nonce length"));
+    }
+
+    #[test]
+    fn backup_rejects_oversized_text() {
+        let oversized = "x".repeat(MAX_BACKUP_TEXT_BYTES + 1);
+
+        let err = parse_backup_text(None, &oversized).unwrap_err();
+
+        assert!(matches!(err, AppError::PayloadTooLarge(_)));
     }
 
     #[test]
@@ -791,21 +1069,9 @@ mod tests {
 
     #[test]
     fn backup_client_control_keeps_only_active_rules_and_blocks() {
-        let mut config = ClientControlConfig {
-            enabled: true,
-            notify_enabled: false,
-            playback_rate_limit_enabled: false,
-            playback_rate_limit_window_seconds: 60,
-            playback_rate_limit_max_requests: 20,
-            playback_rate_limit_block_seconds: 1800,
-            playback_rate_limit_action: "block_ip".to_string(),
-            concurrent_playback_limit_enabled: false,
-            concurrent_playback_limit_max: 3,
-            rate_limit_blocks: Vec::new(),
-            webhook: WebhookNotifyConfig::default(),
-            webhooks: Vec::new(),
-            records: Vec::new(),
-        };
+        let now = 1_000;
+        let active_until = now + 60;
+        let mut config = test_client_control();
         config.records.push(ClientRuleRecord {
             id: "blocked".to_string(),
             client_name: "Infuse".to_string(),
@@ -830,72 +1096,67 @@ mod tests {
             updated_at: "1".to_string(),
             note: "自动记录播放设备".to_string(),
         });
-        let active_until = now_seconds() + 60;
-        config
-            .rate_limit_blocks
-            .push(crate::client_control::PlaybackRateBlockRecord {
-                id: "active-block".to_string(),
-                server_id: "server-a".to_string(),
-                server_name: "a".to_string(),
-                action: "block_ip".to_string(),
-                ip: "10.0.0.1".to_string(),
-                user_name: "user-a".to_string(),
-                blocked_until: active_until.to_string(),
-                created_at: "1".to_string(),
-                enabled: true,
-                note: "active".to_string(),
-                ip_location: None,
-            });
-        config
-            .rate_limit_blocks
-            .push(crate::client_control::PlaybackRateBlockRecord {
-                id: "expired-block".to_string(),
-                server_id: "server-a".to_string(),
-                server_name: "a".to_string(),
-                action: "block_ip".to_string(),
-                ip: "10.0.0.2".to_string(),
-                user_name: "user-b".to_string(),
-                blocked_until: "1".to_string(),
-                created_at: "1".to_string(),
-                enabled: true,
-                note: "expired".to_string(),
-                ip_location: None,
-            });
-        config
-            .rate_limit_blocks
-            .push(crate::client_control::PlaybackRateBlockRecord {
-                id: "disabled-block".to_string(),
-                server_id: "server-a".to_string(),
-                server_name: "a".to_string(),
-                action: "disable_user".to_string(),
-                ip: "10.0.0.3".to_string(),
-                user_name: "user-c".to_string(),
-                blocked_until: active_until.to_string(),
-                created_at: "1".to_string(),
-                enabled: false,
-                note: "disabled".to_string(),
-                ip_location: None,
-            });
+        config.records.push(ClientRuleRecord {
+            id: "allowed-manual".to_string(),
+            client_name: "Manual".to_string(),
+            device_name: "--".to_string(),
+            user_name: "--".to_string(),
+            user_agent: "Manual-UA".to_string(),
+            source: ClientRuleSource::Manual,
+            enabled: false,
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+            note: "手动保留".to_string(),
+        });
+        config.rate_limit_blocks.push(PlaybackRateBlockRecord {
+            id: "active-block".to_string(),
+            server_id: "server-a".to_string(),
+            server_name: "a".to_string(),
+            action: "block_ip".to_string(),
+            ip: "10.0.0.1".to_string(),
+            user_name: "user-a".to_string(),
+            blocked_until: active_until.to_string(),
+            created_at: "1".to_string(),
+            enabled: true,
+            note: "active".to_string(),
+            ip_location: None,
+        });
+        config.rate_limit_blocks.push(PlaybackRateBlockRecord {
+            id: "expired-block".to_string(),
+            server_id: "server-a".to_string(),
+            server_name: "a".to_string(),
+            action: "block_ip".to_string(),
+            ip: "10.0.0.2".to_string(),
+            user_name: "user-b".to_string(),
+            blocked_until: "1".to_string(),
+            created_at: "1".to_string(),
+            enabled: true,
+            note: "expired".to_string(),
+            ip_location: None,
+        });
+        config.rate_limit_blocks.push(PlaybackRateBlockRecord {
+            id: "disabled-block".to_string(),
+            server_id: "server-a".to_string(),
+            server_name: "a".to_string(),
+            action: "disable_user".to_string(),
+            ip: "10.0.0.3".to_string(),
+            user_name: "user-c".to_string(),
+            blocked_until: active_until.to_string(),
+            created_at: "1".to_string(),
+            enabled: false,
+            note: "disabled".to_string(),
+            ip_location: None,
+        });
 
-        let value = backup_client_control_value(Some(config)).unwrap().unwrap();
-        let records = value
-            .get("records")
-            .and_then(|records| records.as_array())
-            .unwrap();
+        let backup = client_control::prepare_backup_config(config, now);
+        let record_ids = backup
+            .records
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect::<Vec<_>>();
 
-        assert_eq!(records.len(), 1);
-        assert_eq!(
-            records[0].get("id").and_then(|id| id.as_str()),
-            Some("blocked")
-        );
-        let blocks = value
-            .get("rate_limit_blocks")
-            .and_then(|blocks| blocks.as_array())
-            .unwrap();
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(
-            blocks[0].get("id").and_then(|id| id.as_str()),
-            Some("active-block")
-        );
+        assert_eq!(record_ids, vec!["blocked", "allowed-manual"]);
+        assert_eq!(backup.rate_limit_blocks.len(), 1);
+        assert_eq!(backup.rate_limit_blocks[0].id, "active-block");
     }
 }

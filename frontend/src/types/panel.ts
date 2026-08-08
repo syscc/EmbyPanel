@@ -214,7 +214,7 @@ export type PlaybackRateBlockRecord = {
   id: string
   server_id: string
   server_name: string
-  action: 'block_ip' | 'disable_user' | 'mixed'
+  action: 'block_ip' | 'block_user' | 'disable_user' | 'mixed'
   ip: string
   ip_location?: IpLocation
   user_name: string
@@ -308,7 +308,7 @@ export type SystemLogConfig = {
 }
 
 export type AuthMode = 'loading' | 'setup' | 'login' | 'app'
-export type Page = 'home' | 'server' | 'clients' | 'notifications' | 'backup' | 'logs' | 'account'
+export type Page = 'home' | 'server' | 'clients' | 'notifications' | 'backup' | 'logs' | 'account' | 'users'
 export type ClientStatusFilter = 'all' | 'blocked' | 'allowed'
 export type LogKindFilter = 'all' | 'playback' | 'general'
 export type LogViewFilter = 'playback' | 'blocked' | 'proxy' | 'general'
@@ -316,3 +316,170 @@ export type Locale = 'zh-CN' | 'en-US'
 export type EncryptionPublicKey =
   | { kind: 'webcrypto'; key: CryptoKey }
   | { kind: 'forge'; key: forge.pki.rsa.PublicKey }
+
+export type UserPolicyRecord = {
+  server_id: string
+  user_id: string
+  user_name: string
+  rate_limit_enabled: boolean
+  rate_limit_window_seconds: number
+  rate_limit_max_requests: number
+  rate_limit_block_seconds: number
+  rate_limit_action: 'block_ip' | 'block_user' | 'disable_user' | 'mixed' | string
+  concurrent_playback_limit_enabled: boolean
+  concurrent_playback_limit_max: number
+}
+
+export type UserAccessSchedule = {
+  day_of_week: 'Sunday' | 'Monday' | 'Tuesday' | 'Wednesday' | 'Thursday' | 'Friday' | 'Saturday' | 'Everyday' | 'Weekday' | 'Weekend'
+  start_hour: number
+  end_hour: number
+}
+
+export type UserPolicyInput = {
+  is_administrator?: boolean
+  is_hidden?: boolean
+  is_hidden_remotely?: boolean
+  is_hidden_from_unused_devices?: boolean
+  is_disabled?: boolean
+  max_parental_rating_enabled?: boolean
+  max_parental_rating?: number
+  allow_tag_or_rating?: boolean
+  blocked_tags?: string[]
+  is_tag_blocking_mode_inclusive?: boolean
+  include_tags?: string[]
+  enable_user_preference_access?: boolean
+  access_schedules?: UserAccessSchedule[]
+  block_unrated_items?: string[]
+  enable_remote_control_of_other_users?: boolean
+  enable_shared_device_control?: boolean
+  enable_remote_access?: boolean
+  enable_live_tv_management?: boolean
+  enable_live_tv_access?: boolean
+  enable_media_playback?: boolean
+  enable_audio_playback_transcoding?: boolean
+  enable_video_playback_transcoding?: boolean
+  auto_remote_quality?: number
+  enable_playback_remuxing?: boolean
+  enable_content_deletion?: boolean
+  restricted_features?: string[]
+  enable_content_deletion_from_folders?: string[]
+  enable_content_downloading?: boolean
+  enable_subtitle_downloading?: boolean
+  enable_subtitle_management?: boolean
+  enable_sync_transcoding?: boolean
+  enable_media_conversion?: boolean
+  enabled_channels?: string[]
+  enable_all_channels?: boolean
+  enable_all_folders?: boolean
+  enabled_folders?: string[]
+  enable_public_sharing?: boolean
+  remote_client_bitrate_limit?: number
+  excluded_sub_folders?: string[]
+  enable_all_devices?: boolean
+  enabled_devices?: string[]
+  simultaneous_stream_limit?: number
+  allow_camera_upload?: boolean
+  allow_sharing_personal_items?: boolean
+  rate_limit_enabled?: boolean
+  rate_limit_window_seconds?: number
+  rate_limit_max_requests?: number
+  rate_limit_block_seconds?: number
+  rate_limit_action?: 'block_ip' | 'block_user' | 'disable_user' | 'mixed' | string
+  concurrent_playback_limit_enabled?: boolean
+  concurrent_playback_limit_max?: number
+}
+
+export type UserPolicyDraft = {
+  is_administrator: boolean
+  is_hidden: boolean
+  is_hidden_remotely: boolean
+  is_hidden_from_unused_devices: boolean
+  is_disabled: boolean
+  max_parental_rating_enabled: boolean
+  max_parental_rating: number
+  allow_tag_or_rating: boolean
+  blocked_tags: string[]
+  is_tag_blocking_mode_inclusive: boolean
+  include_tags: string[]
+  enable_user_preference_access: boolean
+  access_schedules: UserAccessSchedule[]
+  block_unrated_items: string[]
+  enable_remote_control_of_other_users: boolean
+  enable_shared_device_control: boolean
+  enable_remote_access: boolean
+  enable_live_tv_management: boolean
+  enable_live_tv_access: boolean
+  enable_media_playback: boolean
+  enable_audio_playback_transcoding: boolean
+  enable_video_playback_transcoding: boolean
+  auto_remote_quality: number
+  enable_playback_remuxing: boolean
+  enable_content_deletion: boolean
+  restricted_features: string[]
+  enable_content_deletion_from_folders: string[]
+  enable_content_downloading: boolean
+  enable_subtitle_downloading: boolean
+  enable_subtitle_management: boolean
+  enable_sync_transcoding: boolean
+  enable_media_conversion: boolean
+  enabled_channels: string[]
+  enable_all_channels: boolean
+  enable_all_folders: boolean
+  enabled_folders: string[]
+  enable_public_sharing: boolean
+  remote_client_bitrate_limit: number
+  excluded_sub_folders: string[]
+  enable_all_devices: boolean
+  enabled_devices: string[]
+  simultaneous_stream_limit: number
+  allow_camera_upload: boolean
+  allow_sharing_personal_items: boolean
+  rate_limit_enabled: boolean
+  rate_limit_window_seconds: number
+  rate_limit_max_requests: number
+  rate_limit_block_seconds: number
+  rate_limit_action: 'block_ip' | 'block_user' | 'disable_user' | 'mixed' | string
+  concurrent_playback_limit_enabled: boolean
+  concurrent_playback_limit_max: number
+}
+
+export type UserTemplate = {
+  id: string
+  server_id: string
+  name: string
+  policy: UserPolicyInput
+}
+
+export type UserSummary = {
+  server_id: string
+  server_name: string
+  user_id: string
+  name: string
+  is_administrator: boolean
+  is_disabled: boolean
+  enable_remote_access: boolean
+  enable_media_playback: boolean
+  enable_all_folders: boolean
+  enabled_folders: string[]
+  available_folders: Array<{ id: string; name: string }>
+  enable_all_devices: boolean
+  enabled_devices: string[]
+  available_devices: Array<{ id: string; name: string }>
+  simultaneous_stream_limit: number | null
+  last_activity: string | null
+  active_sessions: number
+  devices: string[]
+  policy: UserPolicyInput
+  user_policy: UserPolicyRecord
+}
+
+export type UsersResponse = {
+  users: UserSummary[]
+  servers?: Array<{ id: string; name: string }>
+  server_errors: Array<{ server_id: string; server_name: string; error: string }>
+}
+
+export type UserTemplatesResponse = {
+  templates: UserTemplate[]
+}

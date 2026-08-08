@@ -648,6 +648,22 @@ impl SettingsStore {
         Ok(())
     }
 
+    pub fn record_audit_best_effort(
+        &self,
+        admin_user_id: Option<i64>,
+        action: &str,
+        summary: &str,
+        result: &str,
+    ) {
+        if let Err(error) = self.record_audit(admin_user_id, action, summary, result) {
+            tracing::error!(
+                action,
+                error = %error.safe_log_message(),
+                "failed to record admin audit"
+            );
+        }
+    }
+
     pub fn list_audit_logs(
         &self,
         action: Option<&str>,

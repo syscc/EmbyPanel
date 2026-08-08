@@ -4,6 +4,7 @@ import { usePanelContext } from '@/composables/panel-context'
 
 const {
   backupError,
+  backupBusy,
   backupFileInput,
   t,
   exportBackup,
@@ -49,8 +50,12 @@ const {
             <div>
               <strong>{{ t('客户端管控') }}</strong>
               <span>{{
-                t('UA 拦截、播放频率限制、封禁列表和客户端规则')
+                t('UA 拦截、播放频率限制、手动客户端规则和当前有效封禁')
               }}</span>
+            </div>
+            <div>
+              <strong>{{ t('用户策略') }}</strong>
+              <span>{{ t('权限模板、用户级限流和同时播放限制') }}</span>
             </div>
             <div>
               <strong>{{ t('通知配置') }}</strong>
@@ -64,7 +69,7 @@ const {
           <p class="muted backup-note">
             {{
               t(
-                '备份文件会使用备份密码加密；不包含面板管理员用户名、密码、登录会话、运行日志文件和请求统计数据。',
+                '备份文件会使用备份密码加密；不包含面板管理员凭证、登录会话、审计与统计、运行日志正文，也不包含 Emby 数据库中的用户、密码和实际权限。',
               )
             }}
           </p>
@@ -73,10 +78,10 @@ const {
         <section class="backup-card">
           <h3>{{ t('配置文件备份 / 还原') }}</h3>
           <div class="backup-actions text-actions">
-            <button class="secondary" @click="exportBackup">
+            <button class="secondary" :disabled="backupBusy" @click="exportBackup">
               <Download :size="15" />{{ t('导出备份') }}
             </button>
-            <button class="primary" @click="importBackup">
+            <button class="primary" :disabled="backupBusy" @click="importBackup">
               <Upload :size="15" />{{ t('还原') }}
             </button>
           </div>

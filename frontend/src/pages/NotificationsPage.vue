@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { Bell, Check, Plus, Trash2, Webhook } from '@lucide/vue'
+import CheckboxField from '@/components/ui/CheckboxField.vue'
 import { usePanelContext } from '@/composables/panel-context'
 
 const {
@@ -37,10 +38,11 @@ const {
           </p>
         </div>
         <div class="panel-actions">
-          <label class="check compact-check">
-            <input v-model="clientControl.notify_enabled" type="checkbox" />
-            <span>{{ t('命中通知') }}</span>
-          </label>
+          <CheckboxField
+            v-model="clientControl.notify_enabled"
+            class="compact-check"
+            :label="t('命中通知')"
+          />
           <button class="secondary" type="button" @click="addWebhook">
             <Plus :size="15" />{{ t('添加 Webhook') }}
           </button>
@@ -65,10 +67,11 @@ const {
           class="webhook-item"
         >
           <div class="webhook-item-head">
-            <label class="check compact-check">
-              <input v-model="webhook.enabled" type="checkbox" />
-              <span>{{ t('启用') }}</span>
-            </label>
+            <CheckboxField
+              v-model="webhook.enabled"
+              class="compact-check"
+              :label="t('启用')"
+            />
             <div class="rule-actions">
               <button
                 class="secondary"
