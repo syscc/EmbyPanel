@@ -151,7 +151,7 @@ function metricTone(metric: HistoryMetric): HistoryMetricItem['tone'] {
   if (metric === 'errors') return 'danger'
   return 'default'
 }
-function formatMetric(metric: HistoryMetric, value: number): string {
+export function formatMetric(metric: HistoryMetric, value: number): string {
   if (!Number.isFinite(value) || value < 0) return '—'
   if (metric === 'redirect_success_rate' || metric === 'transcode_rate') return `${value.toFixed(1)}%`
   if (metric === 'latency_p95') return `${value.toFixed(0)} ms`

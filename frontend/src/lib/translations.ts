@@ -692,6 +692,7 @@ export const translations: Record<string, string> = {
   '播放会话已停止': 'Playback session stopped',
   '新建告警规则': 'New alert rule',
   '无数据': 'No data',
+  '有数据': 'Data available',
   '日均': 'Daily average',
   '旧格式': 'Legacy format',
   '时间': 'Time',

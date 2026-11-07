@@ -634,8 +634,7 @@ test('server options failure is retryable and a previous login response cannot r
   assert.deepEqual(harness.panel.serverOptions.value, [])
 })
 
-async function renderPage(filename, panel, onSetup, overrides = {}) {
-  const vue = require('vue')
+function loadPageComponent(filename, panel, overrides = {}) {
   const { parse, compileScript, compileTemplate } = require('@vue/compiler-sfc')
   const absolute = path.resolve(__dirname, '../src/pages', filename)
   const { descriptor } = parse(readFileSync(absolute, 'utf8'), { filename: absolute })
@@ -651,15 +650,296 @@ async function renderPage(filename, panel, onSetup, overrides = {}) {
     if (id.startsWith('@/')) return load(id.slice(2) + '.ts')
     return require(id)
   }, module, module.exports)
-  const component = module.exports.default, setup = component.setup
+  const component = module.exports.default
   component.render = module.exports.render
+  return component
+}
+
+async function renderPage(filename, panel, onSetup, overrides = {}, props = {}) {
+  const vue = require('vue')
+  const component = loadPageComponent(filename, panel, overrides), setup = component.setup
   component.setup = (props, context) => {
     const state = setup(props, context)
     onSetup?.(state)
     return state
   }
-  return require('@vue/server-renderer').renderToString(vue.createSSRApp(component))
+  return require('@vue/server-renderer').renderToString(vue.createSSRApp(component, props))
 }
+
+function chartHarness(context, input) {
+  const vue = require('vue')
+  const mounted = [], unmounted = []
+  const component = loadPageComponent('../components/ui/P2LineChart.vue', {}, {
+    vue: { ...vue, onMounted: (fn) => mounted.push(fn), onBeforeUnmount: (fn) => unmounted.push(fn) },
+  })
+  const props = vue.reactive({ labels: [], series: [], height: 320, valuePrefix: '', valueSuffix: '', ...input })
+  const scope = vue.effectScope()
+  const state = scope.run(() => component.setup(props, { expose: () => {} }))
+  context.after(() => { unmounted.forEach((fn) => fn()); scope.stop() })
+  return { state, props, mounted, unmounted }
+}
+
+test('P2LineChart renders isolated zero and nonzero samples beyond 31 dates without bridging NaN gaps', async () => {
+  const labels = Array.from({ length: 90 }, (_, i) => `day-${i + 1}`)
+  const sparse = Array(90).fill(Number.NaN)
+  sparse[0] = 0
+  sparse[34] = 180
+  sparse[60] = 20
+  sparse[61] = 21
+  sparse[89] = 0
+  let state
+  const html = await renderPage('../components/ui/P2LineChart.vue', {}, (value) => { state = value }, {}, {
+    labels, series: [{ name: 'continuous', values: labels.map(() => 100) }, { name: 'sparse', values: sparse }],
+  })
+  assert.equal(state.showPoints.value, false)
+  assert.deepEqual(state.markersFor(state.normalizedSeries.value[0].values), [])
+  assert.deepEqual(state.markersFor(state.normalizedSeries.value[1].values), [
+    { val: 0, idx: 0 }, { val: 180, idx: 34 }, { val: 0, idx: 89 },
+  ])
+  assert.equal((html.match(/class="data-point"/g) || []).length, 3, 'actual SFC output must retain isolated markers')
+  const paths = [...html.matchAll(/class="series-path" d="([^"]*)"/g)].map((match) => match[1])
+  assert.equal(paths.length, 2)
+  assert.equal((paths[0].match(/ L /g) || []).length, 89)
+  assert.equal((paths[1].match(/M /g) || []).length, 4)
+  assert.equal((paths[1].match(/ L /g) || []).length, 1, 'only the adjacent pair forms a line')
+  assert.equal(state.getAreaPath(sparse, state.chartScale.value), '')
+})
+
+test('P2LineChart keeps short-series zero markers and renders empty data without a phantom header', async () => {
+  let state
+  const html = await renderPage('../components/ui/P2LineChart.vue', {}, (value) => { state = value }, {}, {
+    labels: ['2026-11-01', '2026-11-02', '2026-11-03', '2026-11-04'],
+    series: [{ name: 'short', values: [0, 2, Number.NaN, 4] }, { name: 'invalid', values: [-1, Infinity] }],
+  })
+  assert.equal(state.normalizedSeries.value.length, 1)
+  assert.equal((html.match(/class="data-point"/g) || []).length, 3)
+  assert.equal(state.getPath(state.normalizedSeries.value[0].values, 4), 'M 0,100 L 33.33,50M 100,0')
+  assert.equal(state.getAreaPath(state.normalizedSeries.value[0].values, 4), '')
+  const empty = await renderPage('../components/ui/P2LineChart.vue', {}, undefined, {}, {
+    labels: [], series: [], emptyLabel: 'fixture-empty',
+  })
+  assert.match(empty, /role="status">fixture-empty/)
+  assert.doesNotMatch(empty, /class="chart-header"|class="axis-x"|class="chart-tooltip"/)
+})
+
+test('P2LineChart clamps measured tooltips and flips below a top sample without changing its date index', async (context) => {
+  const { state } = chartHarness(context, {
+    labels: Array.from({ length: 90 }, (_, i) => `day-${i + 1}`),
+    series: [{ name: 'fixture', values: Array(90).fill(180) }],
+  })
+  state.chartElement.value = {
+    clientWidth: 373, clientHeight: 318, clientLeft: 1, clientTop: 1,
+    getBoundingClientRect: () => ({ left: 100, top: 200, width: 375, height: 320 }),
+  }
+  const plot = { getBoundingClientRect: () => ({ left: 180, top: 280, width: 270, height: 200 }) }
+  state.plotElement.value = plot
+  state.tooltipElement.value = { getBoundingClientRect: () => ({ width: 210, height: 125 }) }
+  state.handleMouseMove({ currentTarget: plot, clientX: 450, clientY: 280 })
+  await require('vue').nextTick()
+  assert.equal(state.tooltip.value.index, 89)
+  assert.equal(state.tooltip.value.x, 100)
+  assert.deepEqual(state.tooltipPosition.value, { left: 155, top: 89 }, 'top sample opens downward and stays inside the right edge')
+  state.handleMouseMove({ currentTarget: plot, clientX: 450, clientY: 300 })
+  assert.equal(state.tooltip.value.y, 0, 'moving toward the tooltip must not chase the pointer')
+  state.handleMouseMove({ currentTarget: plot, clientX: 180, clientY: 480 })
+  await require('vue').nextTick()
+  assert.equal(state.tooltip.value.index, 0)
+  assert.deepEqual(state.tooltipPosition.value, { left: 8, top: 144 }, 'bottom sample opens upward and stays inside the left edge')
+  state.tooltipElement.value = { getBoundingClientRect: () => ({ width: 357, height: 302 }) }
+  await require('vue').nextTick()
+  assert.deepEqual(state.tooltipPosition.value, { left: 8, top: 8 }, 'a tooltip capped to card size still fits')
+})
+
+test('P2LineChart falls back to window resize when ResizeObserver is unavailable and removes the listener on unmount', (context) => {
+  const previousObserver = globalThis.ResizeObserver
+  const previousWindow = globalThis.window
+  delete globalThis.ResizeObserver
+  const listeners = new Map()
+  const added = [], removed = []
+  globalThis.window = {
+    addEventListener(type, listener) {
+      added.push([type, listener])
+      listeners.set(type, listener)
+    },
+    removeEventListener(type, listener) {
+      removed.push([type, listener])
+      if (listeners.get(type) === listener) listeners.delete(type)
+    },
+  }
+  context.after(() => {
+    if (previousObserver === undefined) delete globalThis.ResizeObserver
+    else globalThis.ResizeObserver = previousObserver
+    if (previousWindow === undefined) delete globalThis.window
+    else globalThis.window = previousWindow
+  })
+
+  const { state, mounted, unmounted } = chartHarness(context, {
+    labels: ['first', 'last'], series: [{ name: 'fixture', values: [0, 10] }],
+  })
+  let measured = 0
+  const plot = { getBoundingClientRect: () => { measured += 1; return { width: 240, height: 120 } } }
+  state.plotElement.value = plot
+  state.xAxisLabelElement.value = { getBoundingClientRect: () => ({ width: 30, height: 0 }) }
+
+  assert.doesNotThrow(() => mounted.forEach((fn) => fn()))
+  assert.equal(added.length, 1)
+  assert.equal(added[0][0], 'resize')
+  assert.ok(measured > 0, 'mount performs initial chart measurement')
+  const measuredOnMount = measured
+  listeners.get('resize')()
+  assert.ok(measured > measuredOnMount, 'window resize remeasures the chart')
+
+  globalThis.window = { addEventListener() {}, removeEventListener() { throw new Error('wrong window') } }
+  unmounted.forEach((fn) => fn())
+  assert.deepEqual(removed, added, 'unmount removes the listener from the original window')
+  assert.equal(listeners.has('resize'), false)
+
+  globalThis.window = { addEventListener() {} }
+  const noRemove = chartHarness(context, { labels: [], series: [] })
+  assert.doesNotThrow(() => noRemove.mounted.forEach((fn) => fn()))
+  globalThis.window = { addEventListener() {}, removeEventListener() { throw new Error('replacement window') } }
+  assert.doesNotThrow(() => noRemove.unmounted.forEach((fn) => fn()))
+
+  delete globalThis.window
+  const withoutWindow = chartHarness(context, { labels: [], series: [] })
+  assert.doesNotThrow(() => withoutWindow.mounted.forEach((fn) => fn()))
+  withoutWindow.unmounted.forEach((fn) => fn())
+})
+
+
+test('P2LineChart hides stale tooltips on data changes, repositions on resize, and disconnects its observer', async (context) => {
+  const vue = require('vue')
+  let callback, observer
+  const previousObserver = globalThis.ResizeObserver
+  globalThis.ResizeObserver = class {
+    targets = []
+    disconnected = 0
+    constructor(fn) { callback = fn; observer = this }
+    observe(element) { this.targets.push(element) }
+    disconnect() { this.targets = []; this.disconnected++ }
+  }
+  context.after(() => {
+    if (previousObserver === undefined) delete globalThis.ResizeObserver
+    else globalThis.ResizeObserver = previousObserver
+  })
+  const { state, props, mounted, unmounted } = chartHarness(context, {
+    labels: ['first', 'last'], series: [{ name: 'fixture', values: [0, 500] }],
+  })
+  let width = 600
+  state.chartElement.value = {
+    get clientWidth() { return width }, clientHeight: 318, clientLeft: 0, clientTop: 0,
+    getBoundingClientRect: () => ({ left: 0, top: 0, width, height: 318 }),
+  }
+  const plot = { getBoundingClientRect: () => ({ left: 80, top: 70, width: width - 100, height: 200 }) }
+  state.plotElement.value = plot
+  state.tooltipElement.value = { getBoundingClientRect: () => ({ width: 180, height: 100 }) }
+  mounted.forEach((fn) => fn())
+  state.handleMouseMove({ currentTarget: plot, clientX: 580, clientY: 70 })
+  await vue.nextTick()
+  assert.equal(observer.targets.length, 3)
+  assert.equal(state.tooltipPosition.value.left, 412)
+  width = 375
+  callback()
+  assert.equal(state.tooltipPosition.value.left, 187)
+  props.series[0].values[1] = 25
+  await vue.nextTick()
+  assert.equal(state.tooltip.value.visible, false)
+  assert.equal(state.tooltip.value.index, -1)
+  state.handleMouseMove({ currentTarget: plot, clientX: 355, clientY: 70 })
+  props.labels = ['replacement', 'date']
+  await vue.nextTick()
+  assert.equal(state.tooltip.value.visible, false)
+  assert.equal(state.tooltip.value.index, -1)
+  const before = observer.disconnected
+  unmounted.forEach((fn) => fn())
+  assert.equal(observer.disconnected, before + 1)
+  assert.deepEqual(observer.targets, [])
+})
+
+test('P2LineChart starts with endpoint dates in SSR before axis measurements exist', async () => {
+  const labels = Array.from({ length: 7 }, (_, i) => `2026-11-${String(i + 1).padStart(2, '0')}`)
+  const html = await renderPage('../components/ui/P2LineChart.vue', {}, (state) => {
+    assert.deepEqual(state.xAxisTicks.value, [0, 6])
+    assert.equal(state.xAxisLabelText.value, labels.map((label) => label.slice(5).replace('-', '/')).join('\n'))
+  }, {}, { labels, series: [{ name: 'fixture', values: [0, 1, 2, 3, 4, 5, 6] }] })
+  assert.match(html, /left:0%;transform:translateX\(0\);">11\/01<\/span>/)
+  assert.match(html, /left:100%;transform:translateX\(-100%\);">11\/07<\/span>/)
+})
+
+test('P2LineChart adapts date ticks to measured plot and label widths without changing samples or tooltip indexes', async (context) => {
+  const vue = require('vue')
+  let callback, observer
+  const previousObserver = globalThis.ResizeObserver
+  globalThis.ResizeObserver = class {
+    targets = []
+    constructor(fn) { callback = fn; observer = this }
+    observe(element) { this.targets.push(element) }
+    disconnect() { this.targets = [] }
+  }
+  context.after(() => {
+    if (previousObserver === undefined) delete globalThis.ResizeObserver
+    else globalThis.ResizeObserver = previousObserver
+  })
+  const labels = Array.from({ length: 7 }, (_, i) => `2026-11-${String(i + 1).padStart(2, '0')}`)
+  const series = [{ name: 'fixture', values: [0, 1, 2, 3, 4, 5, 6] }]
+  const { state, props, mounted } = chartHarness(context, { labels, series })
+  const originalPath = state.getPath(state.normalizedSeries.value[0].values, state.chartScale.value)
+  assert.deepEqual(state.xAxisTicks.value, [0, 6], 'before mounting, only endpoint dates are shown')
+  let plotWidth = 147, labelWidth = 30.28
+  const plot = { getBoundingClientRect: () => ({ left: 100, top: 70, width: plotWidth, height: 200 }) }
+  state.plotElement.value = plot
+  state.xAxisLabelElement.value = { getBoundingClientRect: () => ({ width: labelWidth, height: 0 }) }
+  mounted.forEach((fn) => fn())
+  await vue.nextTick()
+  assert.equal(observer.targets.length, 2, 'plot and the independent label measure are observed')
+  assert.deepEqual(state.xAxisTicks.value, [0, 3, 6], '375px scenario reduces crowded endpoint neighbors')
+  plotWidth = 162
+  callback()
+  assert.deepEqual(state.xAxisTicks.value, [0, 2, 4, 6], '390px plot admits four separated dates')
+  plotWidth = 640
+  callback()
+  assert.deepEqual(state.xAxisTicks.value, [0, 1, 2, 3, 4, 5, 6], 'wide plots restore all seven dates')
+  plotWidth = 320
+  callback()
+  assert.equal(state.xAxisTicks.value.length, 7)
+  labelWidth = 60
+  callback()
+  assert.deepEqual(state.xAxisTicks.value, [0, 2, 4, 6], 'a wider measured label reduces tick density too')
+  const layout = state.xAxisLayout.value
+  callback()
+  assert.equal(state.xAxisLayout.value, layout, 'unchanged observations must not invalidate layout again')
+  plotWidth = 147
+  labelWidth = 30.28
+  callback()
+  for (const index of [0, 1, 6]) {
+    state.handleMouseMove({ currentTarget: plot, clientX: 100 + plotWidth * index / 6, clientY: 70 })
+    assert.equal(state.tooltip.value.index, index, 'hidden date ticks remain selectable by their original sample index')
+    assert.equal(state.tooltip.value.x, state.safeX(index, labels.length))
+  }
+  assert.deepEqual(props.labels, labels)
+  assert.deepEqual(props.series, series)
+  assert.equal(state.getPath(state.normalizedSeries.value[0].values, state.chartScale.value), originalPath)
+  assert.deepEqual(state.markersFor(state.normalizedSeries.value[0].values).map((point) => point.idx), [0, 1, 2, 3, 4, 5, 6])
+})
+
+test('P2LineChart renders all tooltip series with complete metric values and units', async () => {
+  const { formatMetric } = load('composables/useHistoryController.ts')
+  const series = Array.from({ length: 20 }, (_, index) => ({ name: `server-${String(index + 1).padStart(2, '0')}`, values: [index === 0 ? Number.NaN : 500_000_000] }))
+  series[0].values = [0]
+  const html = await renderPage('../components/ui/P2LineChart.vue', {}, (state) => {
+    state.tooltip.value = { visible: true, index: 0, x: 50, y: 0 }
+    assert.equal(state.formatAxisValue(500_000_000), '500.00 Mbps')
+    assert.equal(state.formatAxisValue(20_000_000), '20.00 Mbps')
+  }, {}, { labels: ['2026-11-01'], series, valueFormatter: (value) => formatMetric('bandwidth', value) })
+  assert.equal((html.match(/class="tooltip-series"/g) || []).length, 20)
+  assert.match(html, /<div class="tooltip-list">[\s\S]*server-20[\s\S]*<strong>500\.00 Mbps<\/strong>/)
+  assert.match(html, /<strong>0 bps<\/strong>/)
+  assert.match(html, /class="tooltip-date">11\/01/)
+  const counts = await renderPage('../components/ui/P2LineChart.vue', {}, (state) => {
+    assert.equal(state.formatAxisValue(1_000_000), '1,000,000')
+  }, {}, { labels: ['day'], series: [{ name: 'requests', values: [1_000_000] }], valueFormatter: (value) => formatMetric('requests', value) })
+  assert.match(counts, />1,000,000<\/span>/)
+})
 
 test('library task names react to authorized configuration while filters keep server IDs and empty/failed options', async (context) => {
   const vue = require('vue')

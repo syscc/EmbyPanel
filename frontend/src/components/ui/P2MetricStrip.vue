@@ -43,10 +43,11 @@ function itemKey(item: MetricItem, index: number) {
         v-for="(item, index) in props.items"
         :key="itemKey(item, index)"
         class="metric-item"
+        :class="getToneClass(item.tone)"
         role="listitem"
       >
         <div class="metric-label">{{ item.label }}</div>
-        <div class="metric-value" :class="getToneClass(item.tone)">
+        <div class="metric-value">
           {{ item.value }}
         </div>
         <div v-if="item.detail" class="metric-detail">
@@ -62,67 +63,107 @@ function itemKey(item: MetricItem, index: number) {
 
 <style scoped>
 .p2-metric-strip {
-  display: flex;
-  gap: 1.5rem;
-  background: var(--card-bg);
-  padding: 1rem;
-  border-radius: 0.5rem;
-  border: 1px solid var(--border);
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 0.75rem;
+  min-height: 0;
+  padding: 0;
+  background: transparent;
   font-size: 0.875rem;
-  flex-wrap: wrap;
-  justify-content: center;
-  min-height: 4.5rem;
 }
 
 .metric-item {
-  flex: 1;
+  position: relative;
   min-width: 0;
-  text-align: center;
-  max-width: 200px;
+  max-width: none;
+  overflow: hidden;
+  padding: 0.9rem 1rem 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 0.7rem;
+  background: var(--panel-bg);
+  text-align: left;
+  box-shadow: 0 8px 24px var(--shadow-soft);
+}
+
+.metric-item::before {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: var(--primary);
+  content: '';
+}
+
+.metric-item.metric-success::before {
+  background: var(--success-text);
+}
+
+.metric-item.metric-warning::before {
+  background: var(--accent-warn);
+}
+
+.metric-item.metric-danger::before {
+  background: var(--danger-text);
 }
 
 .metric-label {
-  color: var(--muted-foreground);
-  font-size: 0.75rem;
-  margin-bottom: 0.25rem;
-  white-space: nowrap;
   overflow: hidden;
+  margin-bottom: 0.45rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .metric-value {
-  font-size: 1.25rem;
-  font-weight: 600;
-  margin-bottom: 0.25rem;
-}
-
-.metric-default {
+  overflow-wrap: anywhere;
   color: var(--text);
+  font-size: 1.45rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 750;
+  line-height: 1.1;
 }
 
-.metric-success {
-  color: var(--success, #16a34a);
+.metric-success .metric-value {
+  color: var(--success-text);
 }
 
-.metric-warning {
-  color: var(--warning, #d97706);
+.metric-warning .metric-value {
+  color: var(--warn-text);
 }
 
-.metric-danger {
-  color: var(--danger, #dc2626);
+.metric-danger .metric-value {
+  color: var(--danger-text);
 }
 
 .metric-detail {
-  font-size: 0.75rem;
-  color: var(--muted-foreground);
-  margin-top: 0.25rem;
+  min-height: 1.25rem;
+  margin-top: 0.5rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.45;
 }
 
 .metric-empty {
   width: 100%;
-  text-align: center;
-  color: var(--muted-foreground);
+  padding: 0.75rem;
+  color: var(--muted);
   font-size: 0.875rem;
-  padding: 0.5rem 0;
+  text-align: center;
+}
+
+@media (max-width: 560px) {
+  .p2-metric-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .metric-item {
+    padding-inline: 0.85rem;
+  }
+
+  .metric-value {
+    font-size: 1.2rem;
+  }
 }
 </style>
