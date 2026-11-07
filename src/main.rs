@@ -1,21 +1,30 @@
 mod activity_log;
+mod alerts;
+mod alerts_api;
+mod alerts_runtime;
+mod analytics_api;
 mod auth;
 mod block_log;
 mod cache;
+mod cache_api;
 mod client_control;
 mod config;
 mod connectivity;
 mod crypto_api;
 mod db;
+mod diagnostics;
+mod diagnostics_api;
 mod emby;
 mod error;
 mod file_log;
 mod internal_redirect;
 mod ip_location;
+mod library_tasks_api;
 mod monitoring;
 mod openlist;
 mod proxy;
 mod rewrite;
+mod sessions_api;
 mod settings_api;
 mod url_mapping;
 mod users_api;
@@ -35,8 +44,9 @@ use axum::{
     Json, Router,
     extract::{ConnectInfo, DefaultBodyLimit, Query, Request, State},
     http::{Method, StatusCode, Uri, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{any, get},
+    routing::{any, delete, get, patch, post, put},
 };
 use bytes::Bytes;
 use config::Config;
@@ -56,8 +66,10 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
 };
 
-use crate::cache::DirectLinkCache;
+use crate::cache::{DirectLinkCache, DirectLinkCachePolicy};
 use activity_log::{ActivityKind, ActivityLevel, ActivityLogStore, PlaybackLogRecord};
+use alerts::Alerts;
+use alerts_runtime::AlertRuntime;
 use block_log::BlockLogStore;
 use file_log::FileLogStore;
 
@@ -191,6 +203,8 @@ struct AppState {
     cache: Arc<RwLock<DirectLinkCache>>,
     settings_store: SettingsStore,
     telemetry_writes: TelemetryWriteQueue,
+    alerts: Alerts,
+    alert_runtime: AlertRuntime,
     client_control_cache: Arc<StdRwLock<Option<(u64, client_control::ClientControlConfig)>>>,
     user_policies_cache: Arc<StdRwLock<Option<(u64, users_api::UserPoliciesDocument)>>>,
     rate_limit_updates: Arc<Mutex<()>>,
@@ -587,10 +601,19 @@ impl ProxyManager {
             let _ = task.shutdown.send(());
             drains.spawn(wait_for_proxy_drain(server_id, task.port, task.handle));
         }
-        while let Some(result) = drains.join_next().await {
-            if let Err(err) = result {
-                tracing::warn!(error = %err, "proxy drain task failed");
+        // A deadline belongs to process shutdown, not to a live config reload.
+        let drained = tokio::time::timeout(PROXY_DRAIN_TIMEOUT, async {
+            while let Some(result) = drains.join_next().await {
+                if let Err(err) = result {
+                    tracing::warn!(error = %err, "proxy drain task failed");
+                }
             }
+        })
+        .await;
+        if drained.is_err() {
+            tracing::warn!("proxy shutdown drain timed out");
+            drains.abort_all();
+            while drains.join_next().await.is_some() {}
         }
     }
 
@@ -631,22 +654,51 @@ fn reap_completed_proxy_drains(drains: &mut JoinSet<()>) {
     }
 }
 
-async fn wait_for_proxy_drain(server_id: String, port: u16, mut handle: JoinHandle<()>) {
-    match tokio::time::timeout(PROXY_DRAIN_TIMEOUT, &mut handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) if err.is_cancelled() => {}
-        Ok(Err(err)) => {
-            tracing::warn!(server_id, port, error = %err, "proxy task exited during drain");
+fn direct_link_cache_policy(config: &Config) -> DirectLinkCachePolicy {
+    DirectLinkCachePolicy::new(
+        config.cache_enabled,
+        config.cache_ttl_seconds,
+        config.cache_max_capacity,
+    )
+}
+
+pub(crate) fn direct_link_cache_from_config(config: &Config) -> DirectLinkCache {
+    let default_policy = direct_link_cache_policy(config);
+    let server_policies = config.servers.iter().filter_map(|server| {
+        let server_id = server.id.trim();
+        if server_id.is_empty() {
+            return None;
         }
-        Err(_) => {
-            tracing::warn!(
-                server_id,
-                port,
-                timeout_seconds = PROXY_DRAIN_TIMEOUT.as_secs(),
-                "proxy drain timed out; aborting server task"
-            );
-            handle.abort();
-            let _ = handle.await;
+        let effective_config = config.for_server_for_validation(server);
+        Some((
+            server_id.to_string(),
+            direct_link_cache_policy(&effective_config),
+        ))
+    });
+    DirectLinkCache::new_with_server_policies(default_policy, server_policies)
+}
+
+fn direct_link_cache_is_effective(config: &Config) -> bool {
+    config.cache_enabled && config.cache_ttl_seconds > 0 && config.cache_max_capacity > 0
+}
+
+struct DrainingProxyTask(JoinHandle<()>);
+
+impl Drop for DrainingProxyTask {
+    fn drop(&mut self) {
+        // JoinHandle normally detaches on drop; canceled drain supervisors must
+        // not leave their server tasks detached during process shutdown.
+        self.0.abort();
+    }
+}
+
+async fn wait_for_proxy_drain(server_id: String, port: u16, handle: JoinHandle<()>) {
+    let mut task = DrainingProxyTask(handle);
+    match (&mut task.0).await {
+        Ok(()) => {}
+        Err(err) if err.is_cancelled() => {}
+        Err(err) => {
+            tracing::warn!(server_id, port, error = %err, "proxy task exited during drain");
         }
     }
 }
@@ -662,6 +714,7 @@ async fn main() -> AppResult<()> {
         return healthcheck_command().await;
     }
 
+    diagnostics::init_diagnostics();
     let settings_store = SettingsStore::open_default()?;
     let config = settings_store.load_or_default_config()?;
     let file_log = Arc::new(FileLogStore::new(&settings_store));
@@ -670,13 +723,11 @@ async fn main() -> AppResult<()> {
     let block_log = Arc::new(BlockLogStore::new());
     block_log.bootstrap_from_proxy_logs(&settings_store);
     let ip_location = Arc::new(ip_location::IpLocationStore::new());
-    let cache = DirectLinkCache::new(
-        config.cache_enabled,
-        config.cache_ttl_seconds,
-        config.cache_max_capacity,
-    );
+    let cache = direct_link_cache_from_config(&config);
     let proxy_manager = Arc::new(ProxyManager::new());
     let telemetry_writes = TelemetryWriteQueue::start(settings_store.clone())?;
+    let alerts = Alerts::new(db::database_path())?;
+    let alert_runtime = AlertRuntime::start(alerts.clone(), client.clone());
     let state = AppState {
         config: Arc::new(RwLock::new(config)),
         config_updates: Arc::new(Mutex::new(())),
@@ -685,6 +736,8 @@ async fn main() -> AppResult<()> {
         cache: Arc::new(RwLock::new(cache)),
         settings_store,
         telemetry_writes,
+        alerts,
+        alert_runtime,
         client_control_cache: Arc::new(StdRwLock::new(None)),
         user_policies_cache: Arc::new(StdRwLock::new(None)),
         rate_limit_updates: Arc::new(Mutex::new(())),
@@ -785,6 +838,7 @@ async fn main() -> AppResult<()> {
     connectivity_task.abort();
     let _ = connectivity_task.await;
     proxy_manager.shutdown().await;
+    state.alert_runtime.shutdown().await;
     let telemetry_writes = state.telemetry_writes.clone();
     let telemetry_result = tokio::task::spawn_blocking(move || telemetry_writes.shutdown())
         .await
@@ -918,7 +972,11 @@ async fn handle_request(
                 method: method.as_str(),
                 uri: &uri,
                 path_type: "proxy",
-                status_code: StatusCode::FORBIDDEN.as_u16(),
+                status_code: request_config
+                    .servers
+                    .first()
+                    .map(|server| server.block_web_ui_status_code)
+                    .unwrap_or(403),
                 outcome: "Web UI 拦截",
                 started_at_ms: timing.started_at_ms,
                 duration_ms: timing.started.elapsed().as_millis(),
@@ -930,11 +988,19 @@ async fn handle_request(
             },
         )
         .await;
-        return Ok((
-            StatusCode::FORBIDDEN,
-            "Emby Web UI is disabled by EmbyPanel",
-        )
-            .into_response());
+        let block_status_code = request_config
+            .servers
+            .first()
+            .map(|server| server.block_web_ui_status_code)
+            .unwrap_or(403);
+        let block_message = request_config
+            .servers
+            .first()
+            .map(|server| server.block_web_ui_message.clone())
+            .unwrap_or_else(|| "Emby Web UI is disabled by EmbyPanel".to_string());
+        let status = StatusCode::from_u16(block_status_code)
+            .map_err(|_| AppError::Config("invalid Emby Web UI block status code".to_string()))?;
+        return Ok((status, block_message).into_response());
     }
 
     let body = if method == Method::GET || method == Method::HEAD {
@@ -1146,6 +1212,65 @@ fn build_management_app(state: AppState) -> Router {
             "/api/profile",
             get(auth::get_profile).put(auth::update_profile),
         )
+        .route(
+            "/api/admins",
+            get(settings_api::list_admins).post(settings_api::create_admin),
+        )
+        .route(
+            "/api/admins/{admin_user_id}/roles",
+            put(settings_api::update_admin_roles),
+        )
+        .route(
+            "/api/admins/{admin_user_id}/server-grants",
+            put(settings_api::update_admin_server_grants),
+        )
+        .route(
+            "/api/admins/{admin_user_id}/status",
+            patch(settings_api::set_admin_status),
+        )
+        .route(
+            "/api/admins/{admin_user_id}/password",
+            post(settings_api::reset_admin_password),
+        )
+        .route(
+            "/api/admins/{admin_user_id}",
+            delete(settings_api::delete_admin),
+        )
+        .route("/api/admin/tokens", get(settings_api::list_admin_tokens))
+        .route("/api/admin/token", post(settings_api::create_admin_token))
+        .route(
+            "/api/admin/token/{token_id}",
+            delete(settings_api::revoke_admin_token),
+        )
+        .route(
+            "/api/admin/sessions",
+            get(settings_api::list_admin_sessions),
+        )
+        .route(
+            "/api/admin/session/{session_id}",
+            delete(settings_api::revoke_admin_session),
+        )
+        .route(
+            "/api/admin/2fa/status",
+            get(settings_api::get_admin_2fa_status),
+        )
+        .route("/api/admin/2fa/setup", post(settings_api::setup_admin_2fa))
+        .route(
+            "/api/admin/2fa/confirm",
+            post(settings_api::confirm_admin_2fa),
+        )
+        .route(
+            "/api/admin/2fa/disable",
+            post(settings_api::disable_admin_2fa),
+        )
+        .route(
+            "/api/admin/2fa/recovery",
+            post(settings_api::regenerate_admin_recovery_codes),
+        )
+        .route(
+            "/api/admin/2fa/rollback",
+            post(settings_api::rollback_admin_2fa_setup),
+        )
         .route("/api/users", get(users_api::list_users))
         .route(
             "/api/users/{server_id}",
@@ -1253,6 +1378,76 @@ fn build_management_app(state: AppState) -> Router {
             get(settings_api::get_log_config).put(settings_api::update_log_config),
         )
         .route(
+            "/api/library/libraries",
+            get(library_tasks_api::list_library_libraries),
+        )
+        .route(
+            "/api/library/libraries/validate",
+            post(library_tasks_api::validate_library_paths),
+        )
+        .route(
+            "/api/library/tasks",
+            get(library_tasks_api::list_library_tasks),
+        )
+        .route(
+            "/api/library/tasks/{task_id}/failure",
+            get(library_tasks_api::get_library_task_failure),
+        )
+        .route(
+            "/api/library/tasks/{task_id}/start",
+            post(library_tasks_api::start_library_task),
+        )
+        .route(
+            "/api/library/tasks/{task_id}/cancel",
+            post(library_tasks_api::cancel_library_task),
+        )
+        .route(
+            "/api/sessions/{session_id}/stop",
+            post(sessions_api::stop_session),
+        )
+        .route(
+            "/api/sessions/{session_id}/message",
+            post(sessions_api::send_session_message),
+        )
+        .route("/api/history", get(analytics_api::get_history))
+        .route("/api/servers/options", get(monitoring::server_options))
+        .route("/api/cache/stats", get(cache_api::get_cache_stats))
+        .route("/api/cache/entries", get(cache_api::list_cache_entries))
+        .route("/api/cache/cleanup", post(cache_api::cleanup_cache))
+        .route("/api/diagnostics", get(diagnostics_api::get_diagnostics))
+        .route(
+            "/api/diagnostics/clean",
+            post(diagnostics_api::clean_diagnostics),
+        )
+        .route("/api/alert-rules", get(alerts_api::list_alert_rules))
+        .route("/api/alert-rules", post(alerts_api::create_alert_rule))
+        .route("/api/alert-rules/{id}", get(alerts_api::get_alert_rule))
+        .route("/api/alert-rules/{id}", put(alerts_api::update_alert_rule))
+        .route(
+            "/api/alert-rules/{id}",
+            delete(alerts_api::delete_alert_rule),
+        )
+        .route(
+            "/api/alert-rules/{id}/toggle",
+            patch(alerts_api::toggle_alert_rule),
+        )
+        .route(
+            "/api/alert-rules/{id}/silent",
+            patch(alerts_api::set_alert_rule_silent),
+        )
+        .route(
+            "/api/alert-rules/{id}/history",
+            get(alerts_api::list_alert_rule_history),
+        )
+        .route(
+            "/api/alert-rules/{id}/test",
+            post(alerts_api::test_alert_rule),
+        )
+        .route(
+            "/api/alert-deliveries",
+            get(alerts_api::list_alert_deliveries),
+        )
+        .route(
             "/api/settings/backup/export",
             axum::routing::post(settings_api::export_backup),
         )
@@ -1266,6 +1461,10 @@ fn build_management_app(state: AppState) -> Router {
             ServeDir::new("frontend/dist")
                 .not_found_service(ServeFile::new("frontend/dist/index.html")),
         )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            authenticate_management_request,
+        ))
         .with_state(state)
 }
 
@@ -1340,6 +1539,7 @@ fn record_incoming_proxy_request(state: &AppState, config: &Config) {
 
 fn record_stat(state: &AppState, config: &Config, kind: RequestStatKind) {
     let (server_id, server_name) = config_server_label(config);
+    state.alert_runtime.record_stat(server_id.clone(), kind);
     state
         .telemetry_writes
         .request_stat(server_id, server_name, config.port, kind);
@@ -1706,6 +1906,38 @@ async fn proxy_to_emby_recorded(
         }
     }
     result
+}
+
+fn is_public_management_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/" | "/healthz"
+            | "/api/setup-status"
+            | "/api/app-info"
+            | "/api/public-key"
+            | "/api/setup"
+            | "/api/login"
+    ) || path == "/ui"
+        || path.starts_with("/ui/")
+}
+
+async fn authenticate_management_request(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let is_write = matches!(
+        *request.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
+    if !is_write || is_public_management_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+
+    match auth::require_auth(&state, request.headers()).await {
+        Ok(()) => next.run(request).await,
+        Err(error) => error.into_response(),
+    }
 }
 
 async fn public_healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -2096,17 +2328,38 @@ async fn handle_video_stream(
         )
             .into_response());
     }
-    let cache_key = format!(
-        "{}:{}",
+    let server_id = config_server_label(&config).0;
+    let mut trace = proxy::PlaybackDiagnosisTrace::new(&server_id, &item_id, &user_agent);
+    let cache_key = DirectLinkCache::key(
         state.proxy_server_id.as_deref().unwrap_or("default"),
-        openlist::cache_key(&item_id, media_source_id.as_deref(), user_agent)
+        &item_id,
+        media_source_id.as_deref().unwrap_or("default"),
+        user_agent,
     );
 
+    trace.begin_step(proxy::STEP_CACHE, "lookup");
     let cache = state.cache.read().await.clone();
-    if config.cache_enabled
-        && let Some(cached) = cache.get(&cache_key).await
-        && should_cache_direct_link(&config, &cached)
-    {
+    let cached = cache.get(&cache_key).await;
+    let valid_hit = cached
+        .as_ref()
+        .is_some_and(|value| should_cache_direct_link(&config, value));
+    trace.set_cache_hit(valid_hit);
+    trace.complete_step(if valid_hit { "hit" } else { "miss" });
+    let cached = cached.filter(|_| valid_hit);
+    if let Some(cached) = cached {
+        trace.bypass_steps(&[
+            proxy::STEP_EMBY_PATH,
+            proxy::STEP_MAPPING,
+            proxy::STEP_OPENLIST,
+            proxy::STEP_RAW_URL,
+        ]);
+        trace.append_cache_step("hit");
+        trace.push_step(
+            proxy::STEP_REDIRECT,
+            Instant::now(),
+            &redirect_diagnosis_detail(&cached),
+        );
+        trace.finish().await;
         record_playback_redirect(
             state,
             &config,
@@ -2151,6 +2404,7 @@ async fn handle_video_stream(
         return Ok(proxy::redirect_response(cached));
     }
 
+    trace.begin_step(proxy::STEP_EMBY_PATH, "query");
     let media_path = match emby::get_media_path(
         &state.client,
         &config,
@@ -2160,9 +2414,23 @@ async fn handle_video_stream(
     )
     .await
     {
-        Ok(Some(path)) => path,
+        Ok(Some(path)) => {
+            trace.complete_step(&diagnostics::sanitize_diagnostic_text(&format!(
+                "resolved path={path}"
+            )));
+            path
+        }
         Ok(None) => {
             tracing::info!(item = item_id, "media source not found; proxying to Emby");
+            trace.complete_step("not found");
+            trace.bypass_steps(&[
+                proxy::STEP_MAPPING,
+                proxy::STEP_OPENLIST,
+                proxy::STEP_RAW_URL,
+            ]);
+            trace.append_cache_step("miss");
+            trace.push_step(proxy::STEP_REDIRECT, Instant::now(), "proxy");
+            trace.finish().await;
             let result = proxy_to_emby_recorded(
                 state,
                 &config,
@@ -2196,6 +2464,11 @@ async fn handle_video_stream(
             return result;
         }
         Err(err) => {
+            trace.fail_step(
+                proxy::STEP_EMBY_PATH,
+                Instant::now(),
+                &err.safe_log_message(),
+            );
             record_proxy_request_detail(
                 state,
                 &config,
@@ -2215,10 +2488,13 @@ async fn handle_video_stream(
                 },
             )
             .await;
+            trace.finish().await;
             return Err(err);
         }
     };
-    let media_path = apply_strm_url_mappings(&config, &media_path);
+    let mapping_started = Instant::now();
+    let (media_path, mapping_details) = apply_strm_url_mappings_with_details(&config, &media_path);
+    trace.push_step(proxy::STEP_MAPPING, mapping_started, &mapping_details);
 
     if is_direct_url(&media_path) && config.openlist_addr.is_none() {
         let redirect_url =
@@ -2226,9 +2502,20 @@ async fn handle_video_stream(
                 .await;
         let should_cache = should_cache_direct_link(&config, &redirect_url);
         if should_cache {
+            trace.begin_step(proxy::STEP_CACHE, "set");
             let cache = state.cache.read().await.clone();
             cache.set(cache_key, redirect_url.clone()).await;
+            trace.complete_step("miss");
         }
+        trace.bypass_steps(&[proxy::STEP_OPENLIST, proxy::STEP_RAW_URL]);
+        trace.append_cache_step(cache_miss_detail(&config, should_cache));
+        trace.set_cache_hit(false);
+        trace.push_step(
+            proxy::STEP_REDIRECT,
+            Instant::now(),
+            &redirect_diagnosis_detail(&redirect_url),
+        );
+        trace.finish().await;
         record_playback_redirect(
             state,
             &config,
@@ -2250,7 +2537,7 @@ async fn handle_video_stream(
                 uri: &uri,
                 path_type: "video_stream",
                 status_code: StatusCode::FOUND.as_u16(),
-                outcome: if should_cache {
+                outcome: if should_cache && direct_link_cache_is_effective(&config) {
                     "重定向"
                 } else {
                     "重定向不缓存"
@@ -2283,6 +2570,11 @@ async fn handle_video_stream(
             path = media_path,
             "media path is not a direct URL or OpenList /d URL; proxying to Emby"
         );
+        trace.bypass_steps(&[proxy::STEP_OPENLIST, proxy::STEP_RAW_URL]);
+        trace.append_cache_step("miss");
+        trace.set_cache_hit(false);
+        trace.push_step(proxy::STEP_REDIRECT, Instant::now(), "proxy");
+        trace.finish().await;
         let result = proxy_to_emby_recorded(
             state,
             &config,
@@ -2316,16 +2608,62 @@ async fn handle_video_stream(
         return result;
     };
 
-    let mut raw_url = openlist::ensure_raw_url(
-        openlist::fs_get(&state.client, &config, &openlist_path, user_agent).await?,
-    )?;
-    raw_url =
-        maybe_resolve_internal_redirect(&state.proxy_client, &config, &raw_url, user_agent).await;
+    trace.begin_step(
+        proxy::STEP_OPENLIST,
+        &diagnostics::sanitize_diagnostic_text(&format!("fs_get path={openlist_path}")),
+    );
+    let raw_url = match openlist::fs_get(&state.client, &config, &openlist_path, user_agent).await {
+        Ok(fs) => {
+            trace.complete_step(&diagnostics::sanitize_diagnostic_text(&format!(
+                "fs_get path={openlist_path}; matched"
+            )));
+            trace.begin_step(proxy::STEP_RAW_URL, "validate and resolve");
+            match openlist::ensure_raw_url(fs) {
+                Ok(raw) => {
+                    let raw = maybe_resolve_internal_redirect(
+                        &state.proxy_client,
+                        &config,
+                        &raw,
+                        user_agent,
+                    )
+                    .await;
+                    trace.complete_step(&diagnostics::sanitize_diagnostic_text(&format!(
+                        "resolved raw_url={raw}"
+                    )));
+                    raw
+                }
+                Err(err) => {
+                    trace.fail_step(proxy::STEP_RAW_URL, Instant::now(), &err.safe_log_message());
+                    trace.finish().await;
+                    return Err(err);
+                }
+            }
+        }
+        Err(err) => {
+            trace.fail_step(
+                proxy::STEP_OPENLIST,
+                Instant::now(),
+                &err.safe_log_message(),
+            );
+            trace.finish().await;
+            return Err(err);
+        }
+    };
     let should_cache = should_cache_direct_link(&config, &raw_url);
     if should_cache {
+        trace.begin_step(proxy::STEP_CACHE, "set");
         let cache = state.cache.read().await.clone();
         cache.set(cache_key, raw_url.clone()).await;
+        trace.complete_step("miss");
     }
+    trace.append_cache_step(cache_miss_detail(&config, should_cache));
+    trace.set_cache_hit(false);
+    trace.push_step(
+        proxy::STEP_REDIRECT,
+        Instant::now(),
+        &redirect_diagnosis_detail(&raw_url),
+    );
+    trace.finish().await;
     record_playback_redirect(
         state,
         &config,
@@ -2348,7 +2686,7 @@ async fn handle_video_stream(
             uri: &uri,
             path_type: "video_stream",
             status_code: StatusCode::FOUND.as_u16(),
-            outcome: if should_cache {
+            outcome: if should_cache && direct_link_cache_is_effective(&config) {
                 "重定向"
             } else {
                 "重定向不缓存"
@@ -2410,6 +2748,20 @@ fn is_direct_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
 }
 
+fn cache_miss_detail(config: &Config, cache_eligible: bool) -> &'static str {
+    if !direct_link_cache_is_effective(config) {
+        "disabled"
+    } else if cache_eligible {
+        "miss; stored"
+    } else {
+        "miss; not stored"
+    }
+}
+
+fn redirect_diagnosis_detail(location: &str) -> String {
+    diagnostics::sanitize_diagnostic_text(&format!("redirect location={location}"))
+}
+
 pub(crate) fn media_path_uses_direct_link(config: &Config, media_path: &str) -> bool {
     let media_path = apply_strm_url_mappings(config, media_path);
     (is_direct_url(&media_path) && config.openlist_addr.is_none())
@@ -2444,6 +2796,7 @@ fn record_playback_redirect(
     } else {
         RequestStatKind::Redirect
     };
+    state.alert_runtime.record_stat(server_id.clone(), kind);
     state
         .telemetry_writes
         .request_stat(server_id, server_name, config.port, kind);
@@ -2458,7 +2811,7 @@ fn cache_ttl_label(seconds: u64) -> String {
 }
 
 fn redirect_log_message(config: &Config, should_cache: bool) -> String {
-    if !should_cache {
+    if !should_cache || !direct_link_cache_is_effective(config) {
         "重定向 strm".to_string()
     } else {
         format!(
@@ -2700,9 +3053,6 @@ fn header_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
 }
 
 fn should_cache_direct_link(config: &Config, redirect_url: &str) -> bool {
-    if !config.cache_enabled || config.cache_ttl_seconds == 0 {
-        return false;
-    }
     let Some(host) = url::Url::parse(redirect_url)
         .ok()
         .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
@@ -2816,10 +3166,41 @@ fn forwarded_header_value<'a>(headers: &'a axum::http::HeaderMap, name: &str) ->
 }
 
 fn apply_strm_url_mappings(config: &Config, media_path: &str) -> String {
+    apply_strm_url_mappings_with_details(config, media_path).0
+}
+
+fn apply_strm_url_mappings_with_details(config: &Config, media_path: &str) -> (String, String) {
     if !config.strm_url_mapping_enabled {
-        return media_path.to_string();
+        return (
+            media_path.to_string(),
+            diagnostics::sanitize_diagnostic_text(&format!("disabled; result={media_path}")),
+        );
     }
+
     let mapped = url_mapping::apply_rules(media_path, &config.strm_url_mapping_rules);
+    let mut current = media_path.to_string();
+    let mut matched_rules = Vec::new();
+    for (index, line) in config.strm_url_mappings.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Reuse the canonical parser one rule at a time so diagnosis can identify
+        // the actual configured rule without duplicating regex semantics.
+        let Ok(rules) = url_mapping::parse_rules(line) else {
+            continue;
+        };
+        let next = url_mapping::apply_rules(&current, &rules);
+        if next != current {
+            matched_rules.push(format!(
+                "rule#{} {}",
+                index + 1,
+                diagnostics::sanitize_diagnostic_text(line)
+            ));
+        }
+        current = next;
+    }
+
     if mapped != media_path {
         tracing::info!(
             from = sanitized_detail_for_log(media_path),
@@ -2827,7 +3208,15 @@ fn apply_strm_url_mappings(config: &Config, media_path: &str) -> String {
             "mapped STRM URL"
         );
     }
-    mapped
+    let details = if matched_rules.is_empty() {
+        diagnostics::sanitize_diagnostic_text(&format!("unmatched; result={mapped}"))
+    } else {
+        diagnostics::sanitize_diagnostic_text(&format!(
+            "matched {}; result={mapped}",
+            matched_rules.join(", ")
+        ))
+    };
+    (mapped, details)
 }
 
 async fn maybe_resolve_internal_redirect(
@@ -2895,7 +3284,7 @@ async fn shutdown_signal() {
 mod tests {
     use axum::{
         body::{Body, to_bytes},
-        http::Request as HttpRequest,
+        http::{Request as HttpRequest, StatusCode},
     };
     use serde_json::json;
     use std::sync::{
@@ -2903,11 +3292,14 @@ mod tests {
         atomic::{AtomicU64, AtomicUsize, Ordering},
     };
     use tokio::net::TcpListener;
-    use tower::ServiceExt;
+    use tower::{Service, ServiceExt};
 
     use super::*;
 
     static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    include!("test-fixtures/review_authorization.rs");
+    include!("test-fixtures/review_api_fixes.rs");
 
     fn test_config(emby_host: &str, openlist_addr: &str, port: u16) -> Config {
         Config {
@@ -2944,9 +3336,27 @@ mod tests {
             port: config.port,
             enabled: true,
             block_web_ui: false,
+            block_web_ui_status_code: 403,
+            block_web_ui_message: "Emby Web UI is disabled by EmbyPanel".to_string(),
             real_ip_mode: "auto".to_string(),
             real_ip_header: String::new(),
             trusted_proxy_cidrs: "192.0.2.0/24".to_string(),
+            openlist_addr_override: None,
+            openlist_token_override: None,
+            openlist_token_override_configured: false,
+            strm_url_mappings_override: None,
+            strm_url_mapping_enabled_override: None,
+            cache_ttl_seconds_override: None,
+            cache_max_capacity_override: None,
+            cache_enabled_override: None,
+            cache_domain_filter_mode_override: None,
+            cache_domain_whitelist_override: None,
+            enable_internal_redirect_override: None,
+            internal_redirect_timeout_seconds_override: None,
+            connectivity_check_enabled_override: None,
+            connectivity_check_interval_seconds_override: None,
+            connectivity_check_timeout_seconds_override: None,
+            connectivity_auto_restart_seconds_override: None,
             trusted_proxy_networks: vec!["192.0.2.0/24".parse().unwrap()],
         }];
         config
@@ -2956,6 +3366,12 @@ mod tests {
         let client = build_http_client().unwrap();
         let proxy_client = build_proxy_http_client().unwrap();
         let telemetry_writes = TelemetryWriteQueue::start(settings_store.clone()).unwrap();
+        let alerts_path = std::env::temp_dir().join(format!(
+            "embypanel-main-alerts-test-{}-{}.db",
+            std::process::id(),
+            TEST_DB_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let alerts = Alerts::new(alerts_path).unwrap();
         AppState {
             config: Arc::new(RwLock::new(config)),
             config_updates: Arc::new(Mutex::new(())),
@@ -2965,6 +3381,8 @@ mod tests {
             file_log: Arc::new(FileLogStore::new(&settings_store)),
             settings_store,
             telemetry_writes,
+            alerts,
+            alert_runtime: AlertRuntime::disabled(),
             client_control_cache: Arc::new(StdRwLock::new(None)),
             user_policies_cache: Arc::new(StdRwLock::new(None)),
             rate_limit_updates: Arc::new(Mutex::new(())),
@@ -3416,6 +3834,97 @@ mod tests {
         assert!(!blocked);
     }
 
+    #[tokio::test]
+    async fn direct_link_cache_from_config_applies_global_and_server_policies() {
+        let mut config = test_config("http://emby.test", "http://openlist.test", 18096);
+        config.cache_enabled = false;
+        config.cache_ttl_seconds = 60;
+        config.cache_max_capacity = 100;
+        config.servers.push(config::EmbyServerConfig {
+            id: "enabled-server".to_string(),
+            cache_enabled_override: Some(true),
+            cache_ttl_seconds_override: Some(30),
+            cache_max_capacity_override: Some(7),
+            ..config::EmbyServerConfig::default()
+        });
+
+        let cache = direct_link_cache_from_config(&config);
+        let enabled_key = "enabled-server:item:source:ua".to_string();
+        let unknown_key = "unknown-server:item:source:ua".to_string();
+        cache
+            .set(enabled_key.clone(), "enabled-url".to_string())
+            .await;
+        cache
+            .set(unknown_key.clone(), "unknown-url".to_string())
+            .await;
+        cache
+            .set("legacy-key".to_string(), "legacy-url".to_string())
+            .await;
+        assert_eq!(
+            cache.get(&enabled_key).await.as_deref(),
+            Some("enabled-url")
+        );
+        assert_eq!(cache.get(&unknown_key).await, None);
+        assert_eq!(cache.get("legacy-key").await, None);
+        assert_eq!(cache.get_stats().await.max_capacity, 7);
+
+        let mut config = test_config("http://emby.test", "http://openlist.test", 18096);
+        config.cache_enabled = true;
+        config.cache_ttl_seconds = 60;
+        config.cache_max_capacity = 100;
+        config.servers.push(config::EmbyServerConfig {
+            id: "disabled-server".to_string(),
+            cache_enabled_override: Some(false),
+            ..config::EmbyServerConfig::default()
+        });
+        let cache = direct_link_cache_from_config(&config);
+        let disabled_key = "disabled-server:item:source:ua".to_string();
+        let unknown_key = "unknown-server:item:source:ua".to_string();
+        cache
+            .set(disabled_key.clone(), "disabled-url".to_string())
+            .await;
+        cache
+            .set(unknown_key.clone(), "unknown-url".to_string())
+            .await;
+        cache
+            .set("legacy-key".to_string(), "legacy-url".to_string())
+            .await;
+        assert_eq!(cache.get(&disabled_key).await, None);
+        assert_eq!(
+            cache.get(&unknown_key).await.as_deref(),
+            Some("unknown-url")
+        );
+        assert_eq!(cache.get("legacy-key").await.as_deref(), Some("legacy-url"));
+        assert_eq!(cache.get_stats().await.max_capacity, 100);
+
+        let mut config = test_config("http://emby.test", "http://openlist.test", 18096);
+        config.cache_enabled = true;
+        config.cache_ttl_seconds = 60;
+        config.cache_max_capacity = 100;
+        config.servers.push(config::EmbyServerConfig {
+            id: "overridden-server".to_string(),
+            cache_ttl_seconds_override: Some(1),
+            cache_max_capacity_override: Some(1),
+            ..config::EmbyServerConfig::default()
+        });
+        let cache = direct_link_cache_from_config(&config);
+        assert_eq!(cache.get_stats().await.max_capacity, 101);
+        let overridden_key = "overridden-server:item:source:ua".to_string();
+        let second_overridden_key = "overridden-server:item-2:source:ua".to_string();
+        cache
+            .set(overridden_key.clone(), "overridden-url".to_string())
+            .await;
+        cache
+            .set(second_overridden_key, "overridden-url-2".to_string())
+            .await;
+        assert_eq!(cache.get_stats().await.capacity, 1);
+        cache
+            .set(overridden_key.clone(), "overridden-url".to_string())
+            .await;
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert_eq!(cache.get(&overridden_key).await, None);
+    }
+
     #[test]
     fn cache_domain_filters_match_host_only() {
         let mut config = test_config("http://emby.test", "http://openlist.test", 18096);
@@ -3442,7 +3951,7 @@ mod tests {
         ));
 
         config.cache_enabled = false;
-        assert!(!should_cache_direct_link(
+        assert!(should_cache_direct_link(
             &config,
             "https://cdn.example.com/a.mkv"
         ));
@@ -3624,7 +4133,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn video_stream_cancellation_records_real_emby_step() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+        let emby = spawn_mock_server(|request| async move {
+            if request.uri().path() == "/Items" {
+                return std::future::pending::<Response>().await;
+            }
+            response_text(StatusCode::NOT_FOUND, "not found")
+        })
+        .await;
+        let openlist =
+            spawn_mock_server(|_| async { response_text(StatusCode::NOT_FOUND, "not found") })
+                .await;
+        let app = test_app(&emby, &openlist, 18096);
+        let task = tokio::spawn(
+            app.oneshot(
+                HttpRequest::builder()
+                    .uri("/videos/item-cancel/stream?MediaSourceId=source1")
+                    .header(header::USER_AGENT, "test-player token=ua-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        let _ = task.await;
+
+        let record = diagnostics::get_diagnosis_records()
+            .into_iter()
+            .find(|record| record.media_id == "item-cancel")
+            .expect("real handle_video_stream cancellation diagnosis");
+        assert_eq!(record.failure_node.as_deref(), Some("Emby Path"));
+        assert!(record.steps[0].details.contains("cancelled"));
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("ua-secret"));
+    }
+
+    #[tokio::test]
+    async fn video_stream_cancellation_records_real_openlist_step() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+        let emby = spawn_mock_server(|request| async move {
+            if request.uri().path() == "/Items" {
+                return response_json(json!({
+                    "Items": [{"MediaSources": [{"Id": "source1", "Path": "http://openlist.local/d/movie/test.mkv"}]}]
+                }));
+            }
+            response_text(StatusCode::NOT_FOUND, "not found")
+        })
+        .await;
+        let openlist = spawn_mock_server(|request| async move {
+            if request.uri().path() == "/api/fs/get" {
+                return std::future::pending::<Response>().await;
+            }
+            response_text(StatusCode::NOT_FOUND, "not found")
+        })
+        .await;
+        let app = test_app(&emby, &openlist, 18096);
+        let task = tokio::spawn(
+            app.oneshot(
+                HttpRequest::builder()
+                    .uri("/videos/item-openlist-cancel/stream?MediaSourceId=source1")
+                    .header(header::USER_AGENT, "test-player token=ua-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        let _ = task.await;
+
+        let record = diagnostics::get_diagnosis_records()
+            .into_iter()
+            .find(|record| record.media_id == "item-openlist-cancel")
+            .expect("real OpenList cancellation diagnosis");
+        assert_eq!(record.failure_node.as_deref(), Some("OpenList"));
+        assert!(record.steps[2].details.contains("cancelled"));
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("ua-secret"));
+    }
+
+    #[tokio::test]
     async fn video_stream_redirects_to_openlist_raw_url() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
         let seen_user_agent = Arc::new(std::sync::Mutex::new(String::new()));
         let seen_user_agent_for_server = seen_user_agent.clone();
         let emby = spawn_mock_server(move |request| {
@@ -3682,6 +4275,115 @@ mod tests {
             "https://cdn.example.test/movie.mkv"
         );
         assert_eq!(seen_user_agent.lock().unwrap().as_str(), "test-player");
+        let record = diagnostics::get_diagnosis_records()
+            .into_iter()
+            .find(|record| record.media_id == "item1")
+            .expect("real playback diagnosis");
+        assert_eq!(record.ua, "test-player");
+        assert_eq!(record.failure_node, None);
+        assert_eq!(record.cache_hit, false);
+        assert_eq!(
+            record
+                .steps
+                .iter()
+                .map(|step| step.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Emby Path", "映射", "OpenList", "raw_url", "缓存", "302"]
+        );
+        assert!(record.steps.iter().all(|step| step.duration_ms < 10_000));
+    }
+
+    #[tokio::test]
+    async fn video_stream_diagnosis_records_mapped_openlist_cache_and_redaction() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+        let emby = spawn_mock_server(|request| async move {
+            if request.uri().path() == "/Items" {
+                return response_json(json!({
+                    "Items": [{
+                        "MediaSources": [{
+                            "Id": "source1",
+                            "Path": "https://source.example.test/d/movie/test.mkv?api_key=emby-path-secret&quality=1080"
+                        }]
+                    }]
+                }));
+            }
+            response_text(StatusCode::NOT_FOUND, "not found")
+        })
+        .await;
+        let openlist = spawn_mock_server(|request| async move {
+            if request.uri().path() == "/api/fs/get" {
+                return response_json(json!({
+                    "code": 200,
+                    "data": {
+                        "raw_url": "https://cdn.example.test/movie.mkv?token=raw-secret&quality=2160"
+                    }
+                }));
+            }
+            response_text(StatusCode::NOT_FOUND, "not found")
+        })
+        .await;
+        let mappings = format!("https://source.example.test => {openlist}");
+        let mut config = test_config(&emby, &openlist, 18096);
+        config.strm_url_mappings = mappings.clone();
+        config.strm_url_mapping_rules = url_mapping::parse_rules(&mappings).unwrap();
+        let app = build_app(test_state(config, test_store()));
+        let request = || {
+            HttpRequest::builder()
+                .uri("/videos/item-chain/stream?MediaSourceId=source1&api_key=request-secret")
+                .header(header::USER_AGENT, "diagnostic-player/1.0 token=ua-secret")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let first = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::FOUND);
+        assert_eq!(
+            first.headers().get(header::LOCATION).unwrap(),
+            "https://cdn.example.test/movie.mkv?token=raw-secret&quality=2160"
+        );
+        assert_eq!(
+            app.oneshot(request()).await.unwrap().status(),
+            StatusCode::FOUND
+        );
+
+        let records: Vec<_> = diagnostics::get_diagnosis_records()
+            .into_iter()
+            .filter(|record| record.media_id == "item-chain")
+            .collect();
+        assert_eq!(records.len(), 2);
+        let miss = &records[0];
+        assert_eq!(miss.failure_node, None);
+        assert!(!miss.cache_hit);
+        assert!(miss.sanitized_errors.is_empty());
+        assert_eq!(miss.steps.len(), 6);
+        assert!(miss.steps[0].details.contains("/d/movie/test.mkv"));
+        assert!(miss.steps[1].details.contains("matched rule#1"));
+        assert!(miss.steps[1].details.contains(&openlist));
+        assert!(miss.steps[2].details.contains("path=/movie/test.mkv"));
+        assert!(miss.steps[3].details.contains("cdn.example.test/movie.mkv"));
+        assert!(miss.steps[3].details.contains("quality=2160"));
+        assert_eq!(miss.steps[4].details, "miss; stored");
+        assert!(miss.steps[5].details.contains("redirect location="));
+        assert!(miss.steps[5].details.contains("quality=2160"));
+
+        let hit = &records[1];
+        assert!(hit.cache_hit);
+        assert!(hit.sanitized_errors.is_empty());
+        assert_eq!(hit.steps[4].details, "hit");
+        assert!(hit.steps[5].details.contains("redirect location="));
+
+        let json = serde_json::to_string(&records).unwrap();
+        for secret in [
+            "emby-path-secret",
+            "raw-secret",
+            "request-secret",
+            "ua-secret",
+        ] {
+            assert!(!json.contains(secret), "secret leaked: {json}");
+        }
+        assert!(json.contains(diagnostics::REDACTED_PLACEHOLDER));
+        assert!(!json.contains("]]"));
     }
 
     #[tokio::test]
@@ -3799,6 +4501,8 @@ mod tests {
 
     #[tokio::test]
     async fn video_stream_applies_strm_url_mapping_before_redirect() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
         let emby = spawn_mock_server(|request| async move {
             if request.uri().path() == "/Items" {
                 return response_json(json!({
@@ -3835,6 +4539,16 @@ mod tests {
             response.headers().get(header::LOCATION).unwrap(),
             "http://localhost:5244/d/videos/movie.mkv"
         );
+        let record = diagnostics::get_diagnosis_records()
+            .into_iter()
+            .find(|record| record.media_id == "item1")
+            .expect("mapping diagnosis");
+        let mapping = record
+            .steps
+            .iter()
+            .find(|step| step.name == "映射")
+            .expect("mapping step");
+        assert!(mapping.details.contains("matched rule#1"));
     }
 
     #[tokio::test]
@@ -4112,6 +4826,8 @@ mod tests {
 
     #[tokio::test]
     async fn video_stream_returns_bad_gateway_when_openlist_fails() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
         let emby = spawn_mock_server(|request| async move {
             if request.uri().path() == "/Items" {
                 return response_json(json!({
@@ -4151,6 +4867,245 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let record = diagnostics::get_diagnosis_records()
+            .into_iter()
+            .find(|record| record.media_id == "item1")
+            .expect("OpenList failure diagnosis");
+        assert_eq!(record.failure_node.as_deref(), Some("OpenList"));
+        assert!(record.steps.iter().all(|step| step.name != "raw_url"));
+        assert!(
+            record
+                .steps
+                .iter()
+                .find(|step| step.name == "OpenList")
+                .is_some_and(|step| step.details.contains("code 500"))
+        );
+    }
+
+    #[tokio::test]
+    async fn video_stream_records_openlist_http_failure_node() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+        let emby = spawn_mock_server(|request| async move {
+            if request.uri().path() == "/Items" {
+                return response_json(json!({
+                    "Items": [{"MediaSources": [{"Id": "source1", "Path": "http://openlist.local/d/movie/test.mkv"}]}]
+                }));
+            }
+            response_text(StatusCode::NOT_FOUND, "not found")
+        })
+        .await;
+        let openlist = spawn_mock_server(|request| async move {
+            if request.uri().path() == "/api/fs/get" {
+                return response_text(StatusCode::SERVICE_UNAVAILABLE, "token=upstream-secret");
+            }
+            response_text(StatusCode::NOT_FOUND, "not found")
+        })
+        .await;
+        let app = test_app(&emby, &openlist, 18096);
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/videos/item1/stream?MediaSourceId=source1")
+                    .header(header::USER_AGENT, "test-player token=ua-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let record = diagnostics::get_diagnosis_records()
+            .into_iter()
+            .find(|record| record.media_id == "item1")
+            .expect("HTTP OpenList failure diagnosis");
+        assert_eq!(record.failure_node.as_deref(), Some("OpenList"));
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("upstream-secret"));
+        assert!(!json.contains("ua-secret"));
+    }
+
+    #[tokio::test]
+    async fn video_stream_records_raw_url_missing_node() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+        let emby = spawn_mock_server(|request| async move {
+            if request.uri().path() == "/Items" {
+                return response_json(json!({
+                    "Items": [{"MediaSources": [{"Id": "source1", "Path": "http://openlist.local/d/movie/test.mkv"}]}]
+                }));
+            }
+            response_text(StatusCode::NOT_FOUND, "not found")
+        })
+        .await;
+        let openlist = spawn_mock_server(|request| async move {
+            if request.uri().path() == "/api/fs/get" {
+                return response_json(json!({"code": 200, "data": {}}));
+            }
+            response_text(StatusCode::NOT_FOUND, "not found")
+        })
+        .await;
+        let app = test_app(&emby, &openlist, 18096);
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/videos/item1/stream?MediaSourceId=source1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let record = diagnostics::get_diagnosis_records()
+            .into_iter()
+            .find(|record| record.media_id == "item1")
+            .expect("raw_url failure diagnosis");
+        assert_eq!(record.failure_node.as_deref(), Some("raw_url"));
+        assert!(
+            record
+                .steps
+                .iter()
+                .any(|step| step.name == "OpenList" && step.details.contains("matched"))
+        );
+    }
+
+    #[tokio::test]
+    async fn video_stream_colon_server_cache_policy_uses_versioned_keys() {
+        let emby = spawn_mock_server(|request| async move {
+            if request.uri().path() == "/Items" {
+                return response_json(json!({
+                    "Items": [{"MediaSources": [{"Id": "source1", "Path": "http://openlist.local/d/movie/test.mkv"}]}]
+                }));
+            }
+            response_text(StatusCode::NOT_FOUND, "not found")
+        }).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock_calls = calls.clone();
+        let openlist = spawn_mock_server(move |request| {
+            let calls = mock_calls.clone();
+            async move {
+                if request.uri().path() == "/api/fs/get" {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    return response_json(json!({
+                        "code": 200,
+                        "data": {"raw_url": "https://cdn.example.test/movie.mkv?token=private"}
+                    }));
+                }
+                response_text(StatusCode::NOT_FOUND, "not found")
+            }
+        })
+        .await;
+        let mut config = test_config(&emby, &openlist, 18096);
+        config.servers = ["a", "a:b"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| config::EmbyServerConfig {
+                id: id.into(),
+                name: id.into(),
+                enabled: true,
+                emby_host: emby.clone(),
+                emby_api_key: "synthetic-key".into(),
+                port: 18096 + index as u16,
+                cache_enabled_override: Some(id == "a"),
+                ..config::EmbyServerConfig::default()
+            })
+            .collect();
+        let cache = direct_link_cache_from_config(&config);
+        let mut state = test_state(config, test_store());
+        state.cache = Arc::new(RwLock::new(cache.clone()));
+        for server in ["a", "a:b"] {
+            state.proxy_server_id = Some(server.into());
+            let app = build_app(state.clone());
+            for _ in 0..2 {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        HttpRequest::builder()
+                            .uri("/videos/colon-cache-item/stream?MediaSourceId=source1")
+                            .header(header::USER_AGENT, "private-UA:secret")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::FOUND);
+            }
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        let expected =
+            DirectLinkCache::key("a", "colon-cache-item", "source1", "private-UA:secret");
+        assert!(cache.get(&expected).await.is_some());
+        assert_eq!(
+            cache
+                .get(&DirectLinkCache::key(
+                    "a:b",
+                    "colon-cache-item",
+                    "source1",
+                    "private-UA:secret"
+                ))
+                .await,
+            None
+        );
+        let views = cache.list_entry_views(None).await;
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].server_id, "a");
+        let serialized = serde_json::to_string(&views).unwrap();
+        assert!(!serialized.contains("private"));
+        assert!(!serialized.contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn video_stream_diagnosis_distinguishes_cache_miss_and_hit() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+        let emby = spawn_mock_server(|request| async move {
+            if request.uri().path() == "/Items" {
+                return response_json(json!({
+                    "Items": [{"MediaSources": [{"Id": "source1", "Path": "http://openlist.local/d/movie/test.mkv"}]}]
+                }));
+            }
+            response_text(StatusCode::NOT_FOUND, "not found")
+        })
+        .await;
+        let openlist = spawn_mock_server(|request| async move {
+            if request.uri().path() == "/api/fs/get" {
+                return response_json(json!({
+                    "code": 200,
+                    "data": {"raw_url": "https://cdn.example.test/movie.mkv"}
+                }));
+            }
+            response_text(StatusCode::NOT_FOUND, "not found")
+        })
+        .await;
+        let app = test_app(&emby, &openlist, 18096);
+        let request = || {
+            HttpRequest::builder()
+                .uri("/videos/item1/stream?MediaSourceId=source1")
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::FOUND
+        );
+        assert_eq!(
+            app.oneshot(request()).await.unwrap().status(),
+            StatusCode::FOUND
+        );
+        let records: Vec<_> = diagnostics::get_diagnosis_records()
+            .into_iter()
+            .filter(|record| record.media_id == "item1")
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert!(!records[0].cache_hit);
+        assert!(
+            records[0]
+                .steps
+                .last()
+                .is_some_and(|step| step.details.contains("redirect"))
+        );
+        assert!(records[1].cache_hit);
+        assert_eq!(records[1].steps[4].name, "缓存");
+        assert_eq!(records[1].steps[4].details, "hit");
     }
 
     #[tokio::test]
@@ -4327,6 +5282,117 @@ mod tests {
             .as_nanos()
     }
 
+    async fn unused_proxy_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[tokio::test]
+    async fn hot_reload_keeps_active_stream_beyond_shutdown_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", upstream.local_addr().unwrap());
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|value| value == b"\r\n\r\n") {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\nbefore\r\n").await.unwrap();
+            finish_rx.await.unwrap();
+            socket.write_all(b"5\r\nafter\r\n0\r\n\r\n").await.unwrap();
+        });
+        let old_port = unused_proxy_port().await;
+        let mut config = Config::default_runtime();
+        config.servers = vec![config::EmbyServerConfig {
+            id: "drain-test".into(),
+            name: "Drain test".into(),
+            emby_host: host,
+            emby_api_key: "synthetic-key".into(),
+            port: old_port,
+            enabled: true,
+            ..config::EmbyServerConfig::default()
+        }];
+        let state = test_state(config, test_store());
+        let manager = ProxyManager::new();
+        manager.ensure_running(state.clone()).await.unwrap();
+        let client = reqwest::Client::new();
+        let mut response = client
+            .get(format!("http://127.0.0.1:{old_port}/qa-stream"))
+            .send()
+            .await
+            .unwrap();
+        let first = response.chunk().await.unwrap().unwrap();
+        assert_eq!(first.as_ref(), b"before");
+
+        let new_port = unused_proxy_port().await;
+        state.config.write().await.servers[0].port = new_port;
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            manager.ensure_running(state.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(manager.running.lock().await["drain-test"].port, new_port);
+        // Cross the old cutoff using an actual open HTTP response. Hot reload
+        // must return promptly without imposing the process shutdown deadline.
+        tokio::time::sleep(PROXY_DRAIN_TIMEOUT + Duration::from_millis(250)).await;
+        assert!(!manager.draining.lock().await.is_empty());
+        finish_tx.send(()).unwrap();
+        let remaining = tokio::time::timeout(Duration::from_secs(3), response.bytes())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remaining.as_ref(), b"after");
+        upstream_task.await.unwrap();
+        manager.shutdown().await;
+        state.telemetry_writes.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_reload_reuses_listener_and_failed_bind_can_roll_back() {
+        let old_port = unused_proxy_port().await;
+        let occupied = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+        let mut config = Config::default_runtime();
+        config.servers = vec![config::EmbyServerConfig {
+            id: "reload-test".into(),
+            name: "Reload test".into(),
+            emby_host: "http://127.0.0.1:1".into(),
+            emby_api_key: "synthetic-key".into(),
+            port: old_port,
+            enabled: true,
+            ..config::EmbyServerConfig::default()
+        }];
+        let state = test_state(config, test_store());
+        let manager = ProxyManager::new();
+        manager.ensure_running(state.clone()).await.unwrap();
+        let before = manager.running.lock().await["reload-test"].handle.id();
+        state.config.write().await.servers[0].name = "Renamed".into();
+        manager.ensure_running(state.clone()).await.unwrap();
+        assert_eq!(
+            manager.running.lock().await["reload-test"].handle.id(),
+            before
+        );
+        state.config.write().await.servers[0].port = occupied_port;
+        assert!(manager.ensure_running(state.clone()).await.is_err());
+        state.config.write().await.servers[0].port = old_port;
+        manager.ensure_running(state.clone()).await.unwrap();
+        assert_eq!(manager.running.lock().await["reload-test"].port, old_port);
+        manager.shutdown().await;
+        state.telemetry_writes.shutdown().unwrap();
+    }
+
     #[test]
     fn log_timer_respects_common_tz_values() {
         assert_eq!(tz_offset_seconds("Asia/Shanghai"), 8 * 3600);
@@ -4373,5 +5439,126 @@ mod tests {
                 .to_vec(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn protected_json_routes_authenticate_before_body_extraction() {
+        let config = test_config("http://127.0.0.1:18090", "http://127.0.0.1:8096", 18090);
+        let store = test_store();
+        let token = "management-auth-test-token";
+        store
+            .create_session(1, &auth::hash_token(token), auth::now_ts() + 3600)
+            .unwrap();
+        let state = test_state(config, store);
+        let app = build_management_app(state).layer(axum::Extension(ConnectInfo(
+            SocketAddr::from(([127, 0, 0, 1], 50000)),
+        )));
+
+        let request = |body: &'static str| {
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/api/library/tasks/task-1/start")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        for body in ["{}", "{", "", "[]"] {
+            assert_eq!(
+                app.clone().oneshot(request(body)).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        let authenticated = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/library/tasks/task-1/start")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{"))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(authenticated).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let health = HttpRequest::builder()
+            .uri("/healthz")
+            .body(Body::from("{"))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(health).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        for path in ["/api/setup", "/api/login"] {
+            let public_request = HttpRequest::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{"))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(public_request).await.unwrap().status(),
+                StatusCode::BAD_REQUEST,
+                "public route {path} must retain JSON extraction errors"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn p2_management_routes_are_mounted_with_expected_methods() {
+        let config = test_config("http://127.0.0.1:18090", "http://127.0.0.1:8096", 18090);
+        let store = test_store();
+        let state = test_state(config, store);
+        let mut app = build_management_app(state);
+        let test_routes = vec![
+            ("/api/library/libraries", "GET"),
+            ("/api/library/libraries/validate", "POST"),
+            ("/api/library/tasks", "GET"),
+            ("/api/library/tasks/task-1/failure", "GET"),
+            ("/api/library/tasks/task-1/start", "POST"),
+            ("/api/library/tasks/task-1/cancel", "POST"),
+            ("/api/sessions/session-1/stop", "POST"),
+            ("/api/sessions/session-1/message", "POST"),
+            ("/api/history", "GET"),
+            ("/api/servers/options", "GET"),
+            ("/api/cache/stats", "GET"),
+            ("/api/cache/entries", "GET"),
+            ("/api/cache/cleanup", "POST"),
+            ("/api/diagnostics", "GET"),
+            ("/api/diagnostics/clean", "POST"),
+            ("/api/alert-rules", "GET"),
+            ("/api/alert-rules", "POST"),
+            ("/api/alert-rules/1", "GET"),
+            ("/api/alert-rules/1", "PUT"),
+            ("/api/alert-rules/1", "DELETE"),
+            ("/api/alert-rules/1/toggle", "PATCH"),
+            ("/api/alert-rules/1/silent", "PATCH"),
+            ("/api/alert-rules/1/history", "GET"),
+            ("/api/alert-rules/1/test", "POST"),
+            ("/api/alert-deliveries", "GET"),
+        ];
+        for (uri, method) in test_routes {
+            let req = HttpRequest::builder()
+                .uri(uri)
+                .method(method)
+                .body(Body::empty())
+                .unwrap();
+            let res = tower::ServiceExt::<HttpRequest<Body>>::ready(&mut app)
+                .await
+                .unwrap()
+                .call(req)
+                .await
+                .unwrap();
+            let status = res.status();
+            assert!(
+                status != StatusCode::NOT_FOUND && status != StatusCode::METHOD_NOT_ALLOWED,
+                "Route failed with status code: method={}, uri={}, status={}",
+                method,
+                uri,
+                status
+            );
+        }
     }
 }

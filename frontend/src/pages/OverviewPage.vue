@@ -638,7 +638,7 @@ onBeforeUnmount(() => {
                 class="play-detail play-detail-wide play-ip"
                 :title="
                   session.playback_ip
-                    ? ipWithLocation(session.playback_ip, session.ip_location)
+                    ? ipWithLocation(session.playback_ip, session.ip_location ?? undefined)
                     : 'IP --'
                 "
               >
@@ -649,7 +649,7 @@ onBeforeUnmount(() => {
                     session.playback_ip
                       ? ipWithLocation(
                           session.playback_ip,
-                          session.ip_location,
+                          session.ip_location ?? undefined,
                         )
                       : '--'
                   }}

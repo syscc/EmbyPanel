@@ -1,5 +1,12 @@
 import type * as forge from 'node-forge'
 
+/** Authorized server identities, independent of settings.read. */
+export type ServerOption = { id: string; name: string }
+export type ServerOptionsResponse = {
+  servers: ServerOption[]
+  can_control_sessions: boolean
+}
+
 export type Settings = {
   emby_host: string
   emby_api_key: string
@@ -32,9 +39,28 @@ export type EmbyServerConfig = {
   port: number
   enabled: boolean
   block_web_ui: boolean
+  block_web_ui_status_code: number
+  block_web_ui_message: string
   real_ip_mode: RealIpMode
   real_ip_header: string
   trusted_proxy_cidrs: string
+  /** Undefined means the redacted API did not return the secret; null explicitly clears the override. */
+  openlist_addr_override?: string | null
+  openlist_token_override?: string | null
+  openlist_token_override_configured?: boolean
+  strm_url_mappings_override?: string | null
+  strm_url_mapping_enabled_override?: boolean | null
+  cache_ttl_seconds_override?: number | null
+  cache_max_capacity_override?: number | null
+  cache_enabled_override?: boolean | null
+  cache_domain_filter_mode_override?: 'off' | 'whitelist' | 'blacklist' | string | null
+  cache_domain_whitelist_override?: string | null
+  enable_internal_redirect_override?: boolean | null
+  internal_redirect_timeout_seconds_override?: number | null
+  connectivity_check_enabled_override?: boolean | null
+  connectivity_check_interval_seconds_override?: number | null
+  connectivity_check_timeout_seconds_override?: number | null
+  connectivity_auto_restart_seconds_override?: number | null
 }
 
 export type PublicKeyResponse = {
@@ -63,9 +89,9 @@ export type PlaybackSession = {
   user_name: string
   client: string
   device_name: string
-  user_agent: string
+  user_agent: string | null
   playback_ip: string | null
-  ip_location?: IpLocation
+  ip_location?: IpLocation | null
   item_name: string
   series_name: string | null
   item_type: string | null
@@ -77,6 +103,13 @@ export type PlaybackSession = {
   play_method: string | null
   playback_mode: 'direct_link' | 'server_proxy' | 'transcode' | 'emby_direct_play' | 'emby_direct_stream' | 'unknown'
   transcoding: boolean
+  bitrate?: number | string | null
+  bandwidth?: number | string | null
+  transcode_reason?: string | null
+  transcode_reasons?: string[] | string | null
+  application_version?: string | null
+  device_id?: string | null
+  remote_endpoint?: string | null
 }
 
 export type MediaOverview = {
@@ -308,7 +341,22 @@ export type SystemLogConfig = {
 }
 
 export type AuthMode = 'loading' | 'setup' | 'login' | 'app'
-export type Page = 'home' | 'server' | 'clients' | 'notifications' | 'backup' | 'logs' | 'account' | 'users'
+export type Page =
+  | 'home'
+  | 'server'
+  | 'clients'
+  | 'notifications'
+  | 'sessions'
+  | 'library-tasks'
+  | 'diagnostics'
+  | 'history'
+  | 'cache-management'
+  | 'alerts'
+  | 'admin-security'
+  | 'backup'
+  | 'logs'
+  | 'account'
+  | 'users'
 export type ClientStatusFilter = 'all' | 'blocked' | 'allowed'
 export type LogKindFilter = 'all' | 'playback' | 'general'
 export type LogViewFilter = 'playback' | 'blocked' | 'proxy' | 'general'

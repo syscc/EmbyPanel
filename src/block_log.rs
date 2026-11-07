@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -138,6 +139,14 @@ impl BlockLogStore {
     }
 
     pub fn list(&self, filter: BlockLogFilter<'_>) -> AppResult<Vec<BlockLogEntry>> {
+        self.list_scoped(filter, None)
+    }
+
+    pub fn list_scoped(
+        &self,
+        filter: BlockLogFilter<'_>,
+        allowed_servers: Option<&HashSet<String>>,
+    ) -> AppResult<Vec<BlockLogEntry>> {
         let _guard = self.lock.lock().expect("block log mutex poisoned");
         let keyword = filter
             .keyword
@@ -162,7 +171,9 @@ impl BlockLogStore {
                     .then_with(|| right.id.cmp(&left.id))
             });
             for entry in file_entries {
-                if !matches_filter(&entry, &filter, keyword.as_deref()) {
+                if allowed_servers.is_some_and(|allowed| !allowed.contains(&entry.server_id))
+                    || !matches_filter(&entry, &filter, keyword.as_deref())
+                {
                     continue;
                 }
                 entries.push(entry);
@@ -463,4 +474,78 @@ fn log_paths(path: &Path) -> Vec<PathBuf> {
 
 fn backup_path(path: &Path, index: u64) -> PathBuf {
     PathBuf::from(format!("{}.{}", path.display(), index))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoped_block_logs_filter_before_limit_across_rotated_files() {
+        let path = std::env::temp_dir().join(format!(
+            "embypanel-block-scope-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = BlockLogStore {
+            path: path.clone(),
+            lock: Mutex::new(()),
+        };
+        let record = |id| BlockLogInsert {
+            event_type: "request",
+            timestamp_ms: 1,
+            server_id: id,
+            server_name: "Server",
+            port: 8096,
+            method: "GET",
+            path: "/",
+            path_type: "proxy",
+            status_code: 403,
+            outcome: "blocked",
+            duration_ms: 1,
+            playback_user: "user",
+            playback_ip: "127.0.0.1",
+            ip_location_text: "",
+            cache_hit: false,
+            detail: "synthetic",
+        };
+        store.record(record("a"));
+        std::fs::rename(&path, backup_path(&path, 1)).unwrap();
+        store.record(BlockLogInsert {
+            timestamp_ms: 2,
+            ..record("b")
+        });
+        let allowed = HashSet::from(["a".to_string()]);
+        let filter = || BlockLogFilter {
+            limit: 1,
+            ..Default::default()
+        };
+        let rows = store.list_scoped(filter(), Some(&allowed)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].server_id, "a");
+        assert_eq!(store.list(filter()).unwrap()[0].server_id, "b");
+        assert!(
+            store
+                .list_scoped(filter(), Some(&HashSet::new()))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_scoped(
+                    BlockLogFilter {
+                        server_id: Some("b"),
+                        ..filter()
+                    },
+                    Some(&allowed)
+                )
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(backup_path(&path, 1)).unwrap();
+    }
 }

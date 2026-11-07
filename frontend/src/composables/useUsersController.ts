@@ -7,8 +7,9 @@ import type {
   UsersResponse,
 } from '@/types/panel'
 
-type Api = <T>(path: string, init?: RequestInit) => Promise<T>
-type EncryptPayload = (name: string, value: unknown) => Promise<unknown>
+export type { ApiClient as Api } from '@/lib/api-client'
+import type { ApiClient as Api } from '@/lib/api-client'
+export type EncryptPayload = (name: string, value: unknown) => Promise<unknown>
 type UserTemplatePayload = { id?: string; name: string; policy: UserPolicyInput }
 type UserCreatePayload = {
   name: string
@@ -132,12 +133,12 @@ export function useUsersController(options: {
     }
   }
 
-  async function deleteUser(user: UserSummary) {
+  async function deleteUser(user: UserSummary, confirmName: string) {
+    if (confirmName !== user.name) return
     saving.value = true
     error.value = ''
     try {
-      // Keep the backend confirmation contract without exposing an extra input step in the UI.
-      const body = await options.encryptPayload('user_delete', { confirm_name: user.name })
+      const body = await options.encryptPayload('user_delete', { confirm_name: confirmName })
       await options.api<{ success: boolean }>(
         `/api/users/${encodeURIComponent(user.server_id)}/${encodeURIComponent(user.user_id)}`,
         { method: 'DELETE', body: JSON.stringify(body) },

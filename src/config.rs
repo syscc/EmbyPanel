@@ -62,12 +62,48 @@ pub struct EmbyServerConfig {
     pub enabled: bool,
     #[serde(default)]
     pub block_web_ui: bool,
+    #[serde(default = "default_block_web_ui_status_code")]
+    pub block_web_ui_status_code: u16,
+    #[serde(default = "default_block_web_ui_message")]
+    pub block_web_ui_message: String,
     #[serde(default = "default_real_ip_mode")]
     pub real_ip_mode: String,
     #[serde(default)]
     pub real_ip_header: String,
     #[serde(default)]
     pub trusted_proxy_cidrs: String,
+    #[serde(default)]
+    pub openlist_addr_override: Option<String>,
+    #[serde(default)]
+    pub openlist_token_override: Option<String>,
+    #[serde(default)]
+    pub openlist_token_override_configured: bool,
+    #[serde(default)]
+    pub strm_url_mappings_override: Option<String>,
+    #[serde(default)]
+    pub strm_url_mapping_enabled_override: Option<bool>,
+    #[serde(default)]
+    pub cache_ttl_seconds_override: Option<u64>,
+    #[serde(default)]
+    pub cache_max_capacity_override: Option<u64>,
+    #[serde(default)]
+    pub cache_enabled_override: Option<bool>,
+    #[serde(default)]
+    pub cache_domain_filter_mode_override: Option<String>,
+    #[serde(default)]
+    pub cache_domain_whitelist_override: Option<String>,
+    #[serde(default)]
+    pub enable_internal_redirect_override: Option<bool>,
+    #[serde(default)]
+    pub internal_redirect_timeout_seconds_override: Option<u64>,
+    #[serde(default)]
+    pub connectivity_check_enabled_override: Option<bool>,
+    #[serde(default)]
+    pub connectivity_check_interval_seconds_override: Option<u64>,
+    #[serde(default)]
+    pub connectivity_check_timeout_seconds_override: Option<u64>,
+    #[serde(default)]
+    pub connectivity_auto_restart_seconds_override: Option<u64>,
     #[serde(skip)]
     pub(crate) trusted_proxy_networks: Vec<IpNet>,
 }
@@ -182,6 +218,108 @@ impl Config {
             self.connectivity_check_timeout_seconds.clamp(1, 60);
         self.connectivity_auto_restart_seconds = self.connectivity_auto_restart_seconds.min(86400);
         self.strm_url_mapping_rules = url_mapping::parse_rules(&self.strm_url_mappings)?;
+        self.normalize_server_overrides()?;
+        Ok(())
+    }
+
+    fn normalize_server_overrides(&mut self) -> AppResult<()> {
+        for server in &mut self.servers {
+            if !(400..=599).contains(&server.block_web_ui_status_code) {
+                return Err(AppError::Config(format!(
+                    "server {} block_web_ui_status_code must be between 400 and 599",
+                    server.id
+                )));
+            }
+            let message = server.block_web_ui_message.trim();
+            if message.chars().count() > 512 {
+                return Err(AppError::Config(format!(
+                    "server {} block_web_ui_message exceeds 512 characters",
+                    server.id
+                )));
+            }
+            if message
+                .chars()
+                .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+            {
+                return Err(AppError::Config(format!(
+                    "server {} block_web_ui_message contains control characters",
+                    server.id
+                )));
+            }
+            server.block_web_ui_message = if message.is_empty() {
+                default_block_web_ui_message()
+            } else {
+                message.to_string()
+            };
+            server.openlist_addr_override = server
+                .openlist_addr_override
+                .as_deref()
+                .map(|value| normalize_optional_base_url("server.openlist_addr_override", value))
+                .transpose()?;
+            server.openlist_token_override = server
+                .openlist_token_override
+                .as_deref()
+                .map(|value| value.trim().to_string());
+            server.openlist_token_override_configured = server.openlist_token_override.is_some();
+            server.strm_url_mappings_override = server
+                .strm_url_mappings_override
+                .as_deref()
+                .map(normalize_multiline);
+            if let Some(mappings) = server.strm_url_mappings_override.as_deref() {
+                url_mapping::parse_rules(mappings)?;
+            }
+            server.cache_domain_filter_mode_override = server
+                .cache_domain_filter_mode_override
+                .as_deref()
+                .map(normalize_cache_domain_filter_mode)
+                .transpose()?;
+            server.cache_domain_whitelist_override = server
+                .cache_domain_whitelist_override
+                .as_deref()
+                .map(normalize_multiline);
+            if let Some(value) = server.cache_max_capacity_override
+                && value == 0
+            {
+                return Err(AppError::Config(format!(
+                    "server {} cache_max_capacity_override must be positive",
+                    server.id
+                )));
+            }
+            if let Some(value) = server.internal_redirect_timeout_seconds_override
+                && value == 0
+            {
+                return Err(AppError::Config(format!(
+                    "server {} internal_redirect_timeout_seconds_override must be positive",
+                    server.id
+                )));
+            }
+            if let Some(value) = &mut server.connectivity_check_interval_seconds_override {
+                *value = (*value).clamp(10, 3600);
+            }
+            if let Some(value) = &mut server.connectivity_check_timeout_seconds_override {
+                *value = (*value).clamp(1, 60);
+            }
+            if let Some(value) = &mut server.connectivity_auto_restart_seconds_override {
+                *value = (*value).min(86400);
+            }
+        }
+
+        for server in &self.servers {
+            let addr = effective_optional_override(
+                server.openlist_addr_override.as_ref(),
+                self.openlist_addr.as_ref(),
+            );
+            let token = effective_optional_override(
+                server.openlist_token_override.as_ref(),
+                self.openlist_token.as_ref(),
+            );
+            if addr.is_some() != token.is_some() {
+                return Err(AppError::Config(format!(
+                    "server {} openlist_addr_override and openlist_token_override must resolve as a pair",
+                    server.id
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -199,9 +337,27 @@ impl Config {
                     port: self.port,
                     enabled: true,
                     block_web_ui: false,
+                    block_web_ui_status_code: default_block_web_ui_status_code(),
+                    block_web_ui_message: default_block_web_ui_message(),
                     real_ip_mode: default_real_ip_mode(),
                     real_ip_header: String::new(),
                     trusted_proxy_cidrs: String::new(),
+                    openlist_addr_override: None,
+                    openlist_token_override: None,
+                    openlist_token_override_configured: false,
+                    strm_url_mappings_override: None,
+                    strm_url_mapping_enabled_override: None,
+                    cache_ttl_seconds_override: None,
+                    cache_max_capacity_override: None,
+                    cache_enabled_override: None,
+                    cache_domain_filter_mode_override: None,
+                    cache_domain_whitelist_override: None,
+                    enable_internal_redirect_override: None,
+                    internal_redirect_timeout_seconds_override: None,
+                    connectivity_check_enabled_override: None,
+                    connectivity_check_interval_seconds_override: None,
+                    connectivity_check_timeout_seconds_override: None,
+                    connectivity_auto_restart_seconds_override: None,
                     trusted_proxy_networks: Vec::new(),
                 });
                 return Ok(());
@@ -271,6 +427,53 @@ impl Config {
 
     fn for_server(&self, server: &EmbyServerConfig) -> Self {
         let mut config = self.clone();
+        if let Some(v) = &server.openlist_addr_override {
+            config.openlist_addr = (!v.is_empty()).then(|| v.clone());
+        }
+        if let Some(v) = &server.openlist_token_override {
+            config.openlist_token = (!v.is_empty()).then(|| v.clone());
+        }
+        if let Some(v) = &server.strm_url_mappings_override {
+            config.strm_url_mappings = v.clone();
+        }
+        if let Some(v) = &server.strm_url_mapping_enabled_override {
+            config.strm_url_mapping_enabled = *v;
+        }
+        if let Some(v) = &server.cache_ttl_seconds_override {
+            config.cache_ttl_seconds = *v;
+        }
+        if let Some(v) = &server.cache_max_capacity_override {
+            config.cache_max_capacity = *v;
+        }
+        if let Some(v) = &server.cache_enabled_override {
+            config.cache_enabled = *v;
+        }
+        if let Some(v) = &server.cache_domain_filter_mode_override {
+            config.cache_domain_filter_mode = v.clone();
+        }
+        if let Some(v) = &server.cache_domain_whitelist_override {
+            config.cache_domain_whitelist = v.clone();
+        }
+        if let Some(v) = &server.enable_internal_redirect_override {
+            config.enable_internal_redirect = *v;
+        }
+        if let Some(v) = &server.internal_redirect_timeout_seconds_override {
+            config.internal_redirect_timeout_seconds = *v;
+        }
+        if let Some(v) = &server.connectivity_check_enabled_override {
+            config.connectivity_check_enabled = *v;
+        }
+        if let Some(v) = &server.connectivity_check_interval_seconds_override {
+            config.connectivity_check_interval_seconds = *v;
+        }
+        if let Some(v) = &server.connectivity_check_timeout_seconds_override {
+            config.connectivity_check_timeout_seconds = *v;
+        }
+        if let Some(v) = &server.connectivity_auto_restart_seconds_override {
+            config.connectivity_auto_restart_seconds = *v;
+        }
+        config.strm_url_mapping_rules = url_mapping::parse_rules(&config.strm_url_mappings)
+            .unwrap_or_else(|_| self.strm_url_mapping_rules.clone());
         config.emby_host = server.emby_host.clone();
         config.emby_api_key = server.emby_api_key.clone();
         config.port = server.port;
@@ -298,12 +501,56 @@ impl EmbyServerConfig {
     }
 }
 
+impl Default for EmbyServerConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            emby_host: String::new(),
+            emby_api_key: String::new(),
+            port: default_port(),
+            enabled: default_enabled(),
+            block_web_ui: false,
+            block_web_ui_status_code: default_block_web_ui_status_code(),
+            block_web_ui_message: default_block_web_ui_message(),
+            real_ip_mode: default_real_ip_mode(),
+            real_ip_header: String::new(),
+            trusted_proxy_cidrs: String::new(),
+            openlist_addr_override: None,
+            openlist_token_override: None,
+            openlist_token_override_configured: false,
+            strm_url_mappings_override: None,
+            strm_url_mapping_enabled_override: None,
+            cache_ttl_seconds_override: None,
+            cache_max_capacity_override: None,
+            cache_enabled_override: None,
+            cache_domain_filter_mode_override: None,
+            cache_domain_whitelist_override: None,
+            enable_internal_redirect_override: None,
+            internal_redirect_timeout_seconds_override: None,
+            connectivity_check_enabled_override: None,
+            connectivity_check_interval_seconds_override: None,
+            connectivity_check_timeout_seconds_override: None,
+            connectivity_auto_restart_seconds_override: None,
+            trusted_proxy_networks: Vec::new(),
+        }
+    }
+}
+
 fn default_port() -> u16 {
     8096
 }
 
 fn default_enabled() -> bool {
     true
+}
+
+fn default_block_web_ui_status_code() -> u16 {
+    403
+}
+
+fn default_block_web_ui_message() -> String {
+    "Emby Web UI is disabled by EmbyPanel".to_string()
 }
 
 fn default_real_ip_mode() -> String {
@@ -363,6 +610,26 @@ fn trim_base_url(name: &str, value: &str) -> AppResult<String> {
     Url::parse(&value)
         .map_err(|err| AppError::Config(format!("{name} must be a valid URL: {err}")))?;
     Ok(value)
+}
+
+fn normalize_optional_base_url(name: &str, value: &str) -> AppResult<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Ok(String::new())
+    } else {
+        trim_base_url(name, value)
+    }
+}
+
+fn effective_optional_override<'a>(
+    value: Option<&'a String>,
+    inherited: Option<&'a String>,
+) -> Option<&'a String> {
+    match value {
+        Some(value) if value.is_empty() => None,
+        Some(value) => Some(value),
+        None => inherited,
+    }
 }
 
 fn validate_port(port: u16) -> AppResult<()> {
@@ -749,5 +1016,340 @@ port = 18096
         .unwrap();
 
         assert!(!server.block_web_ui);
+        assert_eq!(server.block_web_ui_status_code, 403);
+        assert_eq!(
+            server.block_web_ui_message,
+            "Emby Web UI is disabled by EmbyPanel"
+        );
+    }
+
+    #[test]
+    fn web_ui_block_response_settings_are_normalized_and_validated() {
+        let mut config = Config::default_runtime();
+        config.servers.push(EmbyServerConfig {
+            id: "block-settings".to_string(),
+            name: "Block settings".to_string(),
+            emby_host: "http://emby.example.test".to_string(),
+            emby_api_key: "synthetic".to_string(),
+            port: 18096,
+            block_web_ui: true,
+            block_web_ui_status_code: 404,
+            block_web_ui_message: "  Custom notice  ".to_string(),
+            ..EmbyServerConfig::default()
+        });
+
+        config.validate_for_storage().unwrap();
+        assert_eq!(config.servers[0].block_web_ui_status_code, 404);
+        assert_eq!(config.servers[0].block_web_ui_message, "Custom notice");
+
+        config.servers[0].block_web_ui_status_code = 399;
+        assert!(config.validate_for_storage().is_err());
+        config.servers[0].block_web_ui_status_code = 600;
+        assert!(config.validate_for_storage().is_err());
+        config.servers[0].block_web_ui_status_code = 403;
+        config.servers[0].block_web_ui_message = "  \n\t".to_string();
+        config.validate_for_storage().unwrap();
+        assert_eq!(
+            config.servers[0].block_web_ui_message,
+            "Emby Web UI is disabled by EmbyPanel"
+        );
+        config.servers[0].block_web_ui_message = "x".repeat(513);
+        assert!(config.validate_for_storage().is_err());
+    }
+
+    fn server_for_override_tests() -> EmbyServerConfig {
+        EmbyServerConfig {
+            id: "server-override".to_string(),
+            name: "Override server".to_string(),
+            emby_host: "http://emby.override.test:8096".to_string(),
+            emby_api_key: "server-key".to_string(),
+            port: 18096,
+            ..EmbyServerConfig::default()
+        }
+    }
+
+    #[test]
+    fn config_server_overrides_inherit_global_policy() {
+        let mut global = Config::default_runtime();
+        global.openlist_addr = Some("https://openlist.global.test".to_string());
+        global.openlist_token = Some("global-token".to_string());
+        global.strm_url_mappings = "https://from.global => https://to.global".to_string();
+        global.strm_url_mapping_enabled = true;
+        global.cache_enabled = true;
+        global.cache_ttl_seconds = 120;
+        global.cache_max_capacity = 9_000;
+        global.cache_domain_filter_mode = "whitelist".to_string();
+        global.cache_domain_whitelist = "global.test".to_string();
+        global.enable_internal_redirect = true;
+        global.internal_redirect_timeout_seconds = 12;
+        global.connectivity_check_enabled = true;
+        global.connectivity_check_interval_seconds = 45;
+        global.connectivity_check_timeout_seconds = 6;
+        global.connectivity_auto_restart_seconds = 300;
+
+        let effective = global.for_server(&server_for_override_tests());
+
+        assert_eq!(effective.openlist_addr, global.openlist_addr);
+        assert_eq!(effective.openlist_token, global.openlist_token);
+        assert_eq!(effective.strm_url_mappings, global.strm_url_mappings);
+        assert_eq!(
+            effective.strm_url_mapping_enabled,
+            global.strm_url_mapping_enabled
+        );
+        assert_eq!(effective.cache_enabled, global.cache_enabled);
+        assert_eq!(effective.cache_ttl_seconds, global.cache_ttl_seconds);
+        assert_eq!(effective.cache_max_capacity, global.cache_max_capacity);
+        assert_eq!(
+            effective.cache_domain_filter_mode,
+            global.cache_domain_filter_mode
+        );
+        assert_eq!(
+            effective.cache_domain_whitelist,
+            global.cache_domain_whitelist
+        );
+        assert_eq!(
+            effective.enable_internal_redirect,
+            global.enable_internal_redirect
+        );
+        assert_eq!(
+            effective.internal_redirect_timeout_seconds,
+            global.internal_redirect_timeout_seconds
+        );
+        assert_eq!(
+            effective.connectivity_check_enabled,
+            global.connectivity_check_enabled
+        );
+        assert_eq!(
+            effective.connectivity_check_interval_seconds,
+            global.connectivity_check_interval_seconds
+        );
+        assert_eq!(
+            effective.connectivity_check_timeout_seconds,
+            global.connectivity_check_timeout_seconds
+        );
+        assert_eq!(
+            effective.connectivity_auto_restart_seconds,
+            global.connectivity_auto_restart_seconds
+        );
+    }
+
+    #[test]
+    fn config_server_overrides_cover_each_policy_group() {
+        let global = Config::default_runtime();
+        let server = EmbyServerConfig {
+            openlist_addr_override: Some("https://openlist.override.test".to_string()),
+            openlist_token_override: Some("override-token".to_string()),
+            strm_url_mappings_override: Some(
+                "https://from.override => https://to.override".to_string(),
+            ),
+            strm_url_mapping_enabled_override: Some(false),
+            cache_enabled_override: Some(false),
+            cache_ttl_seconds_override: Some(360),
+            cache_max_capacity_override: Some(20_000),
+            cache_domain_filter_mode_override: Some("blacklist".to_string()),
+            cache_domain_whitelist_override: Some("*.override.test".to_string()),
+            enable_internal_redirect_override: Some(true),
+            internal_redirect_timeout_seconds_override: Some(30),
+            connectivity_check_enabled_override: Some(false),
+            connectivity_check_interval_seconds_override: Some(30),
+            connectivity_check_timeout_seconds_override: Some(10),
+            connectivity_auto_restart_seconds_override: Some(360),
+            ..server_for_override_tests()
+        };
+
+        let effective = global.for_server(&server);
+
+        assert_eq!(
+            effective.openlist_addr.as_deref(),
+            Some("https://openlist.override.test")
+        );
+        assert_eq!(effective.openlist_token.as_deref(), Some("override-token"));
+        assert_eq!(
+            effective.strm_url_mappings,
+            "https://from.override => https://to.override"
+        );
+        assert!(!effective.strm_url_mapping_enabled);
+        assert!(!effective.cache_enabled);
+        assert_eq!(effective.cache_ttl_seconds, 360);
+        assert_eq!(effective.cache_max_capacity, 20_000);
+        assert_eq!(effective.cache_domain_filter_mode, "blacklist");
+        assert_eq!(effective.cache_domain_whitelist, "*.override.test");
+        assert!(effective.enable_internal_redirect);
+        assert_eq!(effective.internal_redirect_timeout_seconds, 30);
+        assert!(!effective.connectivity_check_enabled);
+        assert_eq!(effective.connectivity_check_interval_seconds, 30);
+        assert_eq!(effective.connectivity_check_timeout_seconds, 10);
+        assert_eq!(effective.connectivity_auto_restart_seconds, 360);
+        assert_eq!(effective.strm_url_mapping_rules.len(), 1);
+    }
+
+    #[test]
+    fn config_server_overrides_preserve_false_zero_and_empty_values() {
+        let mut global = Config::default_runtime();
+        global.strm_url_mappings = "https://from.global => https://to.global".to_string();
+        global.cache_domain_whitelist = "global.test".to_string();
+        global.enable_internal_redirect = true;
+        global.connectivity_auto_restart_seconds = 180;
+        let server = EmbyServerConfig {
+            openlist_addr_override: Some(String::new()),
+            openlist_token_override: Some(String::new()),
+            strm_url_mappings_override: Some(String::new()),
+            strm_url_mapping_enabled_override: Some(false),
+            cache_ttl_seconds_override: Some(0),
+            cache_enabled_override: Some(false),
+            cache_domain_filter_mode_override: Some("off".to_string()),
+            cache_domain_whitelist_override: Some(String::new()),
+            enable_internal_redirect_override: Some(false),
+            connectivity_check_enabled_override: Some(false),
+            connectivity_auto_restart_seconds_override: Some(0),
+            ..server_for_override_tests()
+        };
+
+        let effective = global.for_server(&server);
+
+        assert_eq!(server.openlist_addr_override.as_deref(), Some(""));
+        assert_eq!(server.openlist_token_override.as_deref(), Some(""));
+        assert!(effective.openlist_addr.is_none());
+        assert!(effective.openlist_token.is_none());
+        assert_eq!(server.strm_url_mappings_override.as_deref(), Some(""));
+        assert_eq!(server.cache_domain_whitelist_override.as_deref(), Some(""));
+        assert_eq!(server.cache_ttl_seconds_override, Some(0));
+        assert_eq!(server.connectivity_auto_restart_seconds_override, Some(0));
+        assert!(effective.strm_url_mappings.is_empty());
+        assert!(!effective.strm_url_mapping_enabled);
+        assert_eq!(effective.cache_ttl_seconds, 0);
+        assert!(!effective.cache_enabled);
+        assert_eq!(effective.cache_domain_filter_mode, "off");
+        assert!(effective.cache_domain_whitelist.is_empty());
+        assert!(!effective.enable_internal_redirect);
+        assert!(!effective.connectivity_check_enabled);
+        assert_eq!(effective.connectivity_auto_restart_seconds, 0);
+    }
+
+    #[test]
+    fn config_server_override_fields_default_when_loading_old_toml() {
+        let server: EmbyServerConfig = toml::from_str(
+            r#"
+id = "legacy"
+name = "Legacy"
+emby_host = "http://legacy.test:8096"
+emby_api_key = "key"
+port = 18096
+"#,
+        )
+        .unwrap();
+
+        assert!(server.openlist_addr_override.is_none());
+        assert!(server.openlist_token_override.is_none());
+        assert!(!server.openlist_token_override_configured);
+        assert!(server.strm_url_mappings_override.is_none());
+        assert!(server.strm_url_mapping_enabled_override.is_none());
+        assert!(server.cache_enabled_override.is_none());
+        assert!(server.cache_ttl_seconds_override.is_none());
+        assert!(server.cache_max_capacity_override.is_none());
+        assert!(server.cache_domain_filter_mode_override.is_none());
+        assert!(server.cache_domain_whitelist_override.is_none());
+        assert!(server.enable_internal_redirect_override.is_none());
+        assert!(server.internal_redirect_timeout_seconds_override.is_none());
+        assert!(server.connectivity_check_enabled_override.is_none());
+        assert!(
+            server
+                .connectivity_check_interval_seconds_override
+                .is_none()
+        );
+        assert!(server.connectivity_check_timeout_seconds_override.is_none());
+        assert!(server.connectivity_auto_restart_seconds_override.is_none());
+    }
+
+    #[test]
+    fn config_normalizes_and_validates_server_overrides_without_changing_global_policy() {
+        let mut config = Config::default_runtime();
+        config.openlist_addr = Some("https://openlist.global.test".to_string());
+        config.openlist_token = Some("global-token".to_string());
+        config.cache_domain_filter_mode = "whitelist".to_string();
+        config.cache_domain_whitelist = "global.test".to_string();
+        config.servers = vec![EmbyServerConfig {
+            openlist_addr_override: Some(" https://openlist.override.test/ ".to_string()),
+            openlist_token_override: Some(" override-token ".to_string()),
+            cache_domain_filter_mode_override: Some(" DENY ".to_string()),
+            cache_domain_whitelist_override: Some(" a.test\n\n b.test ".to_string()),
+            connectivity_check_interval_seconds_override: Some(1),
+            connectivity_check_timeout_seconds_override: Some(99),
+            connectivity_auto_restart_seconds_override: Some(99_999),
+            ..server_for_override_tests()
+        }];
+
+        config.validate_for_storage().unwrap();
+
+        let server = &config.servers[0];
+        assert_eq!(
+            config.openlist_addr.as_deref(),
+            Some("https://openlist.global.test")
+        );
+        assert_eq!(config.openlist_token.as_deref(), Some("global-token"));
+        assert_eq!(config.cache_domain_filter_mode, "whitelist");
+        assert_eq!(config.cache_domain_whitelist, "global.test");
+        assert_eq!(
+            server.openlist_addr_override.as_deref(),
+            Some("https://openlist.override.test")
+        );
+        assert_eq!(
+            server.openlist_token_override.as_deref(),
+            Some("override-token")
+        );
+        assert!(server.openlist_token_override_configured);
+        assert_eq!(
+            server.cache_domain_filter_mode_override.as_deref(),
+            Some("blacklist")
+        );
+        assert_eq!(
+            server.cache_domain_whitelist_override.as_deref(),
+            Some("a.test\nb.test")
+        );
+        assert_eq!(
+            server.connectivity_check_interval_seconds_override,
+            Some(10)
+        );
+        assert_eq!(server.connectivity_check_timeout_seconds_override, Some(60));
+        assert_eq!(
+            server.connectivity_auto_restart_seconds_override,
+            Some(86_400)
+        );
+    }
+
+    #[test]
+    fn config_rejects_invalid_server_override_values() {
+        let mut config = Config::default_runtime();
+        config.servers = vec![EmbyServerConfig {
+            openlist_addr_override: Some("https://openlist.override.test".to_string()),
+            strm_url_mappings_override: Some("not a valid mapping".to_string()),
+            ..server_for_override_tests()
+        }];
+        assert!(config.validate_for_storage().is_err());
+
+        let mut config = Config::default_runtime();
+        config.servers = vec![EmbyServerConfig {
+            openlist_addr_override: Some("https://openlist.override.test".to_string()),
+            internal_redirect_timeout_seconds_override: Some(0),
+            ..server_for_override_tests()
+        }];
+        assert!(config.validate_for_storage().is_err());
+
+        let mut config = Config::default_runtime();
+        config.servers = vec![EmbyServerConfig {
+            cache_max_capacity_override: Some(0),
+            ..server_for_override_tests()
+        }];
+        assert!(config.validate_for_storage().is_err());
+    }
+
+    #[test]
+    fn config_rejects_unpaired_server_openlist_override() {
+        let mut config = Config::default_runtime();
+        config.servers = vec![EmbyServerConfig {
+            openlist_addr_override: Some("https://openlist.override.test".to_string()),
+            ..server_for_override_tests()
+        }];
+        assert!(config.validate_for_storage().is_err());
     }
 }

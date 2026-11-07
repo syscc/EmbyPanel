@@ -32,6 +32,8 @@ const {
   mobileNavCloseButton,
   mobileSidebar,
   saving,
+  secondFactorRequired,
+  secondFactorMode,
   pageLoading,
   pageReady,
   error,
@@ -52,6 +54,7 @@ const {
   toggleTheme,
   setupAdmin,
   login,
+  selectSecondFactorMode,
   refreshUpdateCheck,
   setPage,
   retryPage,
@@ -196,6 +199,37 @@ onBeforeUnmount(() => {
           required
         />
       </label>
+      <template v-if="mode === 'login' && secondFactorRequired">
+        <label v-if="secondFactorMode === 'totp'">
+          <span>{{ t('TOTP 验证码') }}</span>
+          <input
+            v-model="credentials.totp_code"
+            name="totp_code"
+            inputmode="numeric"
+            autocomplete="one-time-code"
+            :placeholder="t('输入 6 位验证码')"
+            required
+          />
+        </label>
+        <label v-else>
+          <span>{{ t('恢复码') }}</span>
+          <input
+            v-model="credentials.recovery_code"
+            name="recovery_code"
+            autocomplete="off"
+            :placeholder="t('输入恢复码')"
+            required
+          />
+        </label>
+        <button
+          class="secondary wide"
+          type="button"
+          :disabled="saving"
+          @click="selectSecondFactorMode(secondFactorMode === 'totp' ? 'recovery' : 'totp')"
+        >
+          {{ secondFactorMode === 'totp' ? t('使用恢复码') : t('使用 TOTP 验证码') }}
+        </button>
+      </template>
       <button class="primary wide" type="submit" :disabled="saving">
         {{ saving ? t('处理中') : mode === 'setup' ? t('创建并进入') : t('登录') }}
       </button>

@@ -100,6 +100,7 @@ async function savePolicy() {
   try {
     const updated = await updatePolicy(selectedUser.value, policyPayload(draft))
     selectedUser.value = updated
+    dialogOpen.value = false
     showNotice(t('用户策略已保存'))
   } catch {
     // The shared controller keeps the actionable error message.
@@ -191,7 +192,7 @@ async function askDelete(user: UserSummary) {
   })
   if (!confirmed || saving.value) return
   try {
-    await deleteUser(user)
+    await deleteUser(user, user.name)
     dialogOpen.value = false
     selectedUser.value = null
     showNotice(t('用户已删除'))

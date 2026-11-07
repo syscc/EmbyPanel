@@ -183,6 +183,7 @@ button:disabled {
   position: sticky;
   top: 0;
   height: 100vh;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 18px;
@@ -1234,6 +1235,10 @@ button.settings-card-main {
   animation: settings-dialog-overlay-in 160ms ease-out;
 }
 
+.action-dialog-overlay {
+  z-index: 120;
+}
+
 .settings-dialog-content {
   position: fixed;
   z-index: 111;
@@ -1360,6 +1365,7 @@ button.settings-card-main {
 }
 
 .action-dialog-content {
+  z-index: 121;
   width: min(460px, calc(100vw - 32px));
 }
 

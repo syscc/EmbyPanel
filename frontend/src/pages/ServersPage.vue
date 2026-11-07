@@ -403,7 +403,242 @@ function validateServerDraft(draft: EmbyServerConfig) {
   if (!Number.isInteger(port) || port < 1 || port > 65535 || port === 8090) {
     return t('反代端口无效或被管理端口占用')
   }
+
+  const globalOpenlistConfigured = Boolean(settings.openlist_addr?.trim())
+  const effectiveOpenlistAddress =
+    draft.openlist_addr_override == null
+      ? globalOpenlistConfigured
+      : Boolean(draft.openlist_addr_override.trim())
+  const effectiveOpenlistToken = Boolean(
+    draft.openlist_token_override_configured ||
+    draft.openlist_token_override?.trim() ||
+    globalOpenlistConfigured,
+  )
+  if (effectiveOpenlistAddress !== effectiveOpenlistToken) {
+    return t('OpenList 地址和 Token 必须按最终有效配置成对存在')
+  }
   return ''
+}
+
+type StringServerOverrideKey =
+  | 'openlist_addr_override'
+  | 'openlist_token_override'
+  | 'strm_url_mappings_override'
+  | 'cache_domain_whitelist_override'
+
+type NumberServerOverrideKey =
+  | 'cache_ttl_seconds_override'
+  | 'cache_max_capacity_override'
+  | 'internal_redirect_timeout_seconds_override'
+  | 'connectivity_check_interval_seconds_override'
+  | 'connectivity_check_timeout_seconds_override'
+  | 'connectivity_auto_restart_seconds_override'
+
+type BooleanServerOverrideKey =
+  | 'strm_url_mapping_enabled_override'
+  | 'cache_enabled_override'
+  | 'enable_internal_redirect_override'
+  | 'connectivity_check_enabled_override'
+
+type SelectServerOverrideKey = 'cache_domain_filter_mode_override'
+type ServerPolicyOverrideKey =
+  | StringServerOverrideKey
+  | NumberServerOverrideKey
+  | BooleanServerOverrideKey
+  | SelectServerOverrideKey
+
+function serverOverrideIsSet(key: ServerPolicyOverrideKey) {
+  const draft = serverDraft.value
+  if (!draft) return false
+  if (key === 'openlist_token_override' && draft.openlist_token_override_configured) return true
+  return draft[key] !== null && draft[key] !== undefined
+}
+
+function serverOverrideStatus(key: ServerPolicyOverrideKey) {
+  return t(serverOverrideIsSet(key) ? '已设置覆盖' : '继承全局')
+}
+
+function serverOpenlistOverrideStatus() {
+  const addressOverride = serverOverrideIsSet('openlist_addr_override')
+  const tokenOverride = serverOverrideIsSet('openlist_token_override')
+  if (addressOverride && tokenOverride) return t('地址与 Token 均覆盖')
+  if (addressOverride) return t('地址覆盖，Token 继承全局')
+  if (tokenOverride) return t('地址继承全局，Token 覆盖')
+  return t('继承全局')
+}
+
+function serverOpenlistOverridesSet() {
+  return (
+    serverOverrideIsSet('openlist_addr_override') || serverOverrideIsSet('openlist_token_override')
+  )
+}
+
+function clearServerOpenlistOverrides() {
+  const draft = serverDraft.value
+  if (!draft) return
+  draft.openlist_addr_override = null
+  draft.openlist_token_override = null
+  draft.openlist_token_override_configured = false
+}
+
+function clearServerOverride(key: ServerPolicyOverrideKey) {
+  const draft = serverDraft.value
+  if (!draft) return
+  switch (key) {
+    case 'openlist_addr_override':
+      draft.openlist_addr_override = null
+      break
+    case 'openlist_token_override':
+      draft.openlist_token_override = null
+      draft.openlist_token_override_configured = false
+      break
+    case 'strm_url_mappings_override':
+      draft.strm_url_mappings_override = null
+      break
+    case 'strm_url_mapping_enabled_override':
+      draft.strm_url_mapping_enabled_override = null
+      break
+    case 'cache_enabled_override':
+      draft.cache_enabled_override = null
+      break
+    case 'cache_ttl_seconds_override':
+      draft.cache_ttl_seconds_override = null
+      break
+    case 'cache_max_capacity_override':
+      draft.cache_max_capacity_override = null
+      break
+    case 'cache_domain_filter_mode_override':
+      draft.cache_domain_filter_mode_override = null
+      break
+    case 'cache_domain_whitelist_override':
+      draft.cache_domain_whitelist_override = null
+      break
+    case 'enable_internal_redirect_override':
+      draft.enable_internal_redirect_override = null
+      break
+    case 'internal_redirect_timeout_seconds_override':
+      draft.internal_redirect_timeout_seconds_override = null
+      break
+    case 'connectivity_check_enabled_override':
+      draft.connectivity_check_enabled_override = null
+      break
+    case 'connectivity_check_interval_seconds_override':
+      draft.connectivity_check_interval_seconds_override = null
+      break
+    case 'connectivity_check_timeout_seconds_override':
+      draft.connectivity_check_timeout_seconds_override = null
+      break
+    case 'connectivity_auto_restart_seconds_override':
+      draft.connectivity_auto_restart_seconds_override = null
+      break
+  }
+}
+
+function setServerOverrideString(key: StringServerOverrideKey, value: string) {
+  const draft = serverDraft.value
+  if (!draft) return
+  switch (key) {
+    case 'openlist_addr_override':
+      draft.openlist_addr_override = value
+      break
+    case 'openlist_token_override':
+      if (value.trim()) {
+        draft.openlist_token_override = value
+        draft.openlist_token_override_configured = true
+      }
+      break
+    case 'strm_url_mappings_override':
+      draft.strm_url_mappings_override = value
+      break
+    case 'cache_domain_whitelist_override':
+      draft.cache_domain_whitelist_override = value
+      break
+  }
+}
+
+function setServerOverrideNumber(key: NumberServerOverrideKey, value: number | null) {
+  const draft = serverDraft.value
+  if (!draft) return
+  switch (key) {
+    case 'cache_ttl_seconds_override':
+      draft.cache_ttl_seconds_override = value
+      break
+    case 'cache_max_capacity_override':
+      draft.cache_max_capacity_override = value
+      break
+    case 'internal_redirect_timeout_seconds_override':
+      draft.internal_redirect_timeout_seconds_override = value
+      break
+    case 'connectivity_check_interval_seconds_override':
+      draft.connectivity_check_interval_seconds_override = value
+      break
+    case 'connectivity_check_timeout_seconds_override':
+      draft.connectivity_check_timeout_seconds_override = value
+      break
+    case 'connectivity_auto_restart_seconds_override':
+      draft.connectivity_auto_restart_seconds_override = value
+      break
+  }
+}
+
+function setServerOverrideBoolean(key: BooleanServerOverrideKey, value: boolean) {
+  const draft = serverDraft.value
+  if (!draft) return
+  switch (key) {
+    case 'strm_url_mapping_enabled_override':
+      draft.strm_url_mapping_enabled_override = value
+      break
+    case 'cache_enabled_override':
+      draft.cache_enabled_override = value
+      break
+    case 'enable_internal_redirect_override':
+      draft.enable_internal_redirect_override = value
+      break
+    case 'connectivity_check_enabled_override':
+      draft.connectivity_check_enabled_override = value
+      break
+  }
+}
+
+function setServerOverrideSelect(key: SelectServerOverrideKey, value: string) {
+  if (serverDraft.value && ['off', 'whitelist', 'blacklist'].includes(value)) {
+    serverDraft.value[key] = value
+  }
+}
+
+function updateServerOverrideString(key: StringServerOverrideKey, event: Event) {
+  const target = event.target
+  if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return
+  setServerOverrideString(key, target.value)
+}
+
+function updateServerOverrideNumber(key: NumberServerOverrideKey, event: Event) {
+  const target = event.target
+  if (!(target instanceof HTMLInputElement)) return
+  setServerOverrideNumber(key, target.value === '' ? null : Number(target.value))
+}
+
+function serverOverrideText(key: StringServerOverrideKey, globalValue: string | null | undefined) {
+  const draft = serverDraft.value
+  if (!draft) return ''
+  const value = draft[key]
+  if (key === 'openlist_token_override') return value == null ? '' : String(value)
+  return value == null ? (globalValue ?? '') : String(value)
+}
+
+function serverOverrideNumber(key: NumberServerOverrideKey, globalValue: number) {
+  const value = serverDraft.value?.[key]
+  return value == null ? globalValue : Number(value)
+}
+
+function serverOverrideBoolean(key: BooleanServerOverrideKey, globalValue: boolean) {
+  const value = serverDraft.value?.[key]
+  return value == null ? globalValue : Boolean(value)
+}
+
+function serverOverrideSelect(key: SelectServerOverrideKey, globalValue: string) {
+  const value = serverDraft.value?.[key]
+  return value == null ? globalValue : String(value)
 }
 
 async function applyServerEditor() {
@@ -921,6 +1156,25 @@ async function removeServerAndSave(serverId: string) {
               class="server-option"
               :label="t('屏蔽 Emby Web UI')"
             />
+            <div v-if="serverDraft.block_web_ui" class="grid real-ip-grid web-ui-block-settings">
+              <label>
+                <span>{{ t('拦截状态码') }}</span>
+                <select v-model.number="serverDraft.block_web_ui_status_code">
+                  <option v-for="status in [400, 401, 403, 404, 429, 500, 503]" :key="status" :value="status">
+                    {{ status }}
+                  </option>
+                </select>
+              </label>
+              <label>
+                <span>{{ t('拦截提示词') }}</span>
+                <textarea
+                  v-model="serverDraft.block_web_ui_message"
+                  maxlength="512"
+                  :placeholder="t('留空时使用默认提示词')"
+                />
+                <small class="field-help">{{ t('仅修改反代拦截响应，不影响 Emby API 和播放。') }}</small>
+              </label>
+            </div>
 
             <div class="grid real-ip-grid">
               <label>
@@ -979,15 +1233,434 @@ async function removeServerAndSave(serverId: string) {
               }}
             </p>
 
-            <div class="settings-dialog-actions">
-              <DialogClose as-child>
-                <button class="secondary" type="button">{{ t('取消') }}</button>
-              </DialogClose>
-              <button class="primary" type="submit" :disabled="saving">
-                <Check :size="15" aria-hidden="true" />{{ t('保存') }}
-              </button>
+            <section class="server-policy-overrides" aria-labelledby="server-policy-overrides-title">
+          <div class="config-section-head">
+            <div class="config-section-title">
+              <Settings2 :size="16" aria-hidden="true" />
+              <h3 id="server-policy-overrides-title">
+                {{ t('服务器策略覆盖') }}
+              </h3>
             </div>
-          </form>
+          </div>
+          <p class="muted real-ip-help">
+            {{ t('未设置=继承全局；设置覆盖后仅影响当前服务器，可随时清除回继承。') }}
+          </p>
+
+          <div class="grid server-policy-grid">
+            <div class="server-policy-field">
+              <div class="server-policy-field-head">
+                <span>{{ t('OpenList 地址') }}</span>
+                <span class="muted">{{ serverOpenlistOverrideStatus() }}</span>
+                <button
+                  v-if="serverOpenlistOverridesSet()"
+                  class="secondary"
+                  type="button"
+                  @click="clearServerOpenlistOverrides"
+                >
+                  {{ t('恢复全局') }}
+                </button>
+              </div>
+              <input
+                :value="serverOverrideText('openlist_addr_override', null)"
+                type="url"
+                :placeholder="settings.openlist_addr || t('全局未配置')"
+                @input="updateServerOverrideString('openlist_addr_override', $event)"
+              />
+            </div>
+
+            <div class="server-policy-field">
+              <div class="server-policy-field-head">
+                <span>{{ t('OpenList Token') }}</span>
+              </div>
+              <input
+                :value="serverOverrideText('openlist_token_override', null)"
+                type="password"
+                autocomplete="new-password"
+                :placeholder="
+                  serverDraft.openlist_token_override_configured
+                    ? t('已配置，输入新 Token 可替换')
+                    : t('继承全局 Token')
+                "
+                @input="updateServerOverrideString('openlist_token_override', $event)"
+              />
+              <small class="field-help">
+                {{
+                  t(
+                    '地址与 Token 按最终有效配置成对使用；允许只覆盖其中一项并继承另一项。恢复全局会同时清除两项覆盖。',
+                  )
+                }}
+              </small>
+              <small class="field-help">{{
+                t('Token 只显示为密码框；留空且不清除时保持已有安全值。')
+              }}</small>
+            </div>
+
+            <div class="server-policy-field">
+              <div class="server-policy-field-head">
+                <span>{{ t('STRM URL 映射') }}</span>
+                <span class="muted">{{ serverOverrideStatus('strm_url_mappings_override') }}</span>
+                <button
+                  v-if="serverOverrideIsSet('strm_url_mappings_override')"
+                  class="secondary"
+                  type="button"
+                  @click="clearServerOverride('strm_url_mappings_override')"
+                >
+                  {{ t('清除覆盖') }}
+                </button>
+              </div>
+              <textarea
+                :value="serverOverrideText('strm_url_mappings_override', null)"
+                :placeholder="settings.strm_url_mappings || strmMappingPlaceholder"
+                @input="updateServerOverrideString('strm_url_mappings_override', $event)"
+              />
+            </div>
+
+            <div class="server-policy-field server-policy-toggle-field">
+              <div class="server-policy-field-head">
+                <span>{{ t('启用 STRM URL 映射') }}</span>
+                <span class="muted">{{
+                  serverOverrideStatus('strm_url_mapping_enabled_override')
+                }}</span>
+                <button
+                  v-if="serverOverrideIsSet('strm_url_mapping_enabled_override')"
+                  class="secondary"
+                  type="button"
+                  @click="clearServerOverride('strm_url_mapping_enabled_override')"
+                >
+                  {{ t('清除覆盖') }}
+                </button>
+              </div>
+              <UiSwitch
+                :model-value="
+                  serverOverrideBoolean(
+                    'strm_url_mapping_enabled_override',
+                    settings.strm_url_mapping_enabled,
+                  )
+                "
+                :label="t('启用 STRM URL 映射')"
+                @update:model-value="
+                  setServerOverrideBoolean('strm_url_mapping_enabled_override', $event)
+                "
+              />
+            </div>
+
+            <div class="server-policy-field server-policy-toggle-field">
+              <div class="server-policy-field-head">
+                <span>{{ t('启用缓存') }}</span>
+                <span class="muted">{{ serverOverrideStatus('cache_enabled_override') }}</span>
+                <button
+                  v-if="serverOverrideIsSet('cache_enabled_override')"
+                  class="secondary"
+                  type="button"
+                  @click="clearServerOverride('cache_enabled_override')"
+                >
+                  {{ t('清除覆盖') }}
+                </button>
+              </div>
+              <UiSwitch
+                :model-value="
+                  serverOverrideBoolean('cache_enabled_override', settings.cache_enabled)
+                "
+                :label="t('启用缓存')"
+                @update:model-value="setServerOverrideBoolean('cache_enabled_override', $event)"
+              />
+            </div>
+
+            <div class="server-policy-field">
+              <div class="server-policy-field-head">
+                <span>{{ t('缓存秒数') }}</span>
+                <span class="muted">{{ serverOverrideStatus('cache_ttl_seconds_override') }}</span>
+                <button
+                  v-if="serverOverrideIsSet('cache_ttl_seconds_override')"
+                  class="secondary"
+                  type="button"
+                  @click="clearServerOverride('cache_ttl_seconds_override')"
+                >
+                  {{ t('清除覆盖') }}
+                </button>
+              </div>
+              <input
+                :value="
+                  serverOverrideNumber('cache_ttl_seconds_override', settings.cache_ttl_seconds)
+                "
+                type="number"
+                min="0"
+                @input="updateServerOverrideNumber('cache_ttl_seconds_override', $event)"
+              />
+            </div>
+
+            <div class="server-policy-field">
+              <div class="server-policy-field-head">
+                <span>{{ t('缓存最大条数') }}</span>
+                <span class="muted">{{ serverOverrideStatus('cache_max_capacity_override') }}</span>
+                <button
+                  v-if="serverOverrideIsSet('cache_max_capacity_override')"
+                  class="secondary"
+                  type="button"
+                  @click="clearServerOverride('cache_max_capacity_override')"
+                >
+                  {{ t('清除覆盖') }}
+                </button>
+              </div>
+              <input
+                :value="
+                  serverOverrideNumber('cache_max_capacity_override', settings.cache_max_capacity)
+                "
+                type="number"
+                min="1"
+                @input="updateServerOverrideNumber('cache_max_capacity_override', $event)"
+              />
+            </div>
+
+            <div class="server-policy-field">
+              <div class="server-policy-field-head">
+                <span>{{ t('缓存过滤模式') }}</span>
+                <span class="muted">{{
+                  serverOverrideStatus('cache_domain_filter_mode_override')
+                }}</span>
+                <button
+                  v-if="serverOverrideIsSet('cache_domain_filter_mode_override')"
+                  class="secondary"
+                  type="button"
+                  @click="clearServerOverride('cache_domain_filter_mode_override')"
+                >
+                  {{ t('清除覆盖') }}
+                </button>
+              </div>
+              <select
+                :value="
+                  serverOverrideSelect(
+                    'cache_domain_filter_mode_override',
+                    settings.cache_domain_filter_mode,
+                  )
+                "
+                @change="
+                  setServerOverrideSelect(
+                    'cache_domain_filter_mode_override',
+                    ($event.target as HTMLSelectElement).value,
+                  )
+                "
+              >
+                <option value="off">{{ t('不过滤') }}</option>
+                <option value="whitelist">{{ t('白名单：命中才缓存') }}</option>
+                <option value="blacklist">{{ t('黑名单：命中不缓存') }}</option>
+              </select>
+            </div>
+
+            <div class="server-policy-field">
+              <div class="server-policy-field-head">
+                <span>{{ t('缓存过滤域名') }}</span>
+                <span class="muted">{{
+                  serverOverrideStatus('cache_domain_whitelist_override')
+                }}</span>
+                <button
+                  v-if="serverOverrideIsSet('cache_domain_whitelist_override')"
+                  class="secondary"
+                  type="button"
+                  @click="clearServerOverride('cache_domain_whitelist_override')"
+                >
+                  {{ t('清除覆盖') }}
+                </button>
+              </div>
+              <textarea
+                :value="serverOverrideText('cache_domain_whitelist_override', null)"
+                :placeholder="settings.cache_domain_whitelist || t('全局未配置')"
+                @input="updateServerOverrideString('cache_domain_whitelist_override', $event)"
+              />
+            </div>
+
+            <div class="server-policy-field server-policy-toggle-field">
+              <div class="server-policy-field-head">
+                <span>{{ t('开启内部重定向 HEAD 解析') }}</span>
+                <span class="muted">{{
+                  serverOverrideStatus('enable_internal_redirect_override')
+                }}</span>
+                <button
+                  v-if="serverOverrideIsSet('enable_internal_redirect_override')"
+                  class="secondary"
+                  type="button"
+                  @click="clearServerOverride('enable_internal_redirect_override')"
+                >
+                  {{ t('清除覆盖') }}
+                </button>
+              </div>
+              <UiSwitch
+                :model-value="
+                  serverOverrideBoolean(
+                    'enable_internal_redirect_override',
+                    settings.enable_internal_redirect,
+                  )
+                "
+                :label="t('开启内部重定向 HEAD 解析')"
+                @update:model-value="
+                  setServerOverrideBoolean('enable_internal_redirect_override', $event)
+                "
+              />
+            </div>
+
+            <div class="server-policy-field">
+              <div class="server-policy-field-head">
+                <span>{{ t('HEAD 超时秒数') }}</span>
+                <span class="muted">{{
+                  serverOverrideStatus('internal_redirect_timeout_seconds_override')
+                }}</span>
+                <button
+                  v-if="serverOverrideIsSet('internal_redirect_timeout_seconds_override')"
+                  class="secondary"
+                  type="button"
+                  @click="clearServerOverride('internal_redirect_timeout_seconds_override')"
+                >
+                  {{ t('清除覆盖') }}
+                </button>
+              </div>
+              <input
+                :value="
+                  serverOverrideNumber(
+                    'internal_redirect_timeout_seconds_override',
+                    settings.internal_redirect_timeout_seconds,
+                  )
+                "
+                type="number"
+                min="1"
+                @input="
+                  updateServerOverrideNumber('internal_redirect_timeout_seconds_override', $event)
+                "
+              />
+            </div>
+
+            <div class="server-policy-field server-policy-toggle-field">
+              <div class="server-policy-field-head">
+                <span>{{ t('启用服务器连通性巡检') }}</span>
+                <span class="muted">{{
+                  serverOverrideStatus('connectivity_check_enabled_override')
+                }}</span>
+                <button
+                  v-if="serverOverrideIsSet('connectivity_check_enabled_override')"
+                  class="secondary"
+                  type="button"
+                  @click="clearServerOverride('connectivity_check_enabled_override')"
+                >
+                  {{ t('清除覆盖') }}
+                </button>
+              </div>
+              <UiSwitch
+                :model-value="
+                  serverOverrideBoolean(
+                    'connectivity_check_enabled_override',
+                    settings.connectivity_check_enabled,
+                  )
+                "
+                :label="t('启用服务器连通性巡检')"
+                @update:model-value="
+                  setServerOverrideBoolean('connectivity_check_enabled_override', $event)
+                "
+              />
+            </div>
+
+            <div class="server-policy-field">
+              <div class="server-policy-field-head">
+                <span>{{ t('巡检间隔秒数') }}</span>
+                <span class="muted">{{
+                  serverOverrideStatus('connectivity_check_interval_seconds_override')
+                }}</span>
+                <button
+                  v-if="serverOverrideIsSet('connectivity_check_interval_seconds_override')"
+                  class="secondary"
+                  type="button"
+                  @click="clearServerOverride('connectivity_check_interval_seconds_override')"
+                >
+                  {{ t('清除覆盖') }}
+                </button>
+              </div>
+              <input
+                :value="
+                  serverOverrideNumber(
+                    'connectivity_check_interval_seconds_override',
+                    settings.connectivity_check_interval_seconds,
+                  )
+                "
+                type="number"
+                min="10"
+                max="3600"
+                @input="
+                  updateServerOverrideNumber('connectivity_check_interval_seconds_override', $event)
+                "
+              />
+            </div>
+
+            <div class="server-policy-field">
+              <div class="server-policy-field-head">
+                <span>{{ t('单项超时秒数') }}</span>
+                <span class="muted">{{
+                  serverOverrideStatus('connectivity_check_timeout_seconds_override')
+                }}</span>
+                <button
+                  v-if="serverOverrideIsSet('connectivity_check_timeout_seconds_override')"
+                  class="secondary"
+                  type="button"
+                  @click="clearServerOverride('connectivity_check_timeout_seconds_override')"
+                >
+                  {{ t('清除覆盖') }}
+                </button>
+              </div>
+              <input
+                :value="
+                  serverOverrideNumber(
+                    'connectivity_check_timeout_seconds_override',
+                    settings.connectivity_check_timeout_seconds,
+                  )
+                "
+                type="number"
+                min="1"
+                max="60"
+                @input="
+                  updateServerOverrideNumber('connectivity_check_timeout_seconds_override', $event)
+                "
+              />
+            </div>
+
+            <div class="server-policy-field">
+              <div class="server-policy-field-head">
+                <span>{{ t('反代无响应自动重启秒数') }}</span>
+                <span class="muted">{{
+                  serverOverrideStatus('connectivity_auto_restart_seconds_override')
+                }}</span>
+                <button
+                  v-if="serverOverrideIsSet('connectivity_auto_restart_seconds_override')"
+                  class="secondary"
+                  type="button"
+                  @click="clearServerOverride('connectivity_auto_restart_seconds_override')"
+                >
+                  {{ t('清除覆盖') }}
+                </button>
+              </div>
+              <input
+                :value="
+                  serverOverrideNumber(
+                    'connectivity_auto_restart_seconds_override',
+                    settings.connectivity_auto_restart_seconds,
+                  )
+                "
+                type="number"
+                min="0"
+                max="86400"
+                @input="
+                  updateServerOverrideNumber('connectivity_auto_restart_seconds_override', $event)
+                "
+              />
+            </div>
+          </div>
+        </section>
+
+        <div class="settings-dialog-actions">
+          <DialogClose as-child>
+            <button class="secondary" type="button">{{ t('取消') }}</button>
+          </DialogClose>
+          <button class="primary" type="submit" :disabled="saving">
+            <Check :size="15" aria-hidden="true" />{{ t('保存') }}
+          </button>
+        </div>
+      </form>
     </SettingsDialogShell>
   </div>
 </template>

@@ -65,13 +65,16 @@
 - 二元状态开关使用 `frontend/src/components/ui/UiSwitch.vue`；独立复选项使用 `frontend/src/components/ui/CheckboxField.vue`。禁止页面自行复制 track/knob、`role="switch"`、`aria-checked` 或 `.check` 模板。
 - 用户策略表单复用 `frontend/src/components/UserPolicyFields.vue`；策略默认值、用户摘要转换、深拷贝、提交归一化和模板合并统一使用 `frontend/src/lib/user-policy.ts` 的 `defaultPolicyDraft`、`policyFromUser`、`copyPolicy`、`policyPayload`、`applyTemplateTo`。新增策略字段时必须同步类型、这些 helper、表单和后端契约，禁止在页面中再写一套策略转换逻辑。
 - 用户与模板 CRUD 优先扩展 `frontend/src/composables/useUsersController.ts`；备份导入导出优先扩展 `frontend/src/composables/useBackupController.ts`。页面只负责交互编排，不重复实现同一套 API、加密、loading 和错误状态。
+- 只需要服务器 ID/名称的页面复用 `usePanelController.ts` 的 `ensureServerOptions` 和 `serverOptions`，通过 `/api/servers/options` 获取授权选项；不要为了填充筛选器依赖全局配置读取权限。播放控制按钮同时遵循响应中的 `can_control_sessions`，后端继续强制校验 `sessions.control`。
 - 时间、容量、播放进度、URL 和请求状态格式化复用 `frontend/src/lib/panel-formatters.ts`。通用 class 合并使用 `frontend/src/lib/utils.ts` 的 `cn`。禁止各页面复制格式化函数导致显示规则分叉。
 - 所有用户可见文案通过现有 `t()` 和 `frontend/src/lib/translations.ts` 管理；新增中文键时同时补英文映射。禁止在同一功能中混用硬编码文案和翻译键。
 
 ### 后端强制复用
 
 - Emby 数据查询和管理能力集中在 `src/emby.rs`。新增普通 Emby API 调用时在该模块内复用 `emby_api_url`、`send_checked` 和已有领域函数，其他 handler 调用公开领域函数；禁止在 API handler 中复制 API Key、状态码检查和 JSON 解包。反代转发、媒体图片或流式响应属于传输通道，可保留在 `proxy.rs`、`main.rs`、`monitoring.rs` 的专用路径，不要强行套用 JSON helper。
-- 鉴权统一使用 `src/auth.rs` 的 `require_auth` 或 `require_auth_user_id`，禁止 handler 自行解析 Bearer token、查询 session 或实现管理员判断。
+- 鉴权与授权统一使用 `src/auth.rs` 的 `require_auth_context`、`require_permission`、`require_server_filter` 和 `require_server_access`，禁止 handler 自行解析 Bearer token、查询 session 或实现权限判断；认证失败返回 401，授权失败返回 403。全局设置写入、备份导入导出、Key 查看要求 `require_super_admin_session`；常规配置读取依 `settings.read` 和服务器授权过滤。
+- 会话读取使用 `monitoring.read`，停止播放和发送消息使用 `sessions.control`。API Token 签发使用 `SettingsStore::create_admin_api_token_from_session`，在同一事务中验证来源会话和当前权限，禁止管理接口调用无来源校验的测试/内部签发入口。
+- 高频代理/播放统计写入统一经过 `TelemetryWriteQueue`，禁止在 handler 请求路径中同步写入。
 - 加密请求统一使用 `src/crypto_api.rs` 的 `EncryptedRequest` 和 `CryptoKeys::decrypt_named`。禁止新增自定义 RSA/AES 解密、字段扫描或 Base64URL 解码实现。
 - 错误统一返回 `src/error.rs` 的 `AppResult`/`AppError`；写日志和审计前使用 `AppError::safe_log_message` 或 `safe_error_message`。禁止把 reqwest 原始错误、凭证、token、API Key、密码或完整敏感请求写进响应和日志。
 - JSON 配置持久化统一使用 `src/db.rs` 的 `SettingsStore::load_setting_json` / `save_setting_json`，管理员操作审计使用 `record_audit` 或 `record_audit_best_effort`。禁止业务模块自行打开 SQLite 连接、创建新的 settings 表或复制审计插入 SQL。

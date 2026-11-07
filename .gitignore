@@ -25,3 +25,14 @@ data/*
 
 # Local workflow/spec tooling
 .spec-workflow/
+/.mindfs/
+/.playwright-cli/
+/.playwright-mcp/
+/.vite/
+/dogfood-output/
+/tmp/
+/frontend/.playwright-cli/
+
+# Local QA screenshots
+/settings-switches-mobile.png
+/ui-before-desktop.png

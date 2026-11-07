@@ -74,7 +74,8 @@ impl CryptoKeys {
                 .map_err(|_| {
                     AppError::Validation("failed to decrypt encrypted field".to_string())
                 })?;
-            let field: PlainField = serde_json::from_slice(&plaintext)?;
+            let field: PlainField = serde_json::from_slice(&plaintext)
+                .map_err(|_| AppError::Validation("invalid encrypted payload".to_string()))?;
             out.insert(field.name, field.value);
         }
         Ok(out)
@@ -89,7 +90,8 @@ impl CryptoKeys {
         let value = fields
             .remove(name)
             .ok_or_else(|| AppError::Validation(format!("missing encrypted field `{name}`")))?;
-        serde_json::from_value(value).map_err(AppError::from)
+        serde_json::from_value(value)
+            .map_err(|_| AppError::Validation("invalid encrypted payload".to_string()))
     }
 }
 
@@ -132,4 +134,68 @@ fn decode_b64(value: &str) -> AppResult<Vec<u8>> {
     URL_SAFE_NO_PAD
         .decode(value)
         .map_err(|err| AppError::Validation(format!("invalid base64url value: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Deserialize)]
+    struct PasswordPayload {
+        #[allow(dead_code)]
+        password: String,
+    }
+
+    #[tokio::test]
+    async fn encrypted_type_error_does_not_leak_canary_to_response_log_or_audit() {
+        let keys = CryptoKeys::generate().unwrap();
+        let aes_key = [7u8; 32];
+        let iv = [3u8; 12];
+        let plaintext = br#"{"name":"password","value":{"password":982764321098765432}}"#;
+        let cipher = Aes256Gcm::new_from_slice(&aes_key).unwrap();
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&iv), plaintext.as_ref())
+            .unwrap();
+        let encrypted_key = RsaPublicKey::from(keys.private_key.as_ref())
+            .encrypt(&mut OsRng, Oaep::new::<Sha256>(), &aes_key)
+            .unwrap();
+        let request = EncryptedRequest {
+            encrypted_key: URL_SAFE_NO_PAD.encode(encrypted_key),
+            fields: HashMap::from([(
+                "field".into(),
+                EncryptedField {
+                    iv: URL_SAFE_NO_PAD.encode(iv),
+                    value: URL_SAFE_NO_PAD.encode(ciphertext),
+                },
+            )]),
+        };
+        let error = keys
+            .decrypt_named::<PasswordPayload>(&request, "password")
+            .err()
+            .unwrap();
+        assert!(matches!(error, AppError::Validation(_)));
+        let audit_summary = error.safe_log_message();
+        assert_eq!(audit_summary, "invalid encrypted payload");
+        assert!(!format!("{error:?}").contains("982764321098765432"));
+        let response = error.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("982764321098765432"));
+        // Exercise the same safe summary that password-reset failure audits persist.
+        let store = crate::db::SettingsStore::open_for_test(std::env::temp_dir().join(format!(
+            "embypanel-crypto-canary-{}.sqlite",
+            rand::random::<u64>()
+        )))
+        .unwrap();
+        store
+            .record_audit(None, "test.password.failure", &audit_summary, "failed")
+            .unwrap();
+        assert!(
+            !serde_json::to_string(&store.list_audit_logs(None, None, 10).unwrap())
+                .unwrap()
+                .contains("982764321098765432")
+        );
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "emby302gateway-rs"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 license = "MIT"
 
@@ -34,3 +34,4 @@ urlencoding = "2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

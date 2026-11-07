@@ -25,13 +25,98 @@ const {
 const inputRef = ref<HTMLInputElement | null>(null)
 const confirmRef = ref<HTMLButtonElement | null>(null)
 
-watch(open, (isOpen) => {
-  if (!isOpen) return
+let returnFocusTarget: HTMLElement | null = null
+let dialogGeneration = 0
+let scheduledRestoreGeneration: number | null = null
+
+function isActionDialogElement(element: Element | null): boolean {
+  return element instanceof HTMLElement && Boolean(element.closest('.action-dialog-content'))
+}
+
+function canRestoreFocus(element: HTMLElement): boolean {
+  if (!element.isConnected || element.matches(':disabled')) return false
+  if (element.getAttribute('aria-disabled') === 'true') return false
+  if (element.closest('[hidden], [inert], [aria-hidden="true"]')) return false
+
+  const style = window.getComputedStyle(element)
+  return style.display !== 'none'
+    && style.visibility !== 'hidden'
+    && style.visibility !== 'collapse'
+    && element.getClientRects().length > 0
+}
+
+function restoreFocus(generation: number) {
+  if (generation !== dialogGeneration || open.value) return
+
+  const target = returnFocusTarget
+  const active = document.activeElement
+  if (!target || !canRestoreFocus(target)) {
+    returnFocusTarget = null
+    return
+  }
+  if (active === target) {
+    returnFocusTarget = null
+    return
+  }
+  if (active instanceof Element
+    && active.isConnected
+    && active !== document.body
+    && active !== document.documentElement) {
+    returnFocusTarget = null
+    return
+  }
+
+  target.focus({ preventScroll: true })
+  returnFocusTarget = null
+}
+
+function scheduleFocusRestore(generation: number) {
+  if (scheduledRestoreGeneration === generation) return
+  scheduledRestoreGeneration = generation
   void nextTick(() => {
+    window.requestAnimationFrame(() => {
+      if (scheduledRestoreGeneration !== generation) return
+      scheduledRestoreGeneration = null
+      restoreFocus(generation)
+    })
+  })
+}
+
+function handleCloseAutoFocus(event: Event) {
+  event.preventDefault()
+  scheduleFocusRestore(dialogGeneration)
+}
+
+watch(open, (isOpen) => {
+  if (!isOpen) {
+    scheduleFocusRestore(dialogGeneration)
+    return
+  }
+
+  dialogGeneration += 1
+  const replacesClosingDialog = scheduledRestoreGeneration !== null
+  scheduledRestoreGeneration = null
+  const active = document.activeElement
+  const preservePendingTarget = replacesClosingDialog
+    && (!(active instanceof HTMLElement)
+      || !active.isConnected
+      || active === document.body
+      || active === document.documentElement)
+  if (!isActionDialogElement(active) && !preservePendingTarget) {
+    returnFocusTarget = active instanceof HTMLElement
+      && active !== document.body
+      && active !== document.documentElement
+      ? active
+      : null
+  }
+
+  const generation = dialogGeneration
+  void nextTick(() => {
+    if (!open.value || generation !== dialogGeneration) return
     if (request.value?.kind === 'prompt') inputRef.value?.focus()
     else confirmRef.value?.focus()
   })
-})
+}, { flush: 'sync' })
 
 onBeforeUnmount(() => {
   if (open.value) cancelActionDialog()
@@ -47,6 +132,7 @@ onBeforeUnmount(() => {
         class="settings-dialog-content action-dialog-content"
         :class="`is-${request.tone || 'default'}`"
         aria-modal="true"
+        @close-auto-focus="handleCloseAutoFocus"
       >
         <header class="settings-dialog-head action-dialog-head">
           <span class="settings-dialog-icon action-dialog-icon" aria-hidden="true">

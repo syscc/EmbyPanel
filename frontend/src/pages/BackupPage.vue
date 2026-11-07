@@ -73,6 +73,9 @@ const {
               )
             }}
           </p>
+          <p class="muted backup-note">
+            {{ t('配置备份包含服务器和用户策略等配置，不包含管理员安全数据、告警数据及独立加密密钥；完整恢复请按升级文档备份数据目录和外部密钥。') }}
+          </p>
         </section>
 
         <section class="backup-card">

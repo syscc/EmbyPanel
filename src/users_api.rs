@@ -260,7 +260,10 @@ pub async fn list_users(
     headers: HeaderMap,
     Query(query): Query<UserListQuery>,
 ) -> AppResult<Json<UsersResponse>> {
-    auth::require_auth(&state, &headers).await?;
+    let auth_context = auth::require_auth_context(&state, &headers).await?;
+    auth::require_permission(&auth_context, "users.read")?;
+    let requested_server_id =
+        auth::require_server_filter(&auth_context, query.server_id.as_deref())?;
     let status = query.status.as_deref().unwrap_or("all").trim();
     if !matches!(status, "" | "all" | "enabled" | "disabled") {
         return Err(AppError::Validation(
@@ -269,14 +272,11 @@ pub async fn list_users(
     }
     let root_config = state.config.read().await.clone();
     let mut configs = managed_server_configs(&root_config);
-    if let Some(server_id) = query
-        .server_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        configs.retain(|config| config.server_label().0 == server_id);
-    }
+    configs.retain(|config| {
+        let (server_id, _) = config.server_label();
+        requested_server_id.is_none_or(|requested| requested == server_id)
+            && auth::has_server_access(&auth_context, &server_id)
+    });
     let mut server_options: Vec<UserServerOption> = configs
         .iter()
         .map(|config| {
@@ -359,7 +359,9 @@ pub async fn get_user(
     headers: HeaderMap,
     Path((server_id, user_id)): Path<(String, String)>,
 ) -> AppResult<Json<UserSummary>> {
-    auth::require_auth(&state, &headers).await?;
+    let auth_context = auth::require_auth_context(&state, &headers).await?;
+    auth::require_permission(&auth_context, "users.read")?;
+    auth::require_server_access(&auth_context, &server_id)?;
     let config = server_config(&state, &server_id).await?;
     let policies = load_user_policies(&state)?;
     let (profile, sessions, folders) = tokio::join!(
@@ -397,18 +399,18 @@ pub async fn list_user_templates(
     headers: HeaderMap,
     Query(query): Query<UserTemplateListQuery>,
 ) -> AppResult<Json<UserTemplatesResponse>> {
-    auth::require_auth(&state, &headers).await?;
+    let auth_context = auth::require_auth_context(&state, &headers).await?;
+    auth::require_permission(&auth_context, "users.read")?;
     let document = load_user_templates(&state)?;
-    let server_id = query
-        .server_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
+    let server_id = auth::require_server_filter(&auth_context, query.server_id.as_deref())?;
     Ok(Json(UserTemplatesResponse {
         templates: document
             .templates
             .into_iter()
-            .filter(|template| server_id.is_none_or(|id| template.server_id == id))
+            .filter(|template| {
+                server_id.is_none_or(|id| template.server_id == id)
+                    && auth::has_server_access(&auth_context, &template.server_id)
+            })
             .collect(),
     }))
 }
@@ -419,7 +421,10 @@ pub async fn save_user_template(
     Path(server_id): Path<String>,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<UserTemplate>> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let auth_context = auth::require_auth_context(&state, &headers).await?;
+    auth::require_permission(&auth_context, "users.write")?;
+    auth::require_server_access(&auth_context, &server_id)?;
+    let admin_user_id = auth_context.user_id;
     let payload: UserTemplateRequest =
         match state.crypto_keys.decrypt_named(&request, "user_template") {
             Ok(payload) => payload,
@@ -522,7 +527,10 @@ pub async fn delete_user_template(
     Path((server_id, template_id)): Path<(String, String)>,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<Value>> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let auth_context = auth::require_auth_context(&state, &headers).await?;
+    auth::require_permission(&auth_context, "users.write")?;
+    auth::require_server_access(&auth_context, &server_id)?;
+    let admin_user_id = auth_context.user_id;
     let payload: UserTemplateDeleteRequest = match state
         .crypto_keys
         .decrypt_named(&request, "user_template_delete")
@@ -607,7 +615,10 @@ pub async fn create_user(
     Path(server_id): Path<String>,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<UserSummary>> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let auth_context = auth::require_auth_context(&state, &headers).await?;
+    auth::require_permission(&auth_context, "users.write")?;
+    auth::require_server_access(&auth_context, &server_id)?;
+    let admin_user_id = auth_context.user_id;
     let payload: UserCreateRequest = match state.crypto_keys.decrypt_named(&request, "user_create")
     {
         Ok(payload) => payload,
@@ -750,7 +761,10 @@ pub async fn delete_user(
     Path((server_id, user_id)): Path<(String, String)>,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<Value>> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let auth_context = auth::require_auth_context(&state, &headers).await?;
+    auth::require_permission(&auth_context, "users.write")?;
+    auth::require_server_access(&auth_context, &server_id)?;
+    let admin_user_id = auth_context.user_id;
     let payload: UserDeleteRequest = match state.crypto_keys.decrypt_named(&request, "user_delete")
     {
         Ok(payload) => payload,
@@ -835,7 +849,10 @@ pub async fn update_user_policy(
     Path((server_id, user_id)): Path<(String, String)>,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<UserSummary>> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let auth_context = auth::require_auth_context(&state, &headers).await?;
+    auth::require_permission(&auth_context, "users.write")?;
+    auth::require_server_access(&auth_context, &server_id)?;
+    let admin_user_id = auth_context.user_id;
     let payload: UserPolicyUpdate = match state.crypto_keys.decrypt_named(&request, "user_policy") {
         Ok(payload) => payload,
         Err(error) => {
@@ -975,7 +992,10 @@ pub async fn reset_user_password(
     Path((server_id, user_id)): Path<(String, String)>,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<Value>> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let auth_context = auth::require_auth_context(&state, &headers).await?;
+    auth::require_permission(&auth_context, "users.write")?;
+    auth::require_server_access(&auth_context, &server_id)?;
+    let admin_user_id = auth_context.user_id;
     let payload: UserPasswordReset =
         match state.crypto_keys.decrypt_named(&request, "user_password") {
             Ok(payload) => payload,
@@ -1016,6 +1036,8 @@ pub async fn reset_user_password(
             );
             error
         })?;
+    // Serialize the entire disable/reset/restore sequence with policy and lifecycle writes.
+    let _settings_update = state.config_updates.lock().await;
     let config = match server_config(&state, &server_id).await {
         Ok(config) => config,
         Err(error) => {
@@ -2204,6 +2226,28 @@ fn default_concurrent_max() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_permissions_keep_read_only_tokens_out_of_mutations() {
+        let mut context = auth::AuthContext {
+            user_id: 1,
+            kind: auth::AuthKind::ApiToken,
+            scopes: Some(vec!["users.read".to_string()]),
+            server_ids: Some(vec!["srv-a".to_string()]),
+            role_keys: vec!["super_admin".to_string()],
+            permission_keys: vec![],
+            server_grants: vec![],
+        };
+        assert!(auth::require_permission(&context, "users.read").is_ok());
+        assert!(matches!(
+            auth::require_permission(&context, "users.write"),
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(auth::require_server_access(&context, "srv-b").is_err());
+        context.scopes = Some(vec!["users.write".to_string()]);
+        assert!(auth::require_permission(&context, "users.write").is_ok());
+        assert!(auth::require_permission(&context, "users.read").is_err());
+    }
 
     #[test]
     fn policy_update_preserves_unknown_fields() {

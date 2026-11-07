@@ -12,12 +12,14 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
-    AppState, DirectLinkCache, auth,
+    AppState, auth,
     client_control::{self, ClientControlConfig},
     config::Config,
     crypto_api::EncryptedRequest,
+    direct_link_cache_from_config,
     error::{AppError, AppResult, safe_error_message},
     file_log::{SETTING_KEY as SYSTEM_LOG_SETTING_KEY, SystemLogConfig, normalize_config},
     users_api::{
@@ -32,6 +34,7 @@ const BACKUP_ENVELOPE_VERSION: u32 = 1;
 const BACKUP_SALT_BYTES: usize = 16;
 const BACKUP_NONCE_BYTES: usize = 12;
 const MAX_BACKUP_TEXT_BYTES: usize = 8 * 1024 * 1024;
+const OPENLIST_TOKEN_OVERRIDE_MASK: &str = "********";
 
 #[derive(Debug, Deserialize)]
 pub struct RestartProxyRequest {
@@ -107,13 +110,1024 @@ pub struct EmbyApiKeyResponse {
     api_key: String,
 }
 
+const ADMIN_SECURITY_PERMISSION: &str = "admin.security.read";
+const ADMIN_SECURITY_WRITE_PERMISSION: &str = "admin.security.write";
+// The shared authentication surface now handles the login second-factor challenge.
+const ADMIN_TOTP_LOGIN_CHALLENGE_AVAILABLE: bool = true;
+
+#[derive(Debug, Deserialize)]
+pub struct AdminCreateRequest {
+    pub username: String,
+    pub password: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub role_keys: Vec<String>,
+    #[serde(default)]
+    pub server_grants: Vec<AdminServerGrantPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminRolesRequest {
+    pub role_keys: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminServerGrantsRequest {
+    #[serde(default)]
+    pub server_grants: Vec<AdminServerGrantPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminStatusRequest {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminPasswordResetRequest {
+    pub new_password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminServerGrantPayload {
+    pub server_id: String,
+    #[serde(default = "default_server_scope")]
+    pub scope: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminSecurityResponse {
+    pub current_user_id: i64,
+    pub admins: Vec<AdminView>,
+    pub roles: Vec<AdminRoleView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminView {
+    pub id: i64,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub enabled: bool,
+    pub disabled_at: Option<i64>,
+    pub totp_enabled: bool,
+    pub totp_pending: bool,
+    pub created_at: String,
+    pub updated_at: Option<i64>,
+    pub role_keys: Vec<String>,
+    pub permission_keys: Vec<String>,
+    pub server_grants: Vec<AdminServerGrantView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminServerGrantView {
+    pub server_id: String,
+    pub scope: String,
+    pub granted_at: i64,
+    pub server_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminRoleView {
+    pub id: i64,
+    pub key: String,
+    pub name: String,
+    pub description: String,
+    pub is_system: bool,
+    pub permissions: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminMutationResponse {
+    pub success: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminTokenCreateRequest {
+    pub name: String,
+    #[serde(default, alias = "scopes")]
+    pub permissions: Vec<String>,
+    #[serde(default)]
+    pub server_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminTokenCreateResponse {
+    pub id: i64,
+    pub token: String,
+    pub token_prefix: String,
+    pub name: String,
+    pub permissions: Vec<String>,
+    pub server_ids: Option<Vec<String>>,
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminTokensResponse {
+    pub tokens: Vec<AdminTokenView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminTokenView {
+    pub id: i64,
+    pub name: String,
+    pub token_prefix: String,
+    pub permissions: Vec<String>,
+    pub server_ids: Option<Vec<String>>,
+    pub expires_at: Option<i64>,
+    pub last_used_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+    pub created_at: i64,
+    pub created_by: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminSessionsResponse {
+    pub sessions: Vec<AdminSessionView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminSessionView {
+    pub id: i64,
+    pub ip: Option<String>,
+    pub user_agent: Option<String>,
+    pub device_label: Option<String>,
+    pub last_seen_at: i64,
+    pub expires_at: i64,
+    pub created_at: String,
+    pub revoked_at: Option<i64>,
+    pub auth_method: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminTwoFactorStatusResponse {
+    pub enabled: bool,
+    pub pending: bool,
+    pub available: bool,
+    pub login_challenge_available: bool,
+    pub recovery_codes_remaining: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminTwoFactorConfirmRequest {
+    pub code: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminTwoFactorCredentialRequest {
+    pub password: String,
+    #[serde(default)]
+    pub totp_code: Option<String>,
+    #[serde(default)]
+    pub recovery_code: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminTwoFactorSetupResponse {
+    pub pending: bool,
+    pub secret: String,
+    pub otpauth_uri: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminRecoveryCodesResponse {
+    pub recovery_codes: Vec<String>,
+}
+
+fn default_server_scope() -> String {
+    "full".to_string()
+}
+
+async fn require_security_context(
+    state: &AppState,
+    headers: &HeaderMap,
+    permission: &str,
+    session_only: bool,
+) -> AppResult<auth::AuthContext> {
+    let ctx = auth::require_auth_context(state, headers).await?;
+    if session_only && ctx.kind != auth::AuthKind::Session {
+        return Err(AppError::Forbidden(
+            "administrator security changes require a session".to_string(),
+        ));
+    }
+    auth::require_permission(&ctx, permission)?;
+    Ok(ctx)
+}
+
+async fn require_super_security_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> AppResult<auth::AuthContext> {
+    let ctx =
+        require_security_context(state, headers, ADMIN_SECURITY_WRITE_PERMISSION, true).await?;
+    if !ctx.role_keys.iter().any(|key| key == "super_admin") {
+        return Err(AppError::Forbidden(
+            "super administrator role required".to_string(),
+        ));
+    }
+    Ok(ctx)
+}
+
+fn normalized_keys(values: &[String], field: &str) -> AppResult<Vec<String>> {
+    let mut normalized = values
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    if normalized.is_empty() {
+        return Err(AppError::Validation(format!("{field} must not be empty")));
+    }
+    if normalized.iter().any(|value| value.len() > 128) {
+        return Err(AppError::Validation(format!(
+            "{field} contains an oversized value"
+        )));
+    }
+    Ok(normalized)
+}
+
+fn validate_role_keys(state: &AppState, role_keys: &[String]) -> AppResult<Vec<String>> {
+    let role_keys = normalized_keys(role_keys, "role_keys")?;
+    let available = state
+        .settings_store
+        .list_admin_roles()?
+        .into_iter()
+        .map(|role| role.key)
+        .collect::<std::collections::HashSet<_>>();
+    if let Some(missing) = role_keys.iter().find(|key| !available.contains(*key)) {
+        return Err(AppError::Validation(format!(
+            "admin role not found: {missing}"
+        )));
+    }
+    Ok(role_keys)
+}
+
+async fn validate_server_grants(
+    state: &AppState,
+    ctx: &auth::AuthContext,
+    payload: &[AdminServerGrantPayload],
+) -> AppResult<Vec<crate::db::AdminServerGrantInput>> {
+    let config = state.config.read().await;
+    let known = config
+        .servers
+        .iter()
+        .map(|server| server.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let is_super = ctx.role_keys.iter().any(|key| key == "super_admin");
+    let allowed = ctx
+        .server_grants
+        .iter()
+        .map(|grant| grant.server_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut seen = std::collections::HashSet::new();
+    let mut grants = Vec::with_capacity(payload.len());
+    for grant in payload {
+        let server_id = grant.server_id.trim();
+        let scope = if grant.scope.trim().is_empty() {
+            "full"
+        } else {
+            grant.scope.trim()
+        };
+        if server_id.is_empty() || !known.contains(server_id) {
+            return Err(AppError::Validation("server_id does not exist".to_string()));
+        }
+        if !is_super && !allowed.contains(server_id) {
+            return Err(AppError::Forbidden(
+                "cannot grant an unauthorized server".to_string(),
+            ));
+        }
+        if !seen.insert(server_id.to_string()) {
+            return Err(AppError::Validation("duplicate server grant".to_string()));
+        }
+        if scope.len() > 64 || scope.chars().any(|ch| ch.is_control()) {
+            return Err(AppError::Validation(
+                "invalid server grant scope".to_string(),
+            ));
+        }
+        grants.push(crate::db::AdminServerGrantInput {
+            server_id: server_id.to_string(),
+            scope: scope.to_string(),
+        });
+    }
+    Ok(grants)
+}
+
+fn no_store_response<T: Serialize>(value: T) -> Response {
+    (
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
+        Json(value),
+    )
+        .into_response()
+}
+
+pub async fn list_admins(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<AdminSecurityResponse>> {
+    let ctx = require_security_context(&state, &headers, ADMIN_SECURITY_PERMISSION, false).await?;
+    let mut users = state.settings_store.list_admin_users()?;
+    if !auth::is_super_admin(&ctx) {
+        users.retain(|user| user.id == ctx.user_id);
+    }
+    let config = state.config.read().await;
+    let server_names = config
+        .servers
+        .iter()
+        .map(|server| (server.id.clone(), server.name.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    drop(config);
+    let mut admins = Vec::with_capacity(users.len());
+    for user in users {
+        let identity = state
+            .settings_store
+            .admin_security_identity(user.id)?
+            .ok_or_else(|| AppError::Internal("admin identity not found".to_string()))?;
+        admins.push(AdminView {
+            id: user.id,
+            username: user.username,
+            display_name: user.display_name,
+            enabled: user.enabled,
+            disabled_at: user.disabled_at,
+            totp_enabled: user.totp_enabled,
+            totp_pending: user.totp_pending,
+            created_at: user.created_at,
+            updated_at: user.updated_at,
+            role_keys: user.role_keys,
+            permission_keys: identity.permission_keys,
+            server_grants: identity
+                .server_grants
+                .into_iter()
+                .filter(|grant| auth::has_server_access(&ctx, &grant.server_id))
+                .map(|grant| AdminServerGrantView {
+                    server_name: server_names.get(&grant.server_id).cloned(),
+                    server_id: grant.server_id,
+                    scope: grant.scope,
+                    granted_at: grant.granted_at,
+                })
+                .collect(),
+        });
+    }
+    let mut roles = Vec::new();
+    for role in state.settings_store.list_admin_roles()? {
+        roles.push(AdminRoleView {
+            permissions: state.settings_store.list_role_permissions(role.id)?,
+            id: role.id,
+            key: role.key,
+            name: role.name,
+            description: role.description,
+            is_system: role.is_system,
+        });
+    }
+    Ok(Json(AdminSecurityResponse {
+        current_user_id: ctx.user_id,
+        admins,
+        roles,
+    }))
+}
+
+pub async fn create_admin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EncryptedRequest>,
+) -> AppResult<Json<AdminView>> {
+    let ctx = require_super_security_session(&state, &headers).await?;
+    let payload: AdminCreateRequest = state.crypto_keys.decrypt_named(&request, "admin_create")?;
+    auth::validate_credentials(&payload.username, &payload.password)?;
+    let roles = validate_role_keys(&state, &payload.role_keys)?;
+    let grants = validate_server_grants(&state, &ctx, &payload.server_grants).await?;
+    let password_hash = auth::hash_password_async(&state, payload.password).await?;
+    let role_refs = roles.iter().map(String::as_str).collect::<Vec<_>>();
+    let admin_id = state
+        .settings_store
+        .create_admin_with_roles_and_server_grants(
+            &payload.username,
+            &password_hash,
+            payload.display_name.as_deref(),
+            &role_refs,
+            &grants,
+            Some(ctx.user_id),
+        )?;
+    state.settings_store.record_audit_best_effort(
+        Some(ctx.user_id),
+        "admin.create",
+        &format!("创建管理员 {}", admin_id),
+        "success",
+    );
+    let identity = state
+        .settings_store
+        .admin_security_identity(admin_id)?
+        .ok_or_else(|| AppError::Internal("admin identity not found".to_string()))?;
+    Ok(Json(admin_view_from_identity(identity)))
+}
+
+pub async fn update_admin_roles(
+    State(state): State<AppState>,
+    Path(admin_user_id): Path<i64>,
+    headers: HeaderMap,
+    Json(request): Json<EncryptedRequest>,
+) -> AppResult<Json<AdminMutationResponse>> {
+    let ctx = require_super_security_session(&state, &headers).await?;
+    let payload: AdminRolesRequest = state.crypto_keys.decrypt_named(&request, "admin_roles")?;
+    let roles = validate_role_keys(&state, &payload.role_keys)?;
+    let role_refs = roles.iter().map(String::as_str).collect::<Vec<_>>();
+    state.settings_store.replace_admin_roles(
+        admin_user_id,
+        &role_refs,
+        Some(ctx.user_id),
+        auth::now_ts(),
+    )?;
+    state.settings_store.record_audit_best_effort(
+        Some(ctx.user_id),
+        "admin.update_roles",
+        &format!("更新管理员 {} 的角色", admin_user_id),
+        "success",
+    );
+    Ok(Json(AdminMutationResponse { success: true }))
+}
+
+pub async fn update_admin_server_grants(
+    State(state): State<AppState>,
+    Path(admin_user_id): Path<i64>,
+    headers: HeaderMap,
+    Json(request): Json<EncryptedRequest>,
+) -> AppResult<Json<AdminMutationResponse>> {
+    let ctx = require_super_security_session(&state, &headers).await?;
+    let payload: AdminServerGrantsRequest = state
+        .crypto_keys
+        .decrypt_named(&request, "admin_server_grants")?;
+    let grants = validate_server_grants(&state, &ctx, &payload.server_grants).await?;
+    state.settings_store.replace_admin_server_grants(
+        admin_user_id,
+        &grants,
+        Some(ctx.user_id),
+        auth::now_ts(),
+    )?;
+    state.settings_store.record_audit_best_effort(
+        Some(ctx.user_id),
+        "admin.update_server_grants",
+        &format!("更新管理员 {} 的服务器授权", admin_user_id),
+        "success",
+    );
+    Ok(Json(AdminMutationResponse { success: true }))
+}
+
+pub async fn set_admin_status(
+    State(state): State<AppState>,
+    Path(admin_user_id): Path<i64>,
+    headers: HeaderMap,
+    Json(request): Json<EncryptedRequest>,
+) -> AppResult<Json<AdminMutationResponse>> {
+    let ctx = require_super_security_session(&state, &headers).await?;
+    let payload: AdminStatusRequest = state.crypto_keys.decrypt_named(&request, "admin_status")?;
+    if admin_user_id == ctx.user_id && !payload.enabled {
+        return Err(AppError::Validation(
+            "cannot disable the current administrator".to_string(),
+        ));
+    }
+    if !state
+        .settings_store
+        .set_admin_disabled(admin_user_id, !payload.enabled, auth::now_ts())?
+    {
+        return Err(AppError::Validation("admin user not found".to_string()));
+    }
+    state.settings_store.record_audit_best_effort(
+        Some(ctx.user_id),
+        "admin.status",
+        &format!(
+            "{}管理员 {}",
+            if payload.enabled { "启用" } else { "禁用" },
+            admin_user_id
+        ),
+        "success",
+    );
+    Ok(Json(AdminMutationResponse { success: true }))
+}
+
+pub async fn reset_admin_password(
+    State(state): State<AppState>,
+    Path(admin_user_id): Path<i64>,
+    headers: HeaderMap,
+    Json(request): Json<EncryptedRequest>,
+) -> AppResult<Json<AdminMutationResponse>> {
+    let ctx = require_super_security_session(&state, &headers).await?;
+    let payload: AdminPasswordResetRequest = state
+        .crypto_keys
+        .decrypt_named(&request, "admin_password_reset")?;
+    auth::validate_credentials("admin", &payload.new_password)?;
+    let password_hash = auth::hash_password_async(&state, payload.new_password).await?;
+    if !state
+        .settings_store
+        .reset_admin_password_and_revoke_credentials(
+            admin_user_id,
+            &password_hash,
+            auth::now_ts(),
+        )?
+    {
+        return Err(AppError::Validation(
+            "enabled admin user not found".to_string(),
+        ));
+    }
+    state.settings_store.record_audit_best_effort(
+        Some(ctx.user_id),
+        "admin.password_reset",
+        &format!("重置管理员 {} 的密码并撤销凭据", admin_user_id),
+        "success",
+    );
+    Ok(Json(AdminMutationResponse { success: true }))
+}
+
+pub async fn delete_admin(
+    State(state): State<AppState>,
+    Path(admin_user_id): Path<i64>,
+    headers: HeaderMap,
+) -> AppResult<Json<AdminMutationResponse>> {
+    let ctx = require_super_security_session(&state, &headers).await?;
+    if admin_user_id == ctx.user_id {
+        return Err(AppError::Validation(
+            "cannot delete the current administrator".to_string(),
+        ));
+    }
+    if !state
+        .settings_store
+        .delete_admin_user(admin_user_id, auth::now_ts())?
+    {
+        return Err(AppError::Validation("admin user not found".to_string()));
+    }
+    state.settings_store.record_audit_best_effort(
+        Some(ctx.user_id),
+        "admin.delete",
+        &format!("删除管理员 {}", admin_user_id),
+        "success",
+    );
+    Ok(Json(AdminMutationResponse { success: true }))
+}
+
+pub async fn list_admin_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<AdminTokensResponse>> {
+    let ctx = require_security_context(&state, &headers, ADMIN_SECURITY_PERMISSION, true).await?;
+    let tokens = state
+        .settings_store
+        .list_admin_api_tokens(ctx.user_id)?
+        .into_iter()
+        .map(|token| AdminTokenView {
+            id: token.id,
+            name: token.name,
+            token_prefix: token.token_prefix,
+            permissions: token.scopes,
+            server_ids: token.server_ids,
+            expires_at: token.expires_at,
+            last_used_at: token.last_used_at,
+            revoked_at: token.revoked_at,
+            created_at: token.created_at,
+            created_by: token.created_by,
+        })
+        .collect();
+    Ok(Json(AdminTokensResponse { tokens }))
+}
+
+pub async fn create_admin_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EncryptedRequest>,
+) -> AppResult<Response> {
+    let ctx =
+        require_security_context(&state, &headers, ADMIN_SECURITY_WRITE_PERMISSION, true).await?;
+    let payload: AdminTokenCreateRequest = state
+        .crypto_keys
+        .decrypt_named(&request, "admin_token_create")?;
+    let name = payload.name.trim();
+    if name.is_empty() || name.len() > 128 {
+        return Err(AppError::Validation("token name is invalid".to_string()));
+    }
+    let permissions = normalized_keys(&payload.permissions, "permissions")?;
+    let is_super = ctx.role_keys.iter().any(|key| key == "super_admin");
+    if !is_super
+        && permissions.iter().any(|permission| {
+            !ctx.permission_keys
+                .iter()
+                .any(|allowed| allowed == permission)
+        })
+    {
+        return Err(AppError::Forbidden(
+            "token permission exceeds administrator access".to_string(),
+        ));
+    }
+    if payload
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= auth::now_ts())
+    {
+        return Err(AppError::Validation(
+            "token expiry must be in the future".to_string(),
+        ));
+    }
+    let server_ids = match payload.server_ids {
+        None => None,
+        Some(ids) => {
+            let ids = normalized_keys(&ids, "server_ids")?;
+            let config = state.config.read().await;
+            let known = config
+                .servers
+                .iter()
+                .map(|server| server.id.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            if ids
+                .iter()
+                .any(|server_id| !known.contains(server_id.as_str()))
+            {
+                return Err(AppError::Validation(
+                    "token server_id does not exist".to_string(),
+                ));
+            }
+            drop(config);
+            if !is_super
+                && ids.iter().any(|server_id| {
+                    !ctx.server_grants
+                        .iter()
+                        .any(|grant| &grant.server_id == server_id)
+                })
+            {
+                return Err(AppError::Forbidden(
+                    "token server access exceeds administrator grants".to_string(),
+                ));
+            }
+            Some(ids)
+        }
+    };
+    let source_token_hash = auth::hash_token(auth::auth_token(&headers)?);
+    for _ in 0..3 {
+        let token = format!("embyp_{}", auth::random_token());
+        let token_prefix = token.chars().take(16).collect::<String>();
+        match state.settings_store.create_admin_api_token_from_session(
+            &source_token_hash,
+            ctx.user_id,
+            name,
+            &token_prefix,
+            &auth::hash_token(&token),
+            &permissions,
+            server_ids.as_deref(),
+            payload.expires_at,
+            Some(ctx.user_id),
+        ) {
+            Ok(id) => {
+                state.settings_store.record_audit_best_effort(
+                    Some(ctx.user_id),
+                    "admin.token_create",
+                    &format!("创建管理员 API token {}", id),
+                    "success",
+                );
+                return Ok(no_store_response(AdminTokenCreateResponse {
+                    id,
+                    token,
+                    token_prefix,
+                    name: name.to_string(),
+                    permissions,
+                    server_ids,
+                    expires_at: payload.expires_at,
+                }));
+            }
+            Err(AppError::Validation(message)) if message == "api token hash already exists" => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Err(AppError::Internal(
+        "failed to create unique API token".to_string(),
+    ))
+}
+
+pub async fn revoke_admin_token(
+    State(state): State<AppState>,
+    Path(token_id): Path<i64>,
+    headers: HeaderMap,
+) -> AppResult<Json<AdminMutationResponse>> {
+    let ctx =
+        require_security_context(&state, &headers, ADMIN_SECURITY_WRITE_PERMISSION, true).await?;
+    if !state.settings_store.revoke_admin_api_token_for_user(
+        token_id,
+        ctx.user_id,
+        auth::now_ts(),
+    )? {
+        return Err(AppError::Validation("API token not found".to_string()));
+    }
+    state.settings_store.record_audit_best_effort(
+        Some(ctx.user_id),
+        "admin.token_revoke",
+        &format!("撤销管理员 API token {}", token_id),
+        "success",
+    );
+    Ok(Json(AdminMutationResponse { success: true }))
+}
+
+pub async fn list_admin_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<AdminSessionsResponse>> {
+    let ctx = require_security_context(&state, &headers, ADMIN_SECURITY_PERMISSION, true).await?;
+    let sessions = state
+        .settings_store
+        .list_admin_sessions(ctx.user_id)?
+        .into_iter()
+        .map(|session| AdminSessionView {
+            id: session.id,
+            ip: session.ip,
+            user_agent: session.user_agent,
+            device_label: session.device_label,
+            last_seen_at: session.last_seen_at,
+            expires_at: session.expires_at,
+            created_at: session.created_at,
+            revoked_at: session.revoked_at,
+            auth_method: session.auth_method,
+        })
+        .collect();
+    Ok(Json(AdminSessionsResponse { sessions }))
+}
+
+pub async fn revoke_admin_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<i64>,
+    headers: HeaderMap,
+) -> AppResult<Json<AdminMutationResponse>> {
+    let ctx =
+        require_security_context(&state, &headers, ADMIN_SECURITY_WRITE_PERMISSION, true).await?;
+    if !state.settings_store.revoke_admin_session_by_id_for_user(
+        session_id,
+        ctx.user_id,
+        auth::now_ts(),
+    )? {
+        return Err(AppError::Validation("session not found".to_string()));
+    }
+    state.settings_store.record_audit_best_effort(
+        Some(ctx.user_id),
+        "admin.session_revoke",
+        &format!("撤销管理员会话 {}", session_id),
+        "success",
+    );
+    Ok(Json(AdminMutationResponse { success: true }))
+}
+
+pub async fn get_admin_2fa_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<AdminTwoFactorStatusResponse>> {
+    let ctx = require_security_context(&state, &headers, ADMIN_SECURITY_PERMISSION, true).await?;
+    let identity = state
+        .settings_store
+        .admin_security_identity(ctx.user_id)?
+        .ok_or_else(|| AppError::Unauthorized("admin identity not found".to_string()))?;
+    Ok(Json(AdminTwoFactorStatusResponse {
+        enabled: identity.totp_enabled,
+        pending: identity.totp_pending,
+        available: auth::admin_security_key().is_ok(),
+        login_challenge_available: ADMIN_TOTP_LOGIN_CHALLENGE_AVAILABLE,
+        recovery_codes_remaining: state
+            .settings_store
+            .count_unused_admin_recovery_codes(ctx.user_id)?,
+    }))
+}
+
+pub async fn setup_admin_2fa(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Response> {
+    let ctx =
+        require_security_context(&state, &headers, ADMIN_SECURITY_WRITE_PERMISSION, true).await?;
+    if !ADMIN_TOTP_LOGIN_CHALLENGE_AVAILABLE {
+        return Err(AppError::Validation(
+            "2FA cannot be enabled until the login challenge is available".to_string(),
+        ));
+    }
+    let identity = state
+        .settings_store
+        .admin_security_identity(ctx.user_id)?
+        .ok_or_else(|| AppError::Unauthorized("admin identity not found".to_string()))?;
+    if identity.totp_enabled {
+        return Err(AppError::Validation("2FA is already enabled".to_string()));
+    }
+    let secret = auth::generate_totp_secret();
+    let (ciphertext, nonce) = auth::encrypt_admin_totp_secret(secret.as_bytes())?;
+    state.settings_store.upsert_admin_totp_secret(
+        ctx.user_id,
+        &ciphertext,
+        &nonce,
+        1,
+        "SHA1",
+        6,
+        30,
+        auth::now_ts(),
+    )?;
+    let issuer = urlencoding::encode("EmbyPanel");
+    let label_value = format!("EmbyPanel:{}", identity.username);
+    let label = urlencoding::encode(&label_value);
+    let otpauth_uri = format!(
+        "otpauth://totp/{label}?secret={secret}&issuer={issuer}&algorithm=SHA1&digits=6&period=30"
+    );
+    state.settings_store.record_audit_best_effort(
+        Some(ctx.user_id),
+        "admin.2fa_setup",
+        &format!("为管理员 {} 创建 2FA 待确认配置", ctx.user_id),
+        "success",
+    );
+    Ok(no_store_response(AdminTwoFactorSetupResponse {
+        pending: true,
+        secret,
+        otpauth_uri,
+    }))
+}
+
+pub async fn confirm_admin_2fa(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EncryptedRequest>,
+) -> AppResult<Response> {
+    let ctx =
+        require_security_context(&state, &headers, ADMIN_SECURITY_WRITE_PERMISSION, true).await?;
+    if !ADMIN_TOTP_LOGIN_CHALLENGE_AVAILABLE {
+        return Err(AppError::Validation(
+            "2FA cannot be enabled until the login challenge is available".to_string(),
+        ));
+    }
+    let payload: AdminTwoFactorConfirmRequest = state
+        .crypto_keys
+        .decrypt_named(&request, "admin_2fa_confirm")?;
+    let row = state
+        .settings_store
+        .get_admin_totp_secret(ctx.user_id)?
+        .ok_or_else(|| AppError::Validation("2FA setup is not pending".to_string()))?;
+    if row.confirmed_at.is_some() {
+        return Err(AppError::Validation("2FA is already enabled".to_string()));
+    }
+    let secret = auth::decrypt_admin_totp_secret(&row)?;
+    let secret = std::str::from_utf8(&secret)
+        .map_err(|_| AppError::Unauthorized("2FA secret is unavailable".to_string()))?;
+    if !auth::verify_admin_totp_setup_code(&row, secret, &payload.code, auth::now_ts()) {
+        return Err(AppError::Unauthorized("invalid 2FA code".to_string()));
+    }
+    let recovery_codes = (0..8).map(|_| auth::random_token()).collect::<Vec<_>>();
+    let hashes = recovery_codes
+        .iter()
+        .map(|code| auth::hash_token(code))
+        .collect::<Vec<_>>();
+    if !state
+        .settings_store
+        .confirm_admin_totp_with_recovery_codes(
+            ctx.user_id,
+            &row.secret_ciphertext,
+            &row.secret_nonce,
+            &hashes,
+            auth::now_ts(),
+        )?
+    {
+        return Err(AppError::Validation(
+            "2FA setup is no longer pending".to_string(),
+        ));
+    }
+    state.settings_store.record_audit_best_effort(
+        Some(ctx.user_id),
+        "admin.2fa_confirm",
+        &format!("确认管理员 {} 的 2FA", ctx.user_id),
+        "success",
+    );
+    Ok(no_store_response(AdminRecoveryCodesResponse {
+        recovery_codes,
+    }))
+}
+
+async fn verify_admin_2fa_credentials(
+    state: &AppState,
+    ctx: &auth::AuthContext,
+    payload: AdminTwoFactorCredentialRequest,
+) -> AppResult<()> {
+    let password_hash = state
+        .settings_store
+        .admin_password_hash_by_id(ctx.user_id)?
+        .ok_or_else(|| AppError::Unauthorized("admin identity not found".to_string()))?;
+    auth::verify_password_async(state, payload.password, password_hash.password_hash).await?;
+    auth::verify_admin_second_factor(
+        state,
+        ctx.user_id,
+        payload.totp_code.as_deref(),
+        payload.recovery_code.as_deref(),
+    )
+}
+
+pub async fn disable_admin_2fa(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EncryptedRequest>,
+) -> AppResult<Json<AdminMutationResponse>> {
+    let ctx =
+        require_security_context(&state, &headers, ADMIN_SECURITY_WRITE_PERMISSION, true).await?;
+    let payload: AdminTwoFactorCredentialRequest = state
+        .crypto_keys
+        .decrypt_named(&request, "admin_2fa_disable")?;
+    verify_admin_2fa_credentials(&state, &ctx, payload).await?;
+    if !state
+        .settings_store
+        .disable_admin_totp_and_revoke_credentials(ctx.user_id, auth::now_ts())?
+    {
+        return Err(AppError::Validation("2FA is not enabled".to_string()));
+    }
+    state.settings_store.record_audit_best_effort(
+        Some(ctx.user_id),
+        "admin.2fa_disable",
+        &format!("禁用管理员 {} 的 2FA 并撤销凭据", ctx.user_id),
+        "success",
+    );
+    Ok(Json(AdminMutationResponse { success: true }))
+}
+
+pub async fn regenerate_admin_recovery_codes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EncryptedRequest>,
+) -> AppResult<Response> {
+    let ctx =
+        require_security_context(&state, &headers, ADMIN_SECURITY_WRITE_PERMISSION, true).await?;
+    let payload: AdminTwoFactorCredentialRequest = state
+        .crypto_keys
+        .decrypt_named(&request, "admin_2fa_recovery")?;
+    verify_admin_2fa_credentials(&state, &ctx, payload).await?;
+    let recovery_codes = (0..8).map(|_| auth::random_token()).collect::<Vec<_>>();
+    let hashes = recovery_codes
+        .iter()
+        .map(|code| auth::hash_token(code))
+        .collect::<Vec<_>>();
+    state
+        .settings_store
+        .replace_admin_recovery_codes(ctx.user_id, &hashes, auth::now_ts())?;
+    state.settings_store.record_audit_best_effort(
+        Some(ctx.user_id),
+        "admin.2fa_recovery_regenerate",
+        &format!("重新生成管理员 {} 的恢复码", ctx.user_id),
+        "success",
+    );
+    Ok(no_store_response(AdminRecoveryCodesResponse {
+        recovery_codes,
+    }))
+}
+
+pub async fn rollback_admin_2fa_setup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<AdminMutationResponse>> {
+    let ctx =
+        require_security_context(&state, &headers, ADMIN_SECURITY_WRITE_PERMISSION, true).await?;
+    if !state
+        .settings_store
+        .rollback_admin_totp_setup(ctx.user_id)?
+    {
+        return Err(AppError::Validation("2FA setup is not pending".to_string()));
+    }
+    state.settings_store.record_audit_best_effort(
+        Some(ctx.user_id),
+        "admin.2fa_rollback",
+        &format!("回滚管理员 {} 的 2FA 待确认配置", ctx.user_id),
+        "success",
+    );
+    Ok(Json(AdminMutationResponse { success: true }))
+}
+
+fn admin_view_from_identity(identity: crate::db::AdminSecurityIdentity) -> AdminView {
+    AdminView {
+        id: identity.admin_user_id,
+        username: identity.username,
+        display_name: identity.display_name,
+        enabled: identity.enabled,
+        disabled_at: identity.disabled_at,
+        totp_enabled: identity.totp_enabled,
+        totp_pending: identity.totp_pending,
+        created_at: String::new(),
+        updated_at: None,
+        role_keys: identity.role_keys,
+        permission_keys: identity.permission_keys,
+        server_grants: identity
+            .server_grants
+            .into_iter()
+            .map(|grant| AdminServerGrantView {
+                server_id: grant.server_id,
+                scope: grant.scope,
+                granted_at: grant.granted_at,
+                server_name: None,
+            })
+            .collect(),
+    }
+}
+
 pub async fn get_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Config>> {
-    auth::require_auth(&state, &headers).await?;
-    Ok(Json(redact_config_secrets(
+    let ctx = auth::require_auth_context(&state, &headers).await?;
+    auth::require_permission(&ctx, "settings.read")?;
+    Ok(Json(settings_for_context(
         state.config.read().await.clone(),
+        &ctx,
     )))
 }
 
@@ -122,7 +1136,10 @@ pub async fn reveal_emby_api_key(
     Path(server_id): Path<String>,
     headers: HeaderMap,
 ) -> AppResult<Response> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let ctx = auth::require_auth_context(&state, &headers).await?;
+    auth::require_super_admin_session(&ctx)?;
+    auth::require_server_access(&ctx, &server_id)?;
+    let admin_user_id = ctx.user_id;
     let (server_name, api_key) = {
         let config = state.config.read().await;
         let server = config
@@ -150,10 +1167,13 @@ pub async fn update_settings(
     headers: HeaderMap,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<Config>> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
-    let mut payload: Config = state.crypto_keys.decrypt_named(&request, "settings")?;
+    let ctx = auth::require_auth_context(&state, &headers).await?;
+    auth::require_super_admin_session(&ctx)?;
+    let admin_user_id = ctx.user_id;
+    let (mut payload, raw_payload) = decrypt_settings_payload(&state, &request)?;
     let _config_update = state.config_updates.lock().await;
     let existing = state.config.read().await.clone();
+    merge_server_openlist_token_overrides(&mut payload, &raw_payload, &existing);
     for server in &mut payload.servers {
         if server.emby_api_key.trim().is_empty()
             && let Some(existing_server) = existing
@@ -199,7 +1219,9 @@ pub async fn restart_proxy_server(
     headers: HeaderMap,
     Json(payload): Json<RestartProxyRequest>,
 ) -> AppResult<Json<Config>> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let ctx = auth::require_auth_context(&state, &headers).await?;
+    auth::require_super_admin_session(&ctx)?;
+    let admin_user_id = ctx.user_id;
     let server_id = payload.server_id.trim();
     if server_id.is_empty() {
         return Err(AppError::Validation("server_id is required".to_string()));
@@ -225,7 +1247,9 @@ pub async fn toggle_proxy_server(
     headers: HeaderMap,
     Json(payload): Json<ToggleProxyRequest>,
 ) -> AppResult<Json<Config>> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let ctx = auth::require_auth_context(&state, &headers).await?;
+    auth::require_super_admin_session(&ctx)?;
+    let admin_user_id = ctx.user_id;
     let server_id = payload.server_id.trim();
     if server_id.is_empty() {
         return Err(AppError::Validation("server_id is required".to_string()));
@@ -266,9 +1290,12 @@ pub async fn validate_settings(
     headers: HeaderMap,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<ValidationResponse>> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
-    let mut payload: Config = state.crypto_keys.decrypt_named(&request, "settings")?;
+    let ctx = auth::require_auth_context(&state, &headers).await?;
+    auth::require_super_admin_session(&ctx)?;
+    let admin_user_id = ctx.user_id;
+    let (mut payload, raw_payload) = decrypt_settings_payload(&state, &request)?;
     let existing = state.config.read().await.clone();
+    merge_server_openlist_token_overrides(&mut payload, &raw_payload, &existing);
     for server in &mut payload.servers {
         if server.emby_api_key.trim().is_empty()
             && let Some(existing_server) = existing
@@ -343,17 +1370,35 @@ pub async fn validate_settings(
         }
     }
 
-    if payload.openlist_addr.is_some() {
-        match crate::openlist::validate_connection(&state.client, &payload).await {
-            Ok(()) => results.push(ok_result("OpenList", "OpenList 连接可用", "")),
-            Err(err) => results.push(err_result(
-                "OpenList",
-                "OpenList 连接失败",
-                &safe_error_message(&err),
-            )),
+    if payload.servers.is_empty() {
+        if payload.openlist_addr.is_some() {
+            match crate::openlist::validate_connection(&state.client, &payload).await {
+                Ok(()) => results.push(ok_result("OpenList", "OpenList 连接可用", "")),
+                Err(err) => results.push(err_result(
+                    "OpenList",
+                    "OpenList 连接失败",
+                    &safe_error_message(&err),
+                )),
+            }
+        } else {
+            results.push(ok_result("OpenList", "未配置，已跳过", ""));
         }
     } else {
-        results.push(ok_result("OpenList", "未配置，已跳过", ""));
+        for server in &payload.servers {
+            let effective_config = payload.for_server_for_validation(server);
+            if effective_config.openlist_addr.is_some() {
+                match crate::openlist::validate_connection(&state.client, &effective_config).await {
+                    Ok(()) => results.push(ok_result(&server.name, "OpenList 连接可用", "")),
+                    Err(err) => results.push(err_result(
+                        &server.name,
+                        "OpenList 连接失败",
+                        &safe_error_message(&err),
+                    )),
+                }
+            } else {
+                results.push(ok_result(&server.name, "未配置，已跳过", ""));
+            }
+        }
     }
 
     let ok = results.iter().all(|result| result.ok);
@@ -370,7 +1415,8 @@ pub async fn get_log_config(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<SystemLogConfig>> {
-    auth::require_auth(&state, &headers).await?;
+    let ctx = auth::require_auth_context(&state, &headers).await?;
+    auth::require_super_admin_session(&ctx)?;
     Ok(Json(state.file_log.config()))
 }
 
@@ -379,7 +1425,9 @@ pub async fn update_log_config(
     headers: HeaderMap,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<SystemLogConfig>> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let ctx = auth::require_auth_context(&state, &headers).await?;
+    auth::require_super_admin_session(&ctx)?;
+    let admin_user_id = ctx.user_id;
     let payload: SystemLogConfig = state.crypto_keys.decrypt_named(&request, "log_config")?;
     let _config_update = state.config_updates.lock().await;
     let config = state
@@ -399,7 +1447,9 @@ pub async fn export_backup(
     headers: HeaderMap,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<BackupExportResponse>> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let ctx = auth::require_auth_context(&state, &headers).await?;
+    auth::require_super_admin_session(&ctx)?;
+    let admin_user_id = ctx.user_id;
     let payload: BackupExportRequest =
         state.crypto_keys.decrypt_named(&request, "backup_export")?;
     let password = payload.password.trim();
@@ -442,7 +1492,9 @@ pub async fn import_backup(
     headers: HeaderMap,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<Config>> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let ctx = auth::require_auth_context(&state, &headers).await?;
+    auth::require_super_admin_session(&ctx)?;
+    let admin_user_id = ctx.user_id;
     let payload: BackupImportRequest = state.crypto_keys.decrypt_named(&request, "backup")?;
     let mut backup = parse_backup_text(payload.password.as_deref(), &payload.backup)?;
     let restore_snapshot = match backup.schema_version {
@@ -735,17 +1787,82 @@ async fn apply_runtime_config(state: &AppState, previous: &Config, next: &Config
 
 async fn install_runtime_config(state: &AppState, config: &Config) {
     *state.config.write().await = config.clone();
-    *state.cache.write().await = DirectLinkCache::new(
-        config.cache_enabled,
-        config.cache_ttl_seconds,
-        config.cache_max_capacity,
-    );
+    *state.cache.write().await = direct_link_cache_from_config(config);
+}
+
+fn decrypt_settings_payload(
+    state: &AppState,
+    request: &EncryptedRequest,
+) -> AppResult<(Config, Value)> {
+    let mut fields = state.crypto_keys.decrypt_fields(request)?;
+    let raw_payload = fields
+        .remove("settings")
+        .ok_or_else(|| AppError::Validation("missing encrypted field `settings`".to_string()))?;
+    let payload = serde_json::from_value(raw_payload.clone())
+        .map_err(|_| AppError::Validation("invalid encrypted payload".to_string()))?;
+    Ok((payload, raw_payload))
+}
+
+fn merge_server_openlist_token_overrides(
+    payload: &mut Config,
+    raw_payload: &Value,
+    existing: &Config,
+) {
+    let raw_servers = raw_payload.get("servers").and_then(Value::as_array);
+    for server in &mut payload.servers {
+        let existing_token = existing
+            .servers
+            .iter()
+            .find(|existing_server| existing_server.id == server.id)
+            .and_then(|existing_server| existing_server.openlist_token_override.clone());
+        let token_field = raw_servers
+            .and_then(|servers| {
+                servers.iter().find(|raw_server| {
+                    raw_server.get("id").and_then(Value::as_str) == Some(server.id.as_str())
+                })
+            })
+            .and_then(|raw_server| raw_server.get("openlist_token_override"));
+
+        match token_field {
+            // Omitted means the redacted value was not echoed by the client; retain it.
+            None => server.openlist_token_override = existing_token,
+            // Null is the explicit clear operation emitted by the UI.
+            Some(Value::Null) => server.openlist_token_override = None,
+            // Empty values and our response mask are non-destructive placeholders.
+            Some(Value::String(value))
+                if value.trim().is_empty() || value.trim() == OPENLIST_TOKEN_OVERRIDE_MASK =>
+            {
+                server.openlist_token_override = existing_token;
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+fn settings_for_context(mut config: Config, ctx: &auth::AuthContext) -> Config {
+    if auth::allowed_server_ids(ctx).is_none() {
+        return redact_config_secrets(config);
+    }
+    config
+        .servers
+        .retain(|server| auth::has_server_access(ctx, &server.id));
+    // Legacy global host mirrors the first configured server and must not reveal
+    // an out-of-scope server when only the server list has been filtered.
+    if let Some(server) = config.servers.first() {
+        config.emby_host = server.emby_host.clone();
+    } else {
+        config.emby_host.clear();
+    }
+    redact_config_secrets(config)
 }
 
 fn redact_config_secrets(mut config: Config) -> Config {
     config.emby_api_key.clear();
     for server in &mut config.servers {
         server.emby_api_key.clear();
+        if server.openlist_token_override.is_some() {
+            server.openlist_token_override = Some(OPENLIST_TOKEN_OVERRIDE_MASK.to_string());
+        }
     }
     config.openlist_token = None;
     config
@@ -773,7 +1890,7 @@ fn parse_backup_text(password: Option<&str>, value: &str) -> AppResult<BackupPay
     let value = value.trim();
     validate_backup_text_size(value)?;
     let root: serde_json::Value = serde_json::from_str(value)
-        .map_err(|err| AppError::Validation(format!("invalid backup config text: {err}")))?;
+        .map_err(|_| AppError::Validation("invalid backup config text".to_string()))?;
     if root.get("cipher").is_some() {
         let password = password
             .map(str::trim)
@@ -782,7 +1899,7 @@ fn parse_backup_text(password: Option<&str>, value: &str) -> AppResult<BackupPay
         decrypt_backup(password, value)
     } else {
         serde_json::from_value(root)
-            .map_err(|err| AppError::Validation(format!("invalid backup config: {err}")))
+            .map_err(|_| AppError::Validation("invalid backup config".to_string()))
     }
 }
 
@@ -850,7 +1967,7 @@ fn decrypt_backup(password: &str, value: &str) -> AppResult<BackupPayload> {
         .decrypt(Nonce::from_slice(&nonce), data.as_ref())
         .map_err(|_| AppError::Validation("backup password is invalid".to_string()))?;
     serde_json::from_slice(&plaintext)
-        .map_err(|err| AppError::Validation(format!("invalid backup payload: {err}")))
+        .map_err(|_| AppError::Validation("invalid backup payload".to_string()))
 }
 
 fn validate_backup_password(password: &str) -> AppResult<()> {
@@ -893,6 +2010,15 @@ mod tests {
         },
         users_api::{UserPolicyRecord, UserPolicyUpdate, UserTemplate},
     };
+
+    #[test]
+    fn malformed_backup_config_does_not_echo_secret_values() {
+        let text =
+            r#"{"runtime_config":{"emby_host":"http://emby","emby_api_key":982764321098765432}}"#;
+        let error = parse_backup_text(None, text).err().unwrap();
+        assert_eq!(error.safe_log_message(), "invalid backup config");
+        assert!(!format!("{error:?}").contains("982764321098765432"));
+    }
 
     fn test_client_control() -> ClientControlConfig {
         ClientControlConfig {
@@ -939,6 +2065,211 @@ mod tests {
         assert_eq!(restored.application_version.as_deref(), Some("v-test"));
         assert!(restored.client_control.as_ref().unwrap().enabled);
         assert!(restored.system_log_config.is_some());
+    }
+
+    #[test]
+    fn cold_data_backup_restores_security_alerts_and_separate_keys() {
+        use crate::{
+            alerts::{AlertRule, Alerts},
+            db::{AdminServerGrantInput, SettingsStore},
+        };
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "embypanel-cold-restore-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = root.join("source");
+        let backup = root.join("backup");
+        let restored = root.join("restored");
+        for dir in [&source, &backup, &restored] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let source_db = source.join("embypanel.db");
+        let store = SettingsStore::open_for_test(source_db.clone()).unwrap();
+        let owner = store
+            .create_initial_admin("backup-owner", "synthetic-password-hash")
+            .unwrap()
+            .unwrap();
+        let viewer = store
+            .create_admin_with_roles(
+                "backup-viewer",
+                "viewer-hash",
+                None,
+                &["viewer"],
+                Some(owner),
+            )
+            .unwrap();
+        store
+            .replace_admin_server_grants(
+                viewer,
+                &[AdminServerGrantInput {
+                    server_id: "srv-a".into(),
+                    scope: "full".into(),
+                }],
+                Some(owner),
+                auth::now_ts(),
+            )
+            .unwrap();
+        store
+            .create_session(
+                owner,
+                &auth::hash_token("revoked-backup-session"),
+                auth::now_ts() + 3600,
+            )
+            .unwrap();
+        store
+            .revoke_session(&auth::hash_token("revoked-backup-session"), auth::now_ts())
+            .unwrap();
+        let mut config = Config::default_runtime();
+        config.servers.push(
+            serde_json::from_value(serde_json::json!({
+                "id":"srv-a","name":"Server A","emby_host":"http://synthetic.invalid",
+                "emby_api_key":"synthetic-api-key","port":18096
+            }))
+            .unwrap(),
+        );
+        config.validate_for_storage().unwrap();
+        store.save_config(&config).unwrap();
+        store
+            .save_setting_json("backup-fixture", &serde_json::json!({"template":"fixture"}))
+            .unwrap();
+
+        // This test key stands in for the externally backed-up 2FA environment key;
+        // it never reads or modifies the process environment or real credentials.
+        let external_key = [23u8; 32];
+        let nonce = [17u8; 12];
+        let cipher = Aes256Gcm::new_from_slice(&external_key).unwrap();
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                b"SYNTHETIC_TOTP_SECRET".as_slice(),
+            )
+            .unwrap();
+        store
+            .upsert_admin_totp_secret(owner, &ciphertext, &nonce, 1, "SHA1", 6, 30, auth::now_ts())
+            .unwrap();
+        assert!(
+            store
+                .confirm_admin_totp_with_recovery_codes(
+                    owner,
+                    &ciphertext,
+                    &nonce,
+                    &[auth::hash_token("backup-recovery-code")],
+                    auth::now_ts()
+                )
+                .unwrap()
+        );
+        let alerts = Alerts::new(&source_db).unwrap();
+        alerts
+            .create_alert_rule(AlertRule {
+                id: "backup-rule".into(),
+                name: "Backup rule".into(),
+                enabled: true,
+                rule_config: "https://synthetic.invalid/hook?token=backup-canary".into(),
+                threshold: "".into(),
+                silence_period: 0,
+                created_at: crate::alerts::now_ms(),
+                metric: "".into(),
+                operator: "gte".into(),
+                server_id: "srv-a".into(),
+                evaluation_window_secs: 0,
+            })
+            .unwrap();
+        alerts
+            .record_test_delivery("backup-rule", "success", "backup fixture")
+            .unwrap();
+        // Complete cold backup: close every SQLite handle, then copy the whole directory.
+        drop(alerts);
+        drop(store);
+        for entry in fs::read_dir(&source).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(entry.path(), backup.join(entry.file_name())).unwrap();
+        }
+        assert!(backup.join("embypanel.db.key").is_file());
+        for entry in fs::read_dir(&backup).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(entry.path(), restored.join(entry.file_name())).unwrap();
+        }
+        let restored_db = restored.join("embypanel.db");
+        let store = SettingsStore::open_for_test(restored_db.clone()).unwrap();
+        let owner_identity = store.admin_security_identity(owner).unwrap().unwrap();
+        assert!(
+            owner_identity
+                .role_keys
+                .contains(&"super_admin".to_string())
+        );
+        assert!(owner_identity.totp_enabled);
+        assert_eq!(
+            store
+                .admin_password_hash("backup-owner")
+                .unwrap()
+                .unwrap()
+                .password_hash,
+            "synthetic-password-hash"
+        );
+        let viewer_identity = store.admin_security_identity(viewer).unwrap().unwrap();
+        assert_eq!(viewer_identity.role_keys, vec!["viewer".to_string()]);
+        assert_eq!(viewer_identity.server_grants[0].server_id, "srv-a");
+        assert!(
+            store
+                .admin_session_auth_by_hash(
+                    &auth::hash_token("revoked-backup-session"),
+                    auth::now_ts()
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.load_config().unwrap().unwrap().servers[0].emby_api_key,
+            "synthetic-api-key"
+        );
+        assert_eq!(
+            store
+                .load_setting_json::<Value>("backup-fixture")
+                .unwrap()
+                .unwrap()["template"],
+            "fixture"
+        );
+        let secret = store.get_admin_totp_secret(owner).unwrap().unwrap();
+        assert_eq!(
+            cipher
+                .decrypt(
+                    Nonce::from_slice(&secret.secret_nonce),
+                    secret.secret_ciphertext.as_slice()
+                )
+                .unwrap(),
+            b"SYNTHETIC_TOTP_SECRET"
+        );
+        assert_eq!(store.count_unused_admin_recovery_codes(owner).unwrap(), 1);
+        let alerts = Alerts::new(&restored_db).unwrap();
+        assert_eq!(
+            alerts
+                .get_rule_webhook_url("backup-rule")
+                .unwrap()
+                .as_deref(),
+            Some("https://synthetic.invalid/hook?token=backup-canary")
+        );
+        assert_eq!(
+            alerts
+                .list_alert_deliveries(Some("backup-rule"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        let rendered =
+            serde_json::to_string(&alerts.get_alert_rule("backup-rule").unwrap().unwrap()).unwrap();
+        assert!(!rendered.contains("backup-canary"));
+        drop(alerts);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1036,6 +2367,58 @@ mod tests {
     }
 
     #[test]
+    fn server_openlist_token_override_preserves_omitted_empty_and_masked_values() {
+        let existing = config_with_server_openlist_token(Some("persisted-server-token"));
+        let raw_payloads = [
+            serde_json::json!({"servers": [{"id": "server-a"}]}),
+            serde_json::json!({
+                "servers": [{"id": "server-a", "openlist_token_override": "  "}]
+            }),
+            serde_json::json!({
+                "servers": [{
+                    "id": "server-a",
+                    "openlist_token_override": OPENLIST_TOKEN_OVERRIDE_MASK
+                }]
+            }),
+        ];
+
+        for raw_payload in raw_payloads {
+            let mut payload = existing.clone();
+            payload.servers[0].openlist_token_override = Some("client-placeholder".to_string());
+            merge_server_openlist_token_overrides(&mut payload, &raw_payload, &existing);
+            assert_eq!(
+                payload.servers[0].openlist_token_override.as_deref(),
+                Some("persisted-server-token")
+            );
+        }
+    }
+
+    #[test]
+    fn server_openlist_token_override_null_explicitly_clears() {
+        let existing = config_with_server_openlist_token(Some("persisted-server-token"));
+        let raw_payload = serde_json::json!({
+            "servers": [{"id": "server-a", "openlist_token_override": null}]
+        });
+        let mut payload = existing.clone();
+
+        merge_server_openlist_token_overrides(&mut payload, &raw_payload, &existing);
+
+        assert!(payload.servers[0].openlist_token_override.is_none());
+    }
+
+    fn config_with_server_openlist_token(token: Option<&str>) -> Config {
+        let mut config = Config::default_runtime();
+        config.servers.push(crate::config::EmbyServerConfig {
+            id: "server-a".to_string(),
+            name: "Server A".to_string(),
+            openlist_addr_override: token.map(|_| "https://openlist.example.test".to_string()),
+            openlist_token_override: token.map(str::to_string),
+            ..crate::config::EmbyServerConfig::default()
+        });
+        config
+    }
+
+    #[test]
     fn settings_responses_redact_all_runtime_secrets() {
         let mut config = Config::default_runtime();
         config.emby_api_key = "top-level-key".to_string();
@@ -1046,13 +2429,18 @@ mod tests {
             name: "Server A".to_string(),
             emby_host: "https://emby.example.test".to_string(),
             emby_api_key: "server-key".to_string(),
+            openlist_addr_override: Some("https://openlist.example.test".to_string()),
+            openlist_token_override: Some("server-openlist-token".to_string()),
             port: 18096,
             enabled: true,
             block_web_ui: false,
+            block_web_ui_status_code: 403,
+            block_web_ui_message: "Emby Web UI is disabled by EmbyPanel".to_string(),
             real_ip_mode: "auto".to_string(),
             real_ip_header: String::new(),
             trusted_proxy_cidrs: String::new(),
             trusted_proxy_networks: Vec::new(),
+            ..crate::config::EmbyServerConfig::default()
         });
 
         let redacted = redact_config_secrets(config);
@@ -1065,6 +2453,12 @@ mod tests {
                 .all(|server| server.emby_api_key.is_empty())
         );
         assert!(redacted.openlist_token.is_none());
+        assert_eq!(
+            redacted.servers[0].openlist_token_override.as_deref(),
+            Some(OPENLIST_TOKEN_OVERRIDE_MASK)
+        );
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        assert!(!serialized.contains("server-openlist-token"));
     }
 
     #[test]

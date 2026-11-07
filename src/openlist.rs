@@ -14,7 +14,6 @@ struct FsGetRequest<'a> {
 #[derive(Debug, Deserialize)]
 struct FsGetResponse {
     code: Option<i64>,
-    message: Option<String>,
     data: Option<FsGetData>,
 }
 
@@ -49,19 +48,22 @@ pub async fn fs_get(
         .await?;
 
     if !response.status().is_success() {
-        tracing::error!(status = %response.status(), path, "OpenList HTTP request failed");
-        return Ok(None);
+        let status = response.status();
+        // Do not log the requested path or response body: either can contain
+        // credentials when an upstream is misconfigured.
+        tracing::error!(%status, "OpenList HTTP request failed");
+        return Err(AppError::BadGateway(format!(
+            "OpenList HTTP request failed with status {status}"
+        )));
     }
 
     let data = response.json::<FsGetResponse>().await?;
     if data.code != Some(200) {
-        tracing::error!(
-            code = ?data.code,
-            message = ?data.message,
-            path,
-            "OpenList API returned failure"
-        );
-        return Ok(None);
+        let code = data.code.unwrap_or_default();
+        tracing::error!(code, "OpenList API returned failure");
+        return Err(AppError::BadGateway(format!(
+            "OpenList API returned failure code {code}"
+        )));
     }
 
     Ok(data.data.and_then(|data| data.raw_url))

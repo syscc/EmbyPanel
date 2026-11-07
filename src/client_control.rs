@@ -211,11 +211,21 @@ pub struct AddUserAgentRuleRequest {
     pub note: Option<String>,
 }
 
+fn require_global_client_control_write(context: &auth::AuthContext) -> AppResult<()> {
+    auth::require_super_admin_session(context)
+}
+
 pub async fn get_client_control(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<ClientControlConfig>> {
-    auth::require_auth(&state, &headers).await?;
+    let context = auth::require_auth_context(&state, &headers).await?;
+    auth::require_permission(&context, "settings.read")?;
+    if auth::allowed_server_ids(&context).is_some() {
+        return Err(AppError::Forbidden(
+            "global client control read requires unrestricted server access".to_string(),
+        ));
+    }
     Ok(Json(
         enrich_client_control_response(&state, load_or_default(&state)?).await,
     ))
@@ -226,7 +236,9 @@ pub async fn update_client_control(
     headers: HeaderMap,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<ClientControlConfig>> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let context = auth::require_auth_context(&state, &headers).await?;
+    require_global_client_control_write(&context)?;
+    let admin_user_id = context.user_id;
     let payload: UpdateClientControlRequest = state
         .crypto_keys
         .decrypt_named(&request, "client_control")?;
@@ -285,7 +297,9 @@ pub async fn add_user_agent_rule(
     headers: HeaderMap,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<ClientControlConfig>> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let context = auth::require_auth_context(&state, &headers).await?;
+    require_global_client_control_write(&context)?;
+    let admin_user_id = context.user_id;
     let payload: AddUserAgentRuleRequest =
         state.crypto_keys.decrypt_named(&request, "client_rule")?;
     let _updates = state.rate_limit_updates.lock().await;
@@ -345,7 +359,9 @@ pub async fn toggle_client_rule(
     headers: HeaderMap,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<ClientControlConfig>> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let context = auth::require_auth_context(&state, &headers).await?;
+    require_global_client_control_write(&context)?;
+    let admin_user_id = context.user_id;
     let payload: ToggleClientRuleRequest =
         state.crypto_keys.decrypt_named(&request, "client_rule")?;
     let _updates = state.rate_limit_updates.lock().await;
@@ -378,7 +394,9 @@ pub async fn delete_client_rule(
     headers: HeaderMap,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<ClientControlConfig>> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let context = auth::require_auth_context(&state, &headers).await?;
+    require_global_client_control_write(&context)?;
+    let admin_user_id = context.user_id;
     let payload: DeleteClientRuleRequest =
         state.crypto_keys.decrypt_named(&request, "client_rule")?;
     let _updates = state.rate_limit_updates.lock().await;
@@ -406,7 +424,9 @@ pub async fn unblock_rate_limit(
     headers: HeaderMap,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<ClientControlConfig>> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let context = auth::require_auth_context(&state, &headers).await?;
+    require_global_client_control_write(&context)?;
+    let admin_user_id = context.user_id;
     let payload: UnblockRateLimitRequest = state
         .crypto_keys
         .decrypt_named(&request, "rate_limit_block")?;
@@ -514,7 +534,8 @@ pub async fn rate_limit_status(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<Vec<PlaybackRateWindowStatus>>> {
-    auth::require_auth(&state, &headers).await?;
+    let context = auth::require_auth_context(&state, &headers).await?;
+    auth::require_permission(&context, "monitoring.read")?;
     let config = load_or_default(&state)?;
     let now = now_seconds();
     let window = config.playback_rate_limit_window_seconds.max(1);
@@ -527,6 +548,9 @@ pub async fn rate_limit_status(
             let Some((server_id, ip)) = key.split_once(':') else {
                 continue;
             };
+            if !auth::has_server_access(&context, server_id) {
+                continue;
+            }
             let active = timestamps
                 .iter()
                 .filter(|hit| now.saturating_sub(hit.timestamp) < window)
@@ -587,6 +611,9 @@ pub async fn rate_limit_status(
     }
     for record in blocks.iter() {
         let blocked_until = record.blocked_until.parse::<u64>().unwrap_or_default();
+        if !auth::has_server_access(&context, &record.server_id) {
+            continue;
+        }
         if !record.enabled || blocked_until <= now || record.ip.trim().is_empty() {
             continue;
         }
@@ -617,7 +644,9 @@ pub async fn test_webhook(
     headers: HeaderMap,
     Json(request): Json<EncryptedRequest>,
 ) -> AppResult<Json<WebhookTestResponse>> {
-    let admin_user_id = auth::require_auth_user_id(&state, &headers).await?;
+    let context = auth::require_auth_context(&state, &headers).await?;
+    require_global_client_control_write(&context)?;
+    let admin_user_id = context.user_id;
     let payload: WebhookTestRequest = state.crypto_keys.decrypt_named(&request, "webhook_test")?;
     let title = normalize_webhook_test_text(&payload.title, "EmbyPanel 通知测试");
     let text = normalize_webhook_test_text(&payload.text, "Webhook POST 测试成功");
@@ -2303,6 +2332,11 @@ mod tests {
             play_method: None,
             playback_mode: "unknown".to_string(),
             transcoding: false,
+            bitrate: None,
+            bandwidth: None,
+            transcode_reason: None,
+            application_version: None,
+            remote_endpoint: None,
         }
     }
 
@@ -2319,6 +2353,27 @@ mod tests {
             updated_at: "0".to_string(),
             note: String::new(),
         }
+    }
+
+    #[test]
+    fn global_client_management_rejects_tokens_even_for_super_admin() {
+        let mut context = auth::AuthContext {
+            user_id: 1,
+            kind: auth::AuthKind::ApiToken,
+            scopes: Some(vec!["settings.write".into()]),
+            server_ids: None,
+            role_keys: vec!["super_admin".into()],
+            permission_keys: vec![],
+            server_grants: vec![],
+        };
+        assert!(matches!(
+            require_global_client_control_write(&context),
+            Err(AppError::Forbidden(_))
+        ));
+        context.kind = auth::AuthKind::Session;
+        assert!(require_global_client_control_write(&context).is_ok());
+        context.role_keys = vec!["operator".into()];
+        assert!(require_global_client_control_write(&context).is_err());
     }
 
     #[test]

@@ -1,4 +1,19 @@
-import { Archive, Bell, FileText, LayoutDashboard, Server, UserRound, Users } from '@lucide/vue'
+import {
+  Archive,
+  Bell,
+  ChartNoAxesCombined,
+  Database,
+  FileText,
+  LayoutDashboard,
+  ListTodo,
+  Network,
+  Radio,
+  Server,
+  ShieldCheck,
+  TriangleAlert,
+  UserRound,
+  Users,
+} from '@lucide/vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 
 import { useRoute, useRouter } from 'vue-router'
@@ -20,6 +35,8 @@ import {
 import { translations } from '@/lib/translations'
 import type {
   Settings,
+  ServerOption,
+  ServerOptionsResponse,
   RealIpMode,
   EmbyServerConfig,
   AppInfo,
@@ -58,7 +75,23 @@ export function usePanelController() {
   const pageKey = 'embypanel_page'
   const themeKey = 'embypanel_theme'
   const localeKey = 'embypanel_locale'
-  const validPages: Page[] = ['home', 'server', 'clients', 'users', 'logs', 'notifications', 'backup', 'account']
+  const validPages: Page[] = [
+    'home',
+    'server',
+    'clients',
+    'users',
+    'logs',
+    'notifications',
+    'sessions',
+    'library-tasks',
+    'diagnostics',
+    'history',
+    'cache-management',
+    'alerts',
+    'admin-security',
+    'backup',
+    'account',
+  ]
   const mode = ref<AuthMode>('loading')
   const route = useRoute()
   const router = useRouter()
@@ -180,6 +213,12 @@ export function usePanelController() {
   let passwordChangeToken = ''
   let deferredAuthExpiredToken = ''
   let logoutInProgress = false
+  const serverOptions = ref<ServerOption[]>([])
+  const canControlSessions = ref(false)
+  let serverOptionsLoaded = false
+  let serverOptionsRequest: Promise<boolean> | undefined
+  let cancelServerOptionsRequest: (() => void) | undefined
+  let serverOptionsGeneration = 0
   let settingsLoaded = false
   let clientControlLoaded = false
   let logConfigLoaded = false
@@ -190,7 +229,12 @@ export function usePanelController() {
   const credentials = reactive({
     username: '',
     password: '',
+    totp_code: '',
+    recovery_code: '',
   })
+  const secondFactorRequired = ref(false)
+  const secondFactorMode = ref<'totp' | 'recovery'>('totp')
+  const adminSecondFactorRequiredMessage = 'second factor required'
 
   const logoUrl = `${import.meta.env.BASE_URL}logo.svg`
 
@@ -259,8 +303,7 @@ export function usePanelController() {
     promptAction,
     onImported(response) {
       resetResourceCache()
-      Object.assign(settings, response)
-      normalizeSettingsServers()
+      applySettingsResponse(response)
       settingsLoaded = true
     },
   })
@@ -272,6 +315,13 @@ export function usePanelController() {
     { id: 'users' as const, label: '用户', icon: UserRound },
     { id: 'logs' as const, label: '日志', icon: FileText },
     { id: 'notifications' as const, label: '通知', icon: Bell },
+    { id: 'sessions' as const, label: '实时会话', icon: Radio },
+    { id: 'library-tasks' as const, label: '媒体库与任务', icon: ListTodo },
+    { id: 'diagnostics' as const, label: '链路诊断', icon: Network },
+    { id: 'history' as const, label: '历史分析', icon: ChartNoAxesCombined },
+    { id: 'cache-management' as const, label: '缓存管理', icon: Database },
+    { id: 'alerts' as const, label: '告警规则', icon: TriangleAlert },
+    { id: 'admin-security' as const, label: '管理员与安全', icon: ShieldCheck },
     { id: 'backup' as const, label: '备份', icon: Archive },
     { id: 'account' as const, label: '账户', icon: UserRound },
   ]
@@ -643,22 +693,51 @@ export function usePanelController() {
     await authenticate('/api/login')
   }
 
+  function selectSecondFactorMode(mode: 'totp' | 'recovery') {
+    secondFactorMode.value = mode
+    if (mode === 'totp') credentials.recovery_code = ''
+    else credentials.totp_code = ''
+    error.value = ''
+  }
+
   async function authenticate(path: string) {
     if (saving.value) return
     saving.value = true
     error.value = ''
+    const payload = path === '/api/login'
+      ? {
+          username: credentials.username,
+          password: credentials.password,
+          ...(credentials.totp_code.trim() ? { totp_code: credentials.totp_code.trim() } : {}),
+          ...(credentials.recovery_code.trim() ? { recovery_code: credentials.recovery_code.trim() } : {}),
+        }
+      : {
+          username: credentials.username,
+          password: credentials.password,
+        }
     try {
       const response = await api<{ token: string }>(path, {
         method: 'POST',
-        body: JSON.stringify(await encryptPayload('credentials', { ...credentials })),
+        body: JSON.stringify(await encryptPayload('credentials', payload)),
       })
+      secondFactorRequired.value = false
+      secondFactorMode.value = 'totp'
       token.value = response.token
       storeToken(token.value)
-      credentials.password = ''
       await loadAppData()
     } catch (err) {
-      error.value = err instanceof Error ? err.message : String(err)
+      const message = err instanceof Error ? err.message.trim() : String(err).trim()
+      if (path === '/api/login' && message === adminSecondFactorRequiredMessage) {
+        secondFactorRequired.value = true
+        secondFactorMode.value = 'totp'
+        error.value = t('需要二次认证，请重新输入密码和验证码')
+      } else {
+        error.value = err instanceof Error ? err.message : String(err)
+      }
     } finally {
+      credentials.password = ''
+      credentials.totp_code = ''
+      credentials.recovery_code = ''
       saving.value = false
     }
   }
@@ -669,6 +748,7 @@ export function usePanelController() {
     persistedServerIds = new Set()
     passwordChangeToken = ''
     deferredAuthExpiredToken = ''
+    invalidateServerOptions()
     settingsLoaded = false
     clientControlLoaded = false
     logConfigLoaded = false
@@ -691,6 +771,84 @@ export function usePanelController() {
     await activatePage(page.value)
   }
 
+  function applySettingsResponse(response: Settings, refreshOptions = true) {
+    Object.assign(settings, response)
+    normalizeSettingsServers()
+    if (!refreshOptions) return
+    invalidateServerOptions()
+    if (mode.value === 'app' && ['history', 'admin-security', 'sessions', 'library-tasks', 'cache-management'].includes(page.value)) {
+      const generation = serverOptionsGeneration
+      const requestSession = dataSession
+      void ensureServerOptions().catch((err) => {
+        if (generation !== serverOptionsGeneration || requestSession !== dataSession || !token.value) return
+        error.value = err instanceof Error ? err.message : String(err)
+      })
+    }
+  }
+
+  function invalidateServerOptions() {
+    serverOptionsGeneration += 1
+    serverOptionsLoaded = false
+    cancelServerOptionsRequest?.()
+    cancelServerOptionsRequest = undefined
+    serverOptionsRequest = undefined
+    serverOptions.value = []
+    canControlSessions.value = false
+  }
+
+  async function loadServerOptions(): Promise<boolean> {
+    if (serverOptionsRequest) return serverOptionsRequest
+    const requestSession = dataSession
+    const generation = serverOptionsGeneration
+    let cancelRequest!: () => void
+    const invalidated = new Promise<boolean>((resolve) => { cancelRequest = () => resolve(false) })
+    cancelServerOptionsRequest = cancelRequest
+    const request = Promise.race([(async () => {
+      const response = await api<ServerOptionsResponse>('/api/servers/options')
+      if (requestSession !== dataSession || generation !== serverOptionsGeneration || !token.value) return false
+      serverOptions.value = response.servers
+      canControlSessions.value = response.can_control_sessions === true
+      serverOptionsLoaded = true
+      return true
+    })(), invalidated])
+    serverOptionsRequest = request
+    try {
+      return await request
+    } finally {
+      if (serverOptionsRequest === request) {
+        serverOptionsRequest = undefined
+        cancelServerOptionsRequest = undefined
+      }
+    }
+  }
+
+  async function ensureServerOptions(): Promise<boolean> {
+    if (serverOptionsLoaded) return true
+    return loadServerOptions()
+  }
+
+  async function refreshServerOptions(activation?: number, activationPage?: Page) {
+    invalidateServerOptions()
+    const generation = serverOptionsGeneration
+    const requestSession = dataSession
+    const loaded = await loadServerOptions()
+    if (loaded && generation === serverOptionsGeneration && requestSession === dataSession && token.value) return true
+    if (
+      activation === undefined || activation !== pageActivation || activationPage !== page.value ||
+      requestSession !== dataSession || !token.value || mode.value !== 'app'
+    ) return false
+
+    // A same-session settings response may supersede this request while the page
+    // activation is waiting. Join replacement requests instead of ending loading.
+    while (
+      activation === pageActivation && activationPage === page.value &&
+      requestSession === dataSession && token.value && mode.value === 'app'
+    ) {
+      if (await ensureServerOptions()) return true
+    }
+    return false
+  }
+
   async function ensureSettings() {
     if (settingsLoaded) return
     if (settingsRequest) return settingsRequest
@@ -698,8 +856,7 @@ export function usePanelController() {
     const request = (async () => {
       const response = await api<Settings>('/api/settings')
       if (requestSession !== dataSession || !token.value) return
-      Object.assign(settings, response)
-      normalizeSettingsServers()
+      applySettingsResponse(response, false)
       settingsLoaded = true
     })()
     settingsRequest = request
@@ -744,7 +901,7 @@ export function usePanelController() {
     }
   }
 
-  async function loadPageData(nextPage: Page) {
+  async function loadPageData(nextPage: Page, activation?: number) {
     switch (nextPage) {
       case 'home':
         await ensureSettings()
@@ -758,6 +915,12 @@ export function usePanelController() {
         await Promise.all([ensureSettings(), ensureClientControl()])
         await refreshRateLimitStatus()
         break
+      case 'history':
+      case 'admin-security':
+      case 'sessions':
+      case 'library-tasks':
+      case 'cache-management':
+        return refreshServerOptions(activation, nextPage)
       case 'users':
         break
       case 'notifications':
@@ -784,8 +947,7 @@ export function usePanelController() {
     stopPagePolling()
     let loaded = false
     try {
-      await loadPageData(nextPage)
-      loaded = true
+      loaded = (await loadPageData(nextPage, activation)) !== false
     } catch (err) {
       if (activation === pageActivation) {
         error.value = err instanceof Error ? err.message : String(err)
@@ -922,8 +1084,7 @@ export function usePanelController() {
         method: 'PUT',
         body: JSON.stringify(await encryptPayload('settings', payload)),
       })
-      Object.assign(settings, response)
-      normalizeSettingsServers()
+      applySettingsResponse(response)
       settingsLoaded = true
       showNotice(t('服务器配置已保存，反代监听器已差量同步'))
       await refreshProxyStatuses()
@@ -1018,8 +1179,7 @@ export function usePanelController() {
         method: 'POST',
         body: JSON.stringify({ server_id: server.id }),
       })
-      Object.assign(settings, response)
-      normalizeSettingsServers()
+      applySettingsResponse(response)
       settingsLoaded = true
       await refreshProxyStatuses()
       showNotice(`${server.name || t('服务器')} ${t('反代服务已重启')}`)
@@ -1040,8 +1200,7 @@ export function usePanelController() {
         method: 'POST',
         body: JSON.stringify({ server_id: server.id, enabled: nextEnabled }),
       })
-      Object.assign(settings, response)
-      normalizeSettingsServers()
+      applySettingsResponse(response)
       settingsLoaded = true
       showNotice(`${server.name || t('服务器')} ${nextEnabled ? t('已开启') : t('已关闭')}`)
       await refreshProxyStatuses()
@@ -1061,9 +1220,32 @@ export function usePanelController() {
         emby_api_key: server.emby_api_key.trim(),
         port: Number(server.port),
         block_web_ui: Boolean(server.block_web_ui),
+        block_web_ui_status_code: Number(server.block_web_ui_status_code) || 403,
+        block_web_ui_message: server.block_web_ui_message?.trim() ?? '',
         real_ip_mode: server.real_ip_mode || 'auto',
         real_ip_header: server.real_ip_header.trim(),
         trusted_proxy_cidrs: server.trusted_proxy_cidrs.trim(),
+        openlist_addr_override: server.openlist_addr_override == null
+          ? server.openlist_addr_override
+          : server.openlist_addr_override.trim(),
+        // Undefined means the API did not reveal an existing secret; preserve that
+        // omission so the backend can retain it instead of treating it as a clear.
+        ...(server.openlist_token_override === undefined
+          ? {}
+          : {
+              openlist_token_override: server.openlist_token_override == null
+                ? server.openlist_token_override
+                : server.openlist_token_override.trim(),
+            }),
+        strm_url_mappings_override: server.strm_url_mappings_override == null
+          ? server.strm_url_mappings_override
+          : server.strm_url_mappings_override.trim(),
+        cache_domain_filter_mode_override: server.cache_domain_filter_mode_override == null
+          ? server.cache_domain_filter_mode_override
+          : server.cache_domain_filter_mode_override.trim(),
+        cache_domain_whitelist_override: server.cache_domain_whitelist_override == null
+          ? server.cache_domain_whitelist_override
+          : server.cache_domain_whitelist_override.trim(),
       }))
     const incompleteServer = servers.find(
       (server) =>
@@ -1091,9 +1273,54 @@ export function usePanelController() {
     settings.servers = settings.servers.map((server) => ({
       ...server,
       block_web_ui: Boolean(server.block_web_ui),
+      block_web_ui_status_code: Number(server.block_web_ui_status_code) || 403,
+      block_web_ui_message: server.block_web_ui_message ?? 'Emby Web UI is disabled by EmbyPanel',
       real_ip_mode: server.real_ip_mode || 'auto',
       real_ip_header: server.real_ip_header || '',
       trusted_proxy_cidrs: server.trusted_proxy_cidrs || '',
+      openlist_addr_override: server.openlist_addr_override === undefined
+        ? null
+        : server.openlist_addr_override,
+      openlist_token_override_configured: Boolean(server.openlist_token_override_configured),
+      strm_url_mappings_override: server.strm_url_mappings_override === undefined
+        ? null
+        : server.strm_url_mappings_override,
+      strm_url_mapping_enabled_override: server.strm_url_mapping_enabled_override === undefined
+        ? null
+        : server.strm_url_mapping_enabled_override,
+      cache_ttl_seconds_override: server.cache_ttl_seconds_override === undefined
+        ? null
+        : server.cache_ttl_seconds_override,
+      cache_max_capacity_override: server.cache_max_capacity_override === undefined
+        ? null
+        : server.cache_max_capacity_override,
+      cache_enabled_override: server.cache_enabled_override === undefined
+        ? null
+        : server.cache_enabled_override,
+      cache_domain_filter_mode_override: server.cache_domain_filter_mode_override === undefined
+        ? null
+        : server.cache_domain_filter_mode_override,
+      cache_domain_whitelist_override: server.cache_domain_whitelist_override === undefined
+        ? null
+        : server.cache_domain_whitelist_override,
+      enable_internal_redirect_override: server.enable_internal_redirect_override === undefined
+        ? null
+        : server.enable_internal_redirect_override,
+      internal_redirect_timeout_seconds_override: server.internal_redirect_timeout_seconds_override === undefined
+        ? null
+        : server.internal_redirect_timeout_seconds_override,
+      connectivity_check_enabled_override: server.connectivity_check_enabled_override === undefined
+        ? null
+        : server.connectivity_check_enabled_override,
+      connectivity_check_interval_seconds_override: server.connectivity_check_interval_seconds_override === undefined
+        ? null
+        : server.connectivity_check_interval_seconds_override,
+      connectivity_check_timeout_seconds_override: server.connectivity_check_timeout_seconds_override === undefined
+        ? null
+        : server.connectivity_check_timeout_seconds_override,
+      connectivity_auto_restart_seconds_override: server.connectivity_auto_restart_seconds_override === undefined
+        ? null
+        : server.connectivity_auto_restart_seconds_override,
     }))
     persistedServerIds = new Set(settings.servers.map((server) => server.id))
   }
@@ -1112,9 +1339,27 @@ export function usePanelController() {
       port,
       enabled: true,
       block_web_ui: false,
+      block_web_ui_status_code: 403,
+      block_web_ui_message: 'Emby Web UI is disabled by EmbyPanel',
       real_ip_mode: 'auto',
       real_ip_header: '',
       trusted_proxy_cidrs: '',
+      openlist_addr_override: null,
+      openlist_token_override: null,
+      openlist_token_override_configured: false,
+      strm_url_mappings_override: null,
+      strm_url_mapping_enabled_override: null,
+      cache_ttl_seconds_override: null,
+      cache_max_capacity_override: null,
+      cache_enabled_override: null,
+      cache_domain_filter_mode_override: null,
+      cache_domain_whitelist_override: null,
+      enable_internal_redirect_override: null,
+      internal_redirect_timeout_seconds_override: null,
+      connectivity_check_enabled_override: null,
+      connectivity_check_interval_seconds_override: null,
+      connectivity_check_timeout_seconds_override: null,
+      connectivity_auto_restart_seconds_override: null,
     }
   }
 
@@ -1977,6 +2222,8 @@ export function usePanelController() {
 
   function clearPasswordFields() {
     credentials.password = ''
+    credentials.totp_code = ''
+    credentials.recovery_code = ''
     passwordForm.current_password = ''
     passwordForm.new_password = ''
     passwordForm.confirm_password = ''
@@ -2104,6 +2351,8 @@ export function usePanelController() {
     error,
     notice,
     credentials,
+    secondFactorRequired,
+    secondFactorMode,
     logoUrl,
     profile,
     appInfo,
@@ -2123,12 +2372,18 @@ export function usePanelController() {
     toggleTheme,
     setupAdmin,
     login,
+    selectSecondFactorMode,
     refreshUpdateCheck,
     setPage,
     retryPage,
     logout,
     api,
     encryptPayload,
+    serverOptions,
+    canControlSessions,
+    loadServerOptions,
+    ensureServerOptions,
+    refreshServerOptions,
     profileForm,
     savingAccount,
     passwordForm,

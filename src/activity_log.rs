@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
@@ -165,6 +165,14 @@ impl ActivityLogStore {
     }
 
     pub fn list_filtered(&self, filter: ActivityLogFilter<'_>) -> Vec<ActivityLogEntry> {
+        self.list_filtered_scoped(filter, None)
+    }
+
+    pub fn list_filtered_scoped(
+        &self,
+        filter: ActivityLogFilter<'_>,
+        allowed_servers: Option<&HashSet<String>>,
+    ) -> Vec<ActivityLogEntry> {
         let keyword = filter.keyword.map(str::to_ascii_lowercase);
         let level = filter.level.filter(|value| *value != "all");
         let entries = self.entries.lock().expect("activity log mutex poisoned");
@@ -172,7 +180,12 @@ impl ActivityLogStore {
             .iter()
             .rev()
             .filter(|entry| {
-                filter
+                allowed_servers.is_none_or(|allowed| {
+                    entry
+                        .server_id
+                        .as_ref()
+                        .is_none_or(|id| allowed.contains(id))
+                }) && filter
                     .server_id
                     .is_none_or(|server_id| entry.server_id.as_deref() == Some(server_id))
                     && filter.kind.is_none_or(|kind| entry.kind == kind.as_str())
@@ -213,6 +226,52 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_logs_apply_grants_before_limit_and_keep_global_entries() {
+        let store = ActivityLogStore::new(20);
+        for id in [Some("a"), None, Some("b"), Some("b")] {
+            store.record(
+                ActivityKind::General,
+                ActivityLevel::Info,
+                id,
+                "server",
+                "entry",
+                "",
+            );
+        }
+        let filter = || ActivityLogFilter {
+            server_id: None,
+            kind: None,
+            level: None,
+            keyword: None,
+            since_ms: None,
+            until_ms: None,
+            limit: 2,
+        };
+        let allowed = HashSet::from(["a".to_string()]);
+        let rows = store.list_filtered_scoped(filter(), Some(&allowed));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].server_id, None);
+        assert_eq!(rows[1].server_id.as_deref(), Some("a"));
+        let empty = HashSet::new();
+        let global = store.list_filtered_scoped(filter(), Some(&empty));
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].server_id, None);
+        assert!(
+            store
+                .list_filtered(filter())
+                .iter()
+                .all(|row| row.server_id.as_deref() == Some("b"))
+        );
+        let mut explicit = filter();
+        explicit.server_id = Some("b");
+        assert!(
+            store
+                .list_filtered_scoped(explicit, Some(&allowed))
+                .is_empty()
+        );
+    }
 
     #[test]
     fn keeps_latest_entries_with_filters() {

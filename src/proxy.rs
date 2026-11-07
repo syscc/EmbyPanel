@@ -1,4 +1,8 @@
-use std::{collections::HashSet, net::IpAddr, time::Duration};
+use std::{
+    collections::HashSet,
+    net::IpAddr,
+    time::{Duration, Instant},
+};
 
 use axum::{
     body::Body,
@@ -10,11 +14,13 @@ use bytes::Bytes;
 use crate::{
     auth,
     config::Config,
+    diagnostics::{self, DiagnosisStep},
     error::{AppError, AppResult},
     rewrite,
 };
 
 const UPSTREAM_RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_PROXY_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_X_FORWARDED_FOR_ENTRIES: usize = 16;
 const FORWARDED_IP_HEADERS: &[&str] = &[
     "x-forwarded-for",
@@ -68,10 +74,28 @@ pub async fn proxy_text(
     body: Bytes,
     peer_ip: IpAddr,
 ) -> AppResult<(StatusCode, HeaderMap, String)> {
-    let response = proxy_to_reqwest(client, config, method, uri, headers, body, peer_ip).await?;
+    let mut response =
+        proxy_to_reqwest(client, config, method, uri, headers, body, peer_ip).await?;
     let status = rewrite::status_from_reqwest(response.status());
     let headers = copy_response_headers(response.headers(), false);
-    let text = response.text().await?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROXY_TEXT_BYTES as u64)
+    {
+        return Err(AppError::BadGateway(
+            "Emby text response exceeds size limit".to_string(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(AppError::from)? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_PROXY_TEXT_BYTES {
+            return Err(AppError::BadGateway(
+                "Emby text response exceeds size limit".to_string(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
     Ok((status, headers, text))
 }
 
@@ -410,9 +434,279 @@ fn should_copy_response_header(
             || !matches!(name.as_str(), "content-length" | "content-encoding"))
 }
 
+/// Fixed playback-chain step names in real execution order.
+pub(crate) const STEP_EMBY_PATH: &str = "Emby Path";
+pub(crate) const STEP_MAPPING: &str = "映射";
+pub(crate) const STEP_OPENLIST: &str = "OpenList";
+pub(crate) const STEP_RAW_URL: &str = "raw_url";
+pub(crate) const STEP_CACHE: &str = "缓存";
+pub(crate) const STEP_REDIRECT: &str = "302";
+
+/// A step that is currently waiting on an async operation. Keeping this state in the
+/// trace makes cancellation observable even though `Drop` cannot await.
+struct ActiveDiagnosisStep {
+    name: String,
+    started: Instant,
+    details: String,
+}
+
+/// Builds at most one DiagnosisRecord from real media-resolution branches.
+///
+/// Production code in `handle_video_stream` starts a step immediately before each
+/// fallible/awaited operation and completes it only after the operation returns.
+/// If the request future is cancelled, `Drop` emits a sanitized cancellation record
+/// synchronously, so no in-flight node disappears from the trace.
+pub(crate) struct PlaybackDiagnosisTrace {
+    server_id: String,
+    media_id: String,
+    ua: String,
+    steps: Vec<DiagnosisStep>,
+    cache_hit: bool,
+    failure_node: Option<String>,
+    active_step: Option<ActiveDiagnosisStep>,
+    cache_duration_ms: u64,
+    cache_pending: bool,
+    finished: bool,
+}
+
+impl PlaybackDiagnosisTrace {
+    pub(crate) fn new(server_id: &str, media_id: &str, ua: &str) -> Self {
+        Self {
+            server_id: server_id.to_string(),
+            media_id: media_id.to_string(),
+            ua: ua.to_string(),
+            steps: Vec::with_capacity(6),
+            cache_hit: false,
+            failure_node: None,
+            active_step: None,
+            cache_duration_ms: 0,
+            cache_pending: false,
+            finished: false,
+        }
+    }
+
+    /// Start a real operation. If the future is cancelled before completion, this
+    /// is the node that `Drop` marks as cancelled.
+    pub(crate) fn begin_step(&mut self, name: &str, details: &str) {
+        if self.finished || self.failure_node.is_some() {
+            return;
+        }
+        self.active_step = Some(ActiveDiagnosisStep {
+            name: name.to_string(),
+            started: Instant::now(),
+            details: details.to_string(),
+        });
+    }
+
+    /// Complete the currently active operation. Cache operations are accumulated
+    /// into one logical cache node so the public order stays Emby → mapping →
+    /// OpenList → raw_url → cache → 302 even when cache lookup happens first.
+    pub(crate) fn complete_step(&mut self, details: &str) {
+        let Some(active) = self.active_step.take() else {
+            return;
+        };
+        let duration_ms = active.started.elapsed().as_millis() as u64;
+        if active.name == STEP_CACHE {
+            self.cache_duration_ms = self.cache_duration_ms.saturating_add(duration_ms);
+            self.cache_pending = true;
+        } else {
+            self.steps.push(DiagnosisStep {
+                name: active.name,
+                duration_ms,
+                details: details.to_string(),
+            });
+        }
+    }
+
+    /// Record a non-failure step with real wall-clock duration from `started`.
+    /// No-ops after the first failure or after finish (prevents forged later success).
+    pub(crate) fn push_step(&mut self, name: &str, started: Instant, details: &str) {
+        if self.finished || self.failure_node.is_some() {
+            return;
+        }
+        self.steps.push(DiagnosisStep {
+            name: name.to_string(),
+            duration_ms: started.elapsed().as_millis() as u64,
+            details: details.to_string(),
+        });
+    }
+
+    /// Mark remaining named nodes as bypassed (near-zero duration).
+    pub(crate) fn bypass_steps(&mut self, names: &[&str]) {
+        for name in names {
+            self.push_step(name, Instant::now(), "bypassed");
+        }
+    }
+
+    /// Append the deferred logical cache node after raw URL resolution.
+    pub(crate) fn append_cache_step(&mut self, details: &str) {
+        if self.finished || self.failure_node.is_some() || !self.cache_pending {
+            return;
+        }
+        self.steps.push(DiagnosisStep {
+            name: STEP_CACHE.to_string(),
+            duration_ms: self.cache_duration_ms,
+            details: details.to_string(),
+        });
+        self.cache_pending = false;
+    }
+
+    /// Record the first failure node. Subsequent push/fail calls are ignored.
+    pub(crate) fn fail_step(&mut self, name: &str, started: Instant, details: &str) {
+        if self.finished || self.failure_node.is_some() {
+            return;
+        }
+        let active_started = self
+            .active_step
+            .take()
+            .filter(|active| active.name == name)
+            .map(|active| active.started);
+        let duration_ms = if name == STEP_CACHE {
+            self.cache_pending = false;
+            self.cache_duration_ms
+                .saturating_add(active_started.unwrap_or(started).elapsed().as_millis() as u64)
+        } else {
+            active_started.unwrap_or(started).elapsed().as_millis() as u64
+        };
+        self.steps.push(DiagnosisStep {
+            name: name.to_string(),
+            duration_ms,
+            details: details.to_string(),
+        });
+        self.failure_node = Some(name.to_string());
+    }
+
+    pub(crate) fn set_cache_hit(&mut self, hit: bool) {
+        if !self.finished && self.failure_node.is_none() {
+            self.cache_hit = hit;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn step_names(&self) -> Vec<&str> {
+        self.steps.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failure_node(&self) -> Option<&str> {
+        self.failure_node.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_hit(&self) -> bool {
+        self.cache_hit
+    }
+
+    #[cfg(test)]
+    pub(crate) fn steps(&self) -> &[DiagnosisStep] {
+        &self.steps
+    }
+
+    /// Emit one record via the shared collector. Safe to call once; extra calls no-op.
+    pub(crate) async fn finish(mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        record_playback_diagnosis(
+            &self.server_id,
+            &self.media_id,
+            &self.ua,
+            std::mem::take(&mut self.steps),
+            self.cache_hit,
+            self.failure_node.take(),
+        )
+        .await;
+    }
+}
+
+impl Drop for PlaybackDiagnosisTrace {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if let Some(active) = self.active_step.take() {
+            let duration_ms = if active.name == STEP_CACHE {
+                self.cache_pending = false;
+                self.cache_duration_ms
+                    .saturating_add(active.started.elapsed().as_millis() as u64)
+            } else {
+                active.started.elapsed().as_millis() as u64
+            };
+            let name = active.name;
+            self.steps.push(DiagnosisStep {
+                name: name.clone(),
+                duration_ms,
+                details: format!("cancelled: {}", active.details),
+            });
+            self.failure_node = Some(name);
+        } else if self.failure_node.is_none() {
+            // A trace created immediately before an unexpected cancellation still
+            // produces a useful, sanitized record instead of disappearing.
+            self.steps.push(DiagnosisStep {
+                name: STEP_EMBY_PATH.to_string(),
+                duration_ms: 0,
+                details: "cancelled before step started".to_string(),
+            });
+            self.failure_node = Some(STEP_EMBY_PATH.to_string());
+        }
+        self.finished = true;
+        let steps = std::mem::take(&mut self.steps);
+        record_playback_diagnosis_sync(
+            &self.server_id,
+            &self.media_id,
+            &self.ua,
+            steps,
+            self.cache_hit,
+            self.failure_node.take(),
+        );
+    }
+}
+
+/// Records at most one DiagnosisRecord for an eligible media request.
+/// Empty server/media identity is silent. Collector failures are ignored.
+pub(crate) async fn record_playback_diagnosis(
+    server_id: &str,
+    media_id: &str,
+    ua: &str,
+    steps: Vec<DiagnosisStep>,
+    cache_hit: bool,
+    failure_node: Option<String>,
+) {
+    record_playback_diagnosis_sync(server_id, media_id, ua, steps, cache_hit, failure_node);
+}
+
+fn record_playback_diagnosis_sync(
+    server_id: &str,
+    media_id: &str,
+    ua: &str,
+    steps: Vec<DiagnosisStep>,
+    cache_hit: bool,
+    failure_node: Option<String>,
+) {
+    if server_id.trim().is_empty() || media_id.trim().is_empty() {
+        return;
+    }
+    let record = diagnostics::create_diagnosis_record(
+        server_id,
+        media_id,
+        ua,
+        steps,
+        cache_hit,
+        failure_node,
+    );
+    diagnostics::record_diagnosis_now(record);
+}
+
 #[cfg(test)]
 mod tests {
+    use axum::body::HttpBody;
     use reqwest::header::{HeaderMap as ReqwestHeaderMap, HeaderValue as ReqwestHeaderValue};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        task::JoinHandle,
+    };
 
     use crate::config::EmbyServerConfig;
 
@@ -430,10 +724,13 @@ mod tests {
                 port: 18096,
                 enabled: true,
                 block_web_ui: false,
+                block_web_ui_status_code: 403,
+                block_web_ui_message: "Emby Web UI is disabled by EmbyPanel".to_string(),
                 real_ip_mode: real_ip_mode.to_string(),
                 real_ip_header: real_ip_header.to_string(),
                 trusted_proxy_cidrs: "192.0.2.0/24".to_string(),
                 trusted_proxy_networks: vec!["192.0.2.0/24".parse().unwrap()],
+                ..EmbyServerConfig::default()
             }],
             openlist_addr: None,
             openlist_token: None,
@@ -454,6 +751,223 @@ mod tests {
             connectivity_auto_restart_seconds: 180,
             strm_url_mapping_rules: Vec::new(),
         }
+    }
+
+    async fn mock_upstream<F, Fut>(respond: F) -> (Config, reqwest::Client, JoinHandle<()>)
+    where
+        F: FnOnce(TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config("auto", "");
+        config.emby_host = format!("http://{}", listener.local_addr().unwrap());
+        config.servers[0].emby_host = config.emby_host.clone();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let task = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let byte = socket.read_u8().await.unwrap();
+                    request.push(byte);
+                    assert!(request.len() <= 8192);
+                }
+                respond(socket).await;
+            })
+            .await
+            .expect("local upstream timed out");
+        });
+        (config, client, task)
+    }
+
+    async fn request_mock_text(
+        config: &Config,
+        client: &reqwest::Client,
+    ) -> AppResult<(StatusCode, HeaderMap, String)> {
+        proxy_text(
+            client,
+            config,
+            Method::GET,
+            &"/Items?api_key=mock-secret".parse().unwrap(),
+            &HeaderMap::new(),
+            Bytes::new(),
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn proxy_text_reads_normal_text_and_preserves_status_and_headers() {
+        let expected = "{\"Name\":\"中文\"}";
+        let (config, client, task) = mock_upstream(move |mut socket| async move {
+            let response = format!(
+                "HTTP/1.1 201 Created\r\nContent-Length: {}\r\nContent-Type: application/json\r\nX-Mock: yes\r\nConnection: close\r\n\r\n{expected}",
+                expected.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        })
+        .await;
+
+        let (status, headers, text) = request_mock_text(&config, &client).await.unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(text, expected);
+        assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+        assert_eq!(headers["x-mock"], "yes");
+        assert!(!headers.contains_key(header::CONTENT_LENGTH));
+        assert!(!headers.contains_key(header::CONNECTION));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_text_preserves_lossy_utf8_and_multibyte_chunk_boundaries() {
+        let (config, client, task) = mock_upstream(|mut socket| async move {
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\n\xe4\r\n2\r\n\xb8\xad\r\n1\r\n\xff\r\n0\r\n\r\n")
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let (_, _, text) = request_mock_text(&config, &client).await.unwrap();
+        assert_eq!(text, "中\u{fffd}");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_text_rejects_declared_length_above_limit_without_reading_body() {
+        let (config, client, task) = mock_upstream(|mut socket| async move {
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                MAX_PROXY_TEXT_BYTES + 1
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            // No body is sent: rejection must occur from the headers alone.
+            assert_eq!(socket.read(&mut [0; 1]).await.unwrap(), 0);
+        })
+        .await;
+
+        let error = request_mock_text(&config, &client).await.unwrap_err();
+        assert!(matches!(error, AppError::BadGateway(_)));
+        assert_eq!(
+            error.safe_log_message(),
+            "Emby text response exceeds size limit"
+        );
+        assert_eq!(error.into_response().status(), StatusCode::BAD_GATEWAY);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_text_accepts_exact_limit() {
+        let (config, client, task) = mock_upstream(|mut socket| async move {
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                MAX_PROXY_TEXT_BYTES
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            let chunk = vec![b'x'; 64 * 1024];
+            for _ in 0..MAX_PROXY_TEXT_BYTES / chunk.len() {
+                socket.write_all(&chunk).await.unwrap();
+            }
+        })
+        .await;
+
+        let (_, _, text) = request_mock_text(&config, &client).await.unwrap();
+        assert_eq!(text.len(), MAX_PROXY_TEXT_BYTES);
+        assert!(text.bytes().all(|byte| byte == b'x'));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_text_rejects_chunked_body_above_limit_before_end_of_stream() {
+        let (config, client, task) = mock_upstream(|mut socket| async move {
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .unwrap();
+            let chunk = vec![b'x'; 64 * 1024];
+            for _ in 0..MAX_PROXY_TEXT_BYTES / chunk.len() {
+                socket.write_all(b"10000\r\n").await.unwrap();
+                socket.write_all(&chunk).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+            }
+            socket.write_all(b"1\r\nx\r\n").await.unwrap();
+            // Leave the stream unfinished to verify prompt rejection and cancellation.
+            assert_eq!(socket.read(&mut [0; 1]).await.unwrap(), 0);
+        })
+        .await;
+
+        let error = request_mock_text(&config, &client).await.unwrap_err();
+        assert!(matches!(error, AppError::BadGateway(_)));
+        assert_eq!(
+            error.safe_log_message(),
+            "Emby text response exceeds size limit"
+        );
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_text_body_read_error_uses_safe_messages() {
+        let (config, client, task) = mock_upstream(|mut socket| async move {
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort")
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let error = request_mock_text(&config, &client).await.unwrap_err();
+        assert!(matches!(error, AppError::Http(_)));
+        assert!(!error.safe_log_message().contains("mock-secret"));
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"bad gateway");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn media_response_streams_first_chunk_and_cancels_upstream_on_drop() {
+        let (config, client, task) = mock_upstream(|mut socket| async move {
+            socket
+                .write_all(b"HTTP/1.1 206 Partial Content\r\nTransfer-Encoding: chunked\r\nContent-Type: video/mp4\r\nContent-Range: bytes 0-9/10\r\n\r\n5\r\nfirst\r\n")
+                .await
+                .unwrap();
+            assert_eq!(socket.read(&mut [0; 1]).await.unwrap(), 0);
+        })
+        .await;
+
+        let response = proxy_to_emby(
+            &client,
+            &config,
+            Method::GET,
+            &"/Videos/mock/stream".parse().unwrap(),
+            &HeaderMap::new(),
+            Bytes::new(),
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 0-9/10");
+        let mut body = Box::pin(response.into_body());
+        let frame = tokio::time::timeout(
+            Duration::from_secs(2),
+            std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)),
+        )
+        .await
+        .expect("first media chunk should arrive before the body completes")
+        .unwrap()
+        .unwrap();
+        assert_eq!(frame.into_data().unwrap().as_ref(), b"first");
+        drop(body);
+        task.await.unwrap();
     }
 
     #[test]
@@ -727,5 +1241,511 @@ mod tests {
         assert_eq!(copied[header::CONTENT_RANGE], "bytes 0-41/100");
         assert!(!copied.contains_key(header::CONNECTION));
         assert!(!copied.contains_key("x-remove-me"));
+    }
+    #[tokio::test]
+    async fn playback_trace_success_chain_order_cache_hit_and_redirect() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+
+        let mut trace = PlaybackDiagnosisTrace::new("server-1", "item-42", "TestPlayer/1.0");
+        let t0 = Instant::now();
+        // Cache short-circuit: earlier nodes bypassed, cache hit, 302 redirect.
+        trace.bypass_steps(&[STEP_EMBY_PATH, STEP_MAPPING, STEP_OPENLIST, STEP_RAW_URL]);
+        trace.push_step(STEP_CACHE, t0, "hit");
+        trace.set_cache_hit(true);
+        trace.push_step(STEP_REDIRECT, Instant::now(), "redirect");
+        assert!(trace.cache_hit());
+        assert!(trace.failure_node().is_none());
+        assert_eq!(
+            trace.step_names(),
+            vec![
+                STEP_EMBY_PATH,
+                STEP_MAPPING,
+                STEP_OPENLIST,
+                STEP_RAW_URL,
+                STEP_CACHE,
+                STEP_REDIRECT,
+            ]
+        );
+        for step in trace.steps() {
+            assert!(
+                step.duration_ms < 10_000,
+                "duration unbounded: {}",
+                step.duration_ms
+            );
+        }
+        trace.finish().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let records = diagnostics::get_diagnosis_records();
+        let r = records
+            .iter()
+            .find(|r| r.media_id == "item-42")
+            .expect("expected diagnosis for item-42");
+        assert_eq!(r.server_id, "server-1");
+        assert!(r.cache_hit);
+        assert!(r.failure_node.is_none());
+        assert_eq!(r.steps.len(), 6);
+        assert_eq!(r.steps[4].details, "hit");
+        assert_eq!(r.steps[5].details, "redirect");
+        // Single finish → single record for this media id.
+        assert_eq!(
+            records.iter().filter(|r| r.media_id == "item-42").count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn playback_trace_first_failure_blocks_later_success_and_sets_node() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+
+        let mut trace = PlaybackDiagnosisTrace::new("server-1", "item-map-fail", "UA");
+        trace.push_step(STEP_EMBY_PATH, Instant::now(), "matched");
+        trace.fail_step(STEP_MAPPING, Instant::now(), "failed");
+        // Must not forge subsequent success after first failure.
+        trace.push_step(STEP_OPENLIST, Instant::now(), "matched");
+        trace.push_step(STEP_RAW_URL, Instant::now(), "matched");
+        trace.push_step(STEP_CACHE, Instant::now(), "hit");
+        trace.set_cache_hit(true);
+        trace.push_step(STEP_REDIRECT, Instant::now(), "redirect");
+        assert_eq!(trace.failure_node(), Some(STEP_MAPPING));
+        assert_eq!(trace.step_names(), vec![STEP_EMBY_PATH, STEP_MAPPING]);
+        assert!(!trace.cache_hit());
+
+        let mut trace2 = PlaybackDiagnosisTrace::new("server-1", "item-ol-fail", "UA");
+        trace2.push_step(STEP_EMBY_PATH, Instant::now(), "matched");
+        trace2.push_step(STEP_MAPPING, Instant::now(), "bypassed");
+        trace2.fail_step(STEP_OPENLIST, Instant::now(), "failed");
+        trace2.push_step(STEP_RAW_URL, Instant::now(), "matched");
+        assert_eq!(trace2.failure_node(), Some(STEP_OPENLIST));
+        assert_eq!(
+            trace2.step_names(),
+            vec![STEP_EMBY_PATH, STEP_MAPPING, STEP_OPENLIST]
+        );
+        trace.finish().await;
+        trace2.finish().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let records = diagnostics::get_diagnosis_records();
+        let r_map = records
+            .iter()
+            .find(|r| r.media_id == "item-map-fail")
+            .expect("mapping fail record");
+        assert_eq!(r_map.failure_node.as_deref(), Some(STEP_MAPPING));
+        assert_eq!(r_map.steps.len(), 2);
+        assert!(!r_map.cache_hit);
+        let r = records
+            .iter()
+            .find(|r| r.media_id == "item-ol-fail")
+            .expect("openlist fail record");
+        assert_eq!(r.failure_node.as_deref(), Some(STEP_OPENLIST));
+        assert_eq!(r.steps.len(), 3);
+        assert!(
+            !r.steps
+                .iter()
+                .any(|s| s.name == STEP_RAW_URL || s.name == STEP_REDIRECT)
+        );
+    }
+
+    #[tokio::test]
+    async fn playback_trace_cache_miss_and_proxy_302_details() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+
+        let mut hit = PlaybackDiagnosisTrace::new("server-1", "item-redirect", "UA");
+        hit.push_step(STEP_EMBY_PATH, Instant::now(), "matched");
+        hit.push_step(STEP_MAPPING, Instant::now(), "matched");
+        hit.bypass_steps(&[STEP_OPENLIST, STEP_RAW_URL]);
+        hit.push_step(STEP_CACHE, Instant::now(), "miss");
+        hit.set_cache_hit(false);
+        hit.push_step(STEP_REDIRECT, Instant::now(), "redirect");
+        hit.finish().await;
+
+        let mut proxy = PlaybackDiagnosisTrace::new("server-1", "item-proxy", "UA");
+        proxy.push_step(STEP_EMBY_PATH, Instant::now(), "bypassed");
+        proxy.bypass_steps(&[STEP_MAPPING, STEP_OPENLIST, STEP_RAW_URL, STEP_CACHE]);
+        proxy.push_step(STEP_REDIRECT, Instant::now(), "proxy");
+        proxy.finish().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let records = diagnostics::get_diagnosis_records();
+        let r_ok = records
+            .iter()
+            .find(|r| r.media_id == "item-redirect")
+            .expect("redirect");
+        let r_proxy = records
+            .iter()
+            .find(|r| r.media_id == "item-proxy")
+            .expect("proxy");
+        assert!(!r_ok.cache_hit);
+        assert_eq!(
+            r_ok.steps
+                .iter()
+                .find(|s| s.name == STEP_CACHE)
+                .unwrap()
+                .details,
+            "miss"
+        );
+        assert_eq!(r_ok.steps.last().unwrap().details, "redirect");
+        assert_eq!(r_proxy.steps.last().unwrap().details, "proxy");
+        assert!(r_proxy.failure_node.is_none());
+    }
+
+    #[tokio::test]
+    async fn playback_trace_skips_non_eligible_without_ids() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+
+        PlaybackDiagnosisTrace::new("", "item-1", "UA")
+            .finish()
+            .await;
+        PlaybackDiagnosisTrace::new("server-1", "", "UA")
+            .finish()
+            .await;
+        // Even with a step, empty identity must stay silent.
+        let mut t = PlaybackDiagnosisTrace::new("", "x", "UA");
+        t.push_step(STEP_EMBY_PATH, Instant::now(), "matched");
+        t.finish().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let records = diagnostics::get_diagnosis_records();
+        assert!(
+            !records
+                .iter()
+                .any(|r| r.media_id.is_empty() || r.server_id.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn playback_trace_details_are_source_minimized_and_sanitized() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+
+        let mut trace =
+            PlaybackDiagnosisTrace::new("server-1", "item-leak", "UA with token=should-not-leak");
+        // Production must only push safe details; this guards sanitizer if a bad detail slips in.
+        trace.push_step(STEP_EMBY_PATH, Instant::now(), "matched");
+        trace.push_step(
+            STEP_RAW_URL,
+            Instant::now(),
+            "https://user:secret@host/path?token=abc123&api_key=xyz",
+        );
+        trace.fail_step(
+            STEP_REDIRECT,
+            Instant::now(),
+            "Authorization: Bearer secret-token; Cookie: a=1",
+        );
+        // After fail, later success must not appear.
+        trace.push_step(STEP_CACHE, Instant::now(), "hit");
+        trace.finish().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let records = diagnostics::get_diagnosis_records();
+        let r = records
+            .iter()
+            .find(|r| r.media_id == "item-leak")
+            .expect("item-leak");
+        assert_eq!(r.failure_node.as_deref(), Some(STEP_REDIRECT));
+        assert_eq!(r.steps.len(), 3);
+        let joined = format!(
+            "{}|{}|{}",
+            r.ua,
+            r.steps
+                .iter()
+                .map(|s| s.details.as_str())
+                .collect::<Vec<_>>()
+                .join("|"),
+            r.sanitized_errors.join("|")
+        );
+        assert!(!joined.contains("secret"));
+        assert!(!joined.contains("abc123"));
+        assert!(!joined.contains("xyz"));
+        assert!(!joined.contains("Bearer secret-token"));
+        assert!(
+            joined.contains(diagnostics::REDACTED_PLACEHOLDER) || !r.sanitized_errors.is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn playback_trace_finish_is_single_shot() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+
+        let mut trace = PlaybackDiagnosisTrace::new("server-1", "item-once", "UA");
+        trace.push_step(STEP_EMBY_PATH, Instant::now(), "matched");
+        trace.push_step(STEP_REDIRECT, Instant::now(), "redirect");
+        // finish consumes self — second record only if we build another trace.
+        trace.finish().await;
+        let mut again = PlaybackDiagnosisTrace::new("server-1", "item-once", "UA");
+        again.push_step(STEP_EMBY_PATH, Instant::now(), "matched");
+        again.finish().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let count = diagnostics::get_diagnosis_records()
+            .iter()
+            .filter(|r| r.media_id == "item-once")
+            .count();
+        // Two separate traces = two records; documents that callers must create one trace per request.
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn playback_trace_cache_hit_bypasses_front_steps_and_sets_hit() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+
+        let mut trace = PlaybackDiagnosisTrace::new("server-1", "item-cache-hit", "UA");
+        trace.bypass_steps(&[STEP_EMBY_PATH, STEP_MAPPING, STEP_OPENLIST, STEP_RAW_URL]);
+        trace.push_step(STEP_CACHE, Instant::now(), "hit");
+        trace.set_cache_hit(true);
+        trace.push_step(STEP_REDIRECT, Instant::now(), "redirect");
+        trace.finish().await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let records = diagnostics::get_diagnosis_records();
+        let r = records
+            .iter()
+            .find(|r| r.media_id == "item-cache-hit")
+            .expect("record");
+        assert_eq!(
+            r.steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["Emby Path", "映射", "OpenList", "raw_url", "缓存", "302"]
+        );
+        assert_eq!(r.failure_node.as_deref(), None);
+        assert!(r.cache_hit);
+        assert_eq!(r.steps[0].details, "bypassed");
+        assert_eq!(r.steps[1].details, "bypassed");
+        assert_eq!(r.steps[2].details, "bypassed");
+        assert_eq!(r.steps[3].details, "bypassed");
+        assert_eq!(r.steps[4].details, "hit");
+        assert_eq!(r.steps[5].details, "redirect");
+    }
+
+    #[tokio::test]
+    async fn playback_trace_cache_miss_success() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+
+        let mut trace = PlaybackDiagnosisTrace::new("server-1", "item-cache-miss", "UA");
+        trace.push_step(STEP_EMBY_PATH, Instant::now(), "matched");
+        trace.push_step(STEP_MAPPING, Instant::now(), "matched");
+        trace.bypass_steps(&[STEP_OPENLIST, STEP_RAW_URL]);
+        trace.push_step(STEP_CACHE, Instant::now(), "miss");
+        trace.set_cache_hit(false);
+        trace.push_step(STEP_REDIRECT, Instant::now(), "redirect");
+        trace.finish().await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let records = diagnostics::get_diagnosis_records();
+        let r = records
+            .iter()
+            .find(|r| r.media_id == "item-cache-miss")
+            .expect("record");
+        assert_eq!(
+            r.steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["Emby Path", "映射", "OpenList", "raw_url", "缓存", "302"]
+        );
+        assert_eq!(r.failure_node.as_deref(), None);
+        assert!(!r.cache_hit);
+        assert_eq!(r.steps[0].details, "matched");
+        assert_eq!(r.steps[1].details, "matched");
+        assert_eq!(r.steps[2].details, "bypassed");
+        assert_eq!(r.steps[3].details, "bypassed");
+        assert_eq!(r.steps[4].details, "miss");
+        assert_eq!(r.steps[5].details, "redirect");
+    }
+
+    #[tokio::test]
+    async fn playback_trace_mapping_failure() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+
+        let mut trace = PlaybackDiagnosisTrace::new("server-1", "item-map-fail", "UA");
+        trace.push_step(STEP_EMBY_PATH, Instant::now(), "matched");
+        trace.fail_step(STEP_MAPPING, Instant::now(), "failed");
+        trace.finish().await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let records = diagnostics::get_diagnosis_records();
+        let r = records
+            .iter()
+            .find(|r| r.media_id == "item-map-fail")
+            .expect("record");
+        assert_eq!(r.failure_node.as_deref(), Some("映射"));
+        assert_eq!(
+            r.steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["Emby Path", "映射"]
+        );
+    }
+
+    #[tokio::test]
+    async fn playback_trace_openlist_failure() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+
+        let mut trace = PlaybackDiagnosisTrace::new("server-1", "item-ol-fail", "UA");
+        trace.push_step(STEP_EMBY_PATH, Instant::now(), "matched");
+        trace.push_step(STEP_MAPPING, Instant::now(), "matched");
+        trace.fail_step(STEP_OPENLIST, Instant::now(), "failed");
+        trace.finish().await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let records = diagnostics::get_diagnosis_records();
+        let r = records
+            .iter()
+            .find(|r| r.media_id == "item-ol-fail")
+            .expect("record");
+        assert_eq!(r.failure_node.as_deref(), Some("OpenList"));
+        assert_eq!(
+            r.steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["Emby Path", "映射", "OpenList"]
+        );
+    }
+
+    #[tokio::test]
+    async fn playback_trace_raw_url_failure() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+
+        let mut trace = PlaybackDiagnosisTrace::new("server-1", "item-raw-fail", "UA");
+        trace.push_step(STEP_EMBY_PATH, Instant::now(), "matched");
+        trace.push_step(STEP_MAPPING, Instant::now(), "matched");
+        trace.push_step(STEP_OPENLIST, Instant::now(), "matched");
+        trace.fail_step(STEP_RAW_URL, Instant::now(), "failed");
+        trace.finish().await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let records = diagnostics::get_diagnosis_records();
+        let r = records
+            .iter()
+            .find(|r| r.media_id == "item-raw-fail")
+            .expect("record");
+        assert_eq!(r.failure_node.as_deref(), Some("raw_url"));
+        assert_eq!(
+            r.steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["Emby Path", "映射", "OpenList", "raw_url"]
+        );
+    }
+
+    #[tokio::test]
+    async fn playback_trace_fallback_non_target_branch() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+
+        let mut trace = PlaybackDiagnosisTrace::new("server-1", "item-fallback", "UA");
+        trace.push_step(STEP_EMBY_PATH, Instant::now(), "matched");
+        trace.bypass_steps(&[STEP_MAPPING, STEP_OPENLIST, STEP_RAW_URL]);
+        trace.push_step(STEP_REDIRECT, Instant::now(), "proxy");
+        trace.finish().await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let records = diagnostics::get_diagnosis_records();
+        let r = records
+            .iter()
+            .find(|r| r.media_id == "item-fallback")
+            .expect("record");
+        assert_eq!(
+            r.steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["Emby Path", "映射", "OpenList", "raw_url", "302"]
+        );
+        assert_eq!(r.failure_node.as_deref(), None);
+        assert_eq!(r.steps[0].details, "matched");
+        assert_eq!(r.steps[1].details, "bypassed");
+        assert_eq!(r.steps[2].details, "bypassed");
+        assert_eq!(r.steps[3].details, "bypassed");
+        assert_eq!(r.steps[4].details, "proxy");
+    }
+
+    #[tokio::test]
+    async fn playback_trace_first_failure_blocks_later_success() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+
+        let mut trace = PlaybackDiagnosisTrace::new("server-1", "item-first-fail", "UA");
+        trace.push_step(STEP_EMBY_PATH, Instant::now(), "matched");
+        trace.fail_step(STEP_MAPPING, Instant::now(), "failed");
+        trace.push_step(STEP_OPENLIST, Instant::now(), "matched");
+        trace.push_step(STEP_RAW_URL, Instant::now(), "matched");
+        trace.push_step(STEP_CACHE, Instant::now(), "hit");
+        trace.set_cache_hit(true);
+        trace.push_step(STEP_REDIRECT, Instant::now(), "redirect");
+        trace.finish().await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let records = diagnostics::get_diagnosis_records();
+        let r = records
+            .iter()
+            .find(|r| r.media_id == "item-first-fail")
+            .expect("record");
+        assert_eq!(r.failure_node.as_deref(), Some("映射"));
+        assert_eq!(
+            r.steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["Emby Path", "映射"]
+        );
+    }
+
+    #[tokio::test]
+    async fn playback_trace_drop_records_sanitized_cancellation() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+
+        let trace_future = async {
+            let mut trace = PlaybackDiagnosisTrace::new(
+                "server-1",
+                "item-cancel",
+                "Player/1.0 token=ua-secret",
+            );
+            trace.begin_step(
+                STEP_OPENLIST,
+                "fs_get path=/movie?api_key=upstream-secret token=body-secret",
+            );
+            std::future::pending::<()>().await;
+            drop(trace);
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), trace_future)
+                .await
+                .is_err()
+        );
+
+        let record = diagnostics::get_diagnosis_records()
+            .into_iter()
+            .find(|record| record.media_id == "item-cancel")
+            .expect("cancellation diagnosis record");
+        assert_eq!(record.failure_node.as_deref(), Some(STEP_OPENLIST));
+        assert!(record.steps[0].details.contains("cancelled"));
+        let json = serde_json::to_string(&record).unwrap();
+        for secret in ["upstream-secret", "body-secret", "ua-secret"] {
+            assert!(!json.contains(secret), "secret leaked: {json}");
+        }
+    }
+
+    #[tokio::test]
+    async fn playback_trace_keeps_server_and_media_scopes_isolated() {
+        diagnostics::init_diagnostics();
+        diagnostics::clean_diagnostics();
+
+        let mut first = PlaybackDiagnosisTrace::new("server-1", "media-1", "UA-1");
+        first.push_step(STEP_EMBY_PATH, Instant::now(), "matched");
+        first.push_step(STEP_REDIRECT, Instant::now(), "redirect");
+        first.finish().await;
+        let mut second = PlaybackDiagnosisTrace::new("server-2", "media-1", "UA-2");
+        second.push_step(STEP_EMBY_PATH, Instant::now(), "matched");
+        second.push_step(STEP_REDIRECT, Instant::now(), "redirect");
+        second.finish().await;
+        let mut third = PlaybackDiagnosisTrace::new("server-1", "media-2", "UA-3");
+        third.push_step(STEP_EMBY_PATH, Instant::now(), "matched");
+        third.push_step(STEP_REDIRECT, Instant::now(), "redirect");
+        third.finish().await;
+
+        let records = diagnostics::get_diagnosis_records();
+        assert!(records.iter().any(|record| {
+            record.server_id == "server-1" && record.media_id == "media-1" && record.ua == "UA-1"
+        }));
+        assert!(records.iter().any(|record| {
+            record.server_id == "server-2" && record.media_id == "media-1" && record.ua == "UA-2"
+        }));
+        assert!(records.iter().any(|record| {
+            record.server_id == "server-1" && record.media_id == "media-2" && record.ua == "UA-3"
+        }));
     }
 }

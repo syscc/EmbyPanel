@@ -45,6 +45,41 @@ export const pageRoutes: RouteRecordRaw[] = [
     name: 'account',
     component: () => import('@/pages/AccountPage.vue'),
   },
+  {
+    path: '/sessions',
+    name: 'sessions',
+    component: () => import('@/pages/SessionsPage.vue'),
+  },
+  {
+    path: '/library-tasks',
+    name: 'library-tasks',
+    component: () => import('@/pages/LibraryTasksPage.vue'),
+  },
+  {
+    path: '/diagnostics',
+    name: 'diagnostics',
+    component: () => import('@/pages/DiagnosticsPage.vue'),
+  },
+  {
+    path: '/history',
+    name: 'history',
+    component: () => import('@/pages/HistoryPage.vue'),
+  },
+  {
+    path: '/cache-management',
+    name: 'cache-management',
+    component: () => import('@/pages/CacheManagementPage.vue'),
+  },
+  {
+    path: '/alerts',
+    name: 'alerts',
+    component: () => import('@/pages/AlertsPage.vue'),
+  },
+  {
+    path: '/admin-security',
+    name: 'admin-security',
+    component: () => import('@/pages/AdminSecurityPage.vue'),
+  },
 ]
 
 const router = createRouter({
