@@ -1039,6 +1039,91 @@ test('library tasks SSR maps configured names in library cards, task rows and fa
   assert.ok(html.includes('value="server-cn"'))
 })
 
+test('diagnostics summary keeps long step details out of the list and marks only actual failed or bypassed steps', async () => {
+  const panel = {
+    t, api: async () => { assert.fail('SSR must not fetch page data') },
+    showNotice: () => {}, clearNotice: () => {}, confirmAction: async () => false,
+  }
+  const records = [
+    {
+      request_id: 'compact-hit', server_id: 'server-a', media_id: 'media-1', ua: 'Fixture player',
+      cache_hit: true, failure_node: null, sanitized_errors: [],
+      steps: [
+        { name: 'Emby Path', duration_ms: 0, details: 'bypassed' },
+        { name: '缓存', duration_ms: 0, details: 'hit' },
+        { name: '302', duration_ms: 0, details: 'redirect location=https://fixture.invalid/very-long-path/episode.mkv' },
+      ],
+    },
+    {
+      request_id: 'compact-failure', server_id: 'server-a', media_id: 'media-2', ua: 'Fixture player',
+      cache_hit: false, failure_node: 'OpenList', sanitized_errors: ['OpenList: fixture failure with path=https://fixture.invalid/failure-long-path/episode.mkv'],
+      steps: [{ name: 'OpenList', duration_ms: 0, details: 'fixture failure with path=https://fixture.invalid/failure-long-path/episode.mkv' }],
+    },
+  ]
+  const html = await renderPage('DiagnosticsPage.vue', panel, (state) => { state.diagnostics.value = records })
+  assert.ok(!html.includes('https://fixture.invalid/very-long-path/episode.mkv'))
+  const articles = [...html.matchAll(/<article\b[^>]*>([\s\S]*?)<\/article>/g)].map((match) => match[1])
+  assert.equal(articles.length, 2)
+  assert.match(articles[0], /class="chain-step skipped"/)
+  assert.match(articles[0], /class="chain-step recorded"/)
+  assert.match(articles[0], /缓存命中/)
+  assert.match(articles[1], /失败节点: OpenList/)
+  assert.ok(!articles[1].includes('https://fixture.invalid/failure-long-path/episode.mkv'))
+  assert.ok(!articles[1].includes('302'))
+  assert.ok(!html.includes('总耗时'))
+  assert.ok(!html.includes('清空诊断记录'))
+})
+
+test('diagnostics distinguish cancellations from failed steps without inventing completed nodes', async () => {
+  const panel = {
+    t, api: async () => { assert.fail('SSR must not fetch page data') },
+    showNotice: () => {}, clearNotice: () => {}, confirmAction: async () => false,
+  }
+  for (const details of ['cancelled: fs_get path=/fixture.mkv', 'cancelled:fs_get path=/fixture.mkv', 'cancelled before step started']) {
+    const record = {
+      request_id: 'canceled-fixture', server_id: 'server-a', media_id: 'media-1', ua: 'Fixture player',
+      cache_hit: false, failure_node: 'OpenList', sanitized_errors: [`OpenList: ${details}`],
+      steps: [{ name: 'OpenList', duration_ms: 0, details }],
+    }
+    const html = await renderPage('DiagnosticsPage.vue', panel, (state) => { state.diagnostics.value = [record] })
+    assert.match(html, /class="chain-step cancelled"/)
+    assert.match(html, /已取消: OpenList/)
+    assert.doesNotMatch(html, /失败节点:/)
+    assert.doesNotMatch(html, /class="chain-step failed"/)
+    assert.doesNotMatch(html, /raw_url|302/)
+  }
+})
+
+test('diagnostics details preserve full text and close clears the selected record', async () => {
+  const vue = require('vue')
+  const panel = {
+    t, api: async () => { assert.fail('SSR must not fetch page data') },
+    showNotice: () => {}, clearNotice: () => {}, confirmAction: async () => false,
+  }
+  const record = {
+    request_id: 'detail-record', server_id: 'server-a', media_id: 'media-1', ua: 'Fixture player',
+    cache_hit: false, failure_node: null, sanitized_errors: [],
+    steps: [{ name: 'Emby Path', duration_ms: 1, details: 'resolved path=https://fixture.invalid/完整路径/episode.mkv\nsecond line' }],
+  }
+  let state
+  const html = await renderPage('DiagnosticsPage.vue', panel, (result) => {
+    state = result
+    state.diagnostics.value = [record]
+    state.openDetail(record)
+  }, {
+    '@/components/ui/SettingsDialogShell.vue': {
+      props: ['open'], setup: (props, { slots }) => () => props.open ? vue.h('dialog', slots.default?.()) : null,
+    },
+  })
+  const dialog = html.match(/<dialog\b[^>]*>([\s\S]*?)<\/dialog>/)?.[1]
+  assert.ok(dialog)
+  assert.ok(dialog.includes('https://fixture.invalid/完整路径/episode.mkv\nsecond line'))
+  assert.ok(dialog.includes('Fixture player'))
+  state.onDetailOpenChange(false)
+  assert.equal(state.detailOpen.value, false)
+  assert.equal(state.selectedRecord.value, null)
+})
+
 test('history SSR uses independent authorized options and session SSR hides viewer control buttons', async () => {
   const vue = require('vue')
   const panel = {
