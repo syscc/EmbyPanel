@@ -5710,6 +5710,59 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn legacy_database_upgrades_without_alert_key_and_preserves_settings() {
+        let path = test_database_path("legacy-no-alert-key");
+        let mut key_path = path.as_os_str().to_os_string();
+        key_path.push(".key");
+        let key_path = PathBuf::from(key_path);
+        open_legacy_admin_db(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );",
+        )
+        .unwrap();
+        let mut config = crate::config::Config::default_runtime();
+        config.emby_host = "http://legacy-upgrade.invalid".into();
+        config.emby_api_key = "synthetic-legacy-api-key".into();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('runtime_config', ?1)",
+            params![serde_json::to_string(&config).unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+
+        for _ in 0..2 {
+            let store = SettingsStore::open_for_test(path.clone()).unwrap();
+            let alerts = crate::alerts::Alerts::new(&path).unwrap();
+            assert!(alerts.get_alert_rules().unwrap().is_empty());
+            assert!(!key_path.exists());
+            let admin = store.admin_password_hash("legacy").unwrap().unwrap();
+            assert_eq!(admin.password_hash, "legacy-hash");
+            let identity = store
+                .admin_security_identity(admin.admin_user_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(identity.role_keys, vec!["super_admin".to_string()]);
+            assert_eq!(
+                store
+                    .session_admin_user_id("legacy-token", now_seconds())
+                    .unwrap(),
+                Some(admin.admin_user_id)
+            );
+            let migrated_config = store.load_config().unwrap().unwrap();
+            assert_eq!(migrated_config.emby_host, config.emby_host);
+            assert_eq!(migrated_config.servers[0].emby_api_key, config.emby_api_key);
+            drop(alerts);
+            drop(store);
+        }
+        remove_test_database(&path);
+    }
+
     fn insert_role(store: &SettingsStore, key: &str, name: &str) -> i64 {
         let conn = store.connection().unwrap();
         let now = now_seconds();

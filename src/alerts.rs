@@ -3,7 +3,7 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use url::Url;
@@ -186,7 +186,8 @@ pub struct AlertDelivery {
 #[derive(Clone)]
 pub struct Alerts {
     db: Arc<Mutex<Connection>>,
-    rule_config_key: Arc<[u8; 32]>,
+    rule_config_key: Arc<Mutex<Option<[u8; 32]>>>,
+    rule_config_key_path: Arc<PathBuf>,
     last_delivery_history_prune: Arc<Mutex<Option<Instant>>>,
 }
 
@@ -235,18 +236,25 @@ impl Alerts {
         )?;
         Self::migrate_schema(&conn).map_err(AppError::Database)?;
         conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_alert_delivery_time ON alert_deliveries(timestamp_ms DESC, id DESC);")?;
-        let has_encrypted_rule_config = Self::has_encrypted_rule_config(&conn)?;
+        let has_nonempty_rule_config = Self::has_nonempty_rule_config(&conn)?;
         let key_path = rule_config_crypto::key_path(db_path);
-        let rule_config_key = if has_encrypted_rule_config {
-            rule_config_crypto::load_existing_key(&key_path)
+        let rule_config_key = if has_nonempty_rule_config {
+            let has_encrypted_rule_config = Self::has_encrypted_rule_config(&conn)?;
+            let key = if has_encrypted_rule_config {
+                rule_config_crypto::load_existing_key(&key_path)
+            } else {
+                rule_config_crypto::load_or_create_key(&key_path)
+            }
+            .map_err(|_| Self::rule_config_storage_unavailable())?;
+            Self::migrate_rule_configs(&mut conn, &key)?;
+            Some(key)
         } else {
-            rule_config_crypto::load_or_create_key(&key_path)
-        }
-        .map_err(|_| Self::rule_config_storage_unavailable())?;
-        Self::migrate_rule_configs(&mut conn, &rule_config_key)?;
+            None
+        };
         let alerts = Self {
             db: Arc::new(Mutex::new(conn)),
-            rule_config_key: Arc::new(rule_config_key),
+            rule_config_key: Arc::new(Mutex::new(rule_config_key)),
+            rule_config_key_path: Arc::new(key_path),
             last_delivery_history_prune: Arc::new(Mutex::new(None)),
         };
         alerts.prune_delivery_history()?;
@@ -321,12 +329,52 @@ impl Alerts {
         .map_err(|_| Self::rule_config_storage_unavailable())
     }
 
+    fn has_nonempty_rule_config(conn: &Connection) -> AppResult<bool> {
+        let mut statement = conn
+            .prepare("SELECT rule_config FROM alert_rules")
+            .map_err(|_| Self::rule_config_storage_unavailable())?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, Option<String>>(0))
+            .map_err(|_| Self::rule_config_storage_unavailable())?;
+        for row in rows {
+            let value = row.map_err(|_| Self::rule_config_storage_unavailable())?;
+            if value.is_some_and(|value| !value.trim().is_empty()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn rule_config_storage_unavailable() -> AppError {
         AppError::Internal("alert rule configuration storage is unavailable".to_string())
     }
 
+    fn current_rule_config_key(&self) -> AppResult<[u8; 32]> {
+        let key = self.rule_config_key.lock().map_err(|_| {
+            AppError::Internal("alert rule configuration key lock is poisoned".to_string())
+        })?;
+        key.ok_or_else(Self::rule_config_storage_unavailable)
+    }
+
+    fn ensure_rule_config_key(&self) -> AppResult<[u8; 32]> {
+        let mut key = self.rule_config_key.lock().map_err(|_| {
+            AppError::Internal("alert rule configuration key lock is poisoned".to_string())
+        })?;
+        if let Some(key) = *key {
+            return Ok(key);
+        }
+        let loaded = rule_config_crypto::load_or_create_key(self.rule_config_key_path.as_path())
+            .map_err(|_| Self::rule_config_storage_unavailable())?;
+        *key = Some(loaded);
+        Ok(loaded)
+    }
+
     fn encrypt_rule_config_for_storage(&self, plaintext: &str) -> AppResult<String> {
-        rule_config_crypto::encrypt_rule_config(plaintext, self.rule_config_key.as_ref())
+        if plaintext.trim().is_empty() {
+            return Ok(String::new());
+        }
+        let key = self.ensure_rule_config_key()?;
+        rule_config_crypto::encrypt_rule_config(plaintext, &key)
             .map_err(|_| Self::rule_config_storage_unavailable())
     }
 
@@ -1580,11 +1628,9 @@ impl Alerts {
         if stored_rule_config.trim().is_empty() {
             return Ok(None);
         }
-        let plaintext = rule_config_crypto::decrypt_rule_config(
-            &stored_rule_config,
-            self.rule_config_key.as_ref(),
-        )
-        .map_err(|_| Self::rule_config_storage_unavailable())?;
+        let key = self.current_rule_config_key()?;
+        let plaintext = rule_config_crypto::decrypt_rule_config(&stored_rule_config, &key)
+            .map_err(|_| Self::rule_config_storage_unavailable())?;
         if plaintext.trim().is_empty() {
             return Ok(None);
         }
@@ -1763,7 +1809,7 @@ mod tests {
 
     fn insert_encrypted_rule_config_fixture(path: &Path) -> [u8; 32] {
         let initialized = Alerts::new(path).unwrap();
-        let existing_key = *initialized.rule_config_key.as_ref();
+        let existing_key = initialized.ensure_rule_config_key().unwrap();
         let ciphertext = rule_config_crypto::encrypt_rule_config(
             "https://example.com/encrypted-hook",
             &existing_key,
@@ -1849,17 +1895,169 @@ mod tests {
     }
 
     #[test]
-    fn rule_config_key_empty_db_creates_and_reuses_key() {
+    fn rule_config_key_empty_db_does_not_create_key() {
         let db_path = temp_rule_config_db("empty");
         let key_path = rule_config_crypto::key_path(&db_path);
 
         let first = Alerts::new(&db_path).unwrap();
-        let created_key = *first.rule_config_key.as_ref();
-        assert!(key_path.is_file());
+        assert!(!key_path.exists());
         drop(first);
 
         let reopened = Alerts::new(&db_path).unwrap();
-        assert!(reopened.rule_config_key.as_ref() == &created_key);
+        assert!(!key_path.exists());
+        drop(reopened);
+        cleanup_rule_config_db(&db_path);
+    }
+
+    #[test]
+    fn whitespace_only_rule_config_does_not_create_key() {
+        let db_path = temp_rule_config_db("whitespace_only");
+        let key_path = rule_config_crypto::key_path(&db_path);
+
+        drop(Alerts::new(&db_path).unwrap());
+        insert_rule_config_fixture(&db_path, "whitespace", "  \t\n  ");
+        drop(Alerts::new(&db_path).unwrap());
+        assert!(!key_path.exists());
+        cleanup_rule_config_db(&db_path);
+    }
+
+    #[test]
+    fn empty_rule_configs_ignore_invalid_existing_key() {
+        let db_path = temp_rule_config_db("unused_invalid_key");
+        let key_path = rule_config_crypto::key_path(&db_path);
+        let invalid_key = b"unused-invalid-key";
+        std::fs::write(&key_path, invalid_key).unwrap();
+
+        drop(Alerts::new(&db_path).unwrap());
+        insert_nullable_rule_config_fixture(&db_path, "null", None);
+        insert_rule_config_fixture(&db_path, "empty", "");
+        insert_rule_config_fixture(&db_path, "whitespace", " \t\n\u{2003} ");
+        let alerts = Alerts::new(&db_path).unwrap();
+        assert_eq!(alerts.get_alert_rules().unwrap().len(), 3);
+        for id in ["null", "empty", "whitespace"] {
+            assert!(alerts.get_rule_webhook_url(id).unwrap().is_none());
+        }
+        assert_eq!(std::fs::read(&key_path).unwrap(), invalid_key);
+        drop(alerts);
+        cleanup_rule_config_db(&db_path);
+    }
+
+    #[test]
+    fn empty_rule_config_does_not_create_key_on_write() {
+        let db_path = temp_rule_config_db("empty_write");
+        let key_path = rule_config_crypto::key_path(&db_path);
+        let alerts = Alerts::new(&db_path).unwrap();
+        let mut rule = sample_rule("empty-write");
+        rule.rule_config.clear();
+
+        alerts.create_alert_rule(rule).unwrap();
+        let view = alerts.get_alert_rule("empty-write").unwrap().unwrap();
+        for update in [
+            RuleConfigUpdate::Preserve,
+            RuleConfigUpdate::Replace(" \t ".into()),
+            RuleConfigUpdate::Clear,
+        ] {
+            alerts
+                .update_alert_rule(editable_rule(&view), update)
+                .unwrap();
+            assert!(!key_path.exists());
+        }
+        drop(alerts);
+        drop(Alerts::new(&db_path).unwrap());
+        assert!(!key_path.exists());
+        cleanup_rule_config_db(&db_path);
+    }
+
+    #[test]
+    fn nonempty_rule_config_creates_key_on_first_write() {
+        let db_path = temp_rule_config_db("nonempty_write");
+        let key_path = rule_config_crypto::key_path(&db_path);
+        let alerts = Alerts::new(&db_path).unwrap();
+
+        let rule = sample_rule("nonempty-write");
+        let expected = rule.rule_config.clone();
+        alerts.create_alert_rule(rule).unwrap();
+        assert!(key_path.is_file());
+        assert_eq!(
+            alerts.get_rule_webhook_url("nonempty-write").unwrap(),
+            Some(expected.clone())
+        );
+        let original_key = std::fs::read(&key_path).unwrap();
+        drop(alerts);
+
+        let reopened = Alerts::new(&db_path).unwrap();
+        assert_eq!(
+            reopened.get_rule_webhook_url("nonempty-write").unwrap(),
+            Some(expected)
+        );
+        assert_eq!(std::fs::read(&key_path).unwrap(), original_key);
+        drop(reopened);
+        cleanup_rule_config_db(&db_path);
+    }
+
+    #[test]
+    fn first_webhook_update_creates_key_shared_with_clones() {
+        let db_path = temp_rule_config_db("first_webhook_update");
+        let key_path = rule_config_crypto::key_path(&db_path);
+        let alerts = Alerts::new(&db_path).unwrap();
+        let cloned = alerts.clone();
+        let mut rule = sample_rule("first-update");
+        rule.rule_config.clear();
+        alerts.create_alert_rule(rule).unwrap();
+        assert!(!key_path.exists());
+
+        let view = alerts.get_alert_rule("first-update").unwrap().unwrap();
+        let webhook = "https://example.invalid/first-update";
+        cloned
+            .update_alert_rule(
+                editable_rule(&view),
+                RuleConfigUpdate::Replace(webhook.into()),
+            )
+            .unwrap();
+        assert!(key_path.is_file());
+        assert_eq!(
+            alerts
+                .get_rule_webhook_url("first-update")
+                .unwrap()
+                .as_deref(),
+            Some(webhook)
+        );
+        drop(cloned);
+        drop(alerts);
+        cleanup_rule_config_db(&db_path);
+    }
+
+    #[test]
+    fn concurrent_first_webhook_writes_share_one_key() {
+        let db_path = temp_rule_config_db("concurrent_lazy_key");
+        let alerts = Alerts::new(&db_path).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let workers: Vec<_> = (0..4)
+            .map(|index| {
+                let alerts = alerts.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    alerts
+                        .create_alert_rule(sample_rule(&format!("concurrent-{index}")))
+                        .unwrap();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        drop(alerts);
+        let reopened = Alerts::new(&db_path).unwrap();
+        for index in 0..4 {
+            assert_eq!(
+                reopened
+                    .get_rule_webhook_url(&format!("concurrent-{index}"))
+                    .unwrap()
+                    .as_deref(),
+                Some("http://127.0.0.1:1")
+            );
+        }
         drop(reopened);
         cleanup_rule_config_db(&db_path);
     }
@@ -1872,10 +2070,10 @@ mod tests {
 
         drop(Alerts::new(&db_path).unwrap());
         insert_rule_config_fixture(&db_path, "plaintext", plaintext);
-        std::fs::remove_file(&key_path).unwrap();
+        assert!(!key_path.exists());
 
         let initialized = Alerts::new(&db_path).unwrap();
-        let created_key = *initialized.rule_config_key.as_ref();
+        let created_key = initialized.current_rule_config_key().unwrap();
         let stored = stored_rule_config(&db_path, "plaintext");
         assert!(key_path.is_file());
         assert!(stored.starts_with(rule_config_crypto::RULE_CONFIG_PREFIX));
@@ -1892,7 +2090,7 @@ mod tests {
         drop(initialized);
 
         let reopened = Alerts::new(&db_path).unwrap();
-        assert!(reopened.rule_config_key.as_ref() == &created_key);
+        assert_eq!(reopened.current_rule_config_key().unwrap(), created_key);
         assert!(stored_rule_config(&db_path, "plaintext") == stored);
         drop(reopened);
         cleanup_rule_config_db(&db_path);
@@ -1902,7 +2100,7 @@ mod tests {
     fn mixed_rule_configs_migrate_without_changing_ciphertext_or_empty_values() {
         let db_path = temp_rule_config_db("mixed");
         let initialized = Alerts::new(&db_path).unwrap();
-        let key = *initialized.rule_config_key.as_ref();
+        let key = initialized.ensure_rule_config_key().unwrap();
         let plaintext = "https://example.com/plaintext-hook";
         let existing_ciphertext =
             rule_config_crypto::encrypt_rule_config("https://example.com/existing-hook", &key)
@@ -1945,7 +2143,9 @@ mod tests {
     #[test]
     fn damaged_ciphertext_rolls_back_all_plaintext_migrations() {
         let db_path = temp_rule_config_db("damaged_ciphertext");
-        drop(Alerts::new(&db_path).unwrap());
+        let initialized = Alerts::new(&db_path).unwrap();
+        initialized.ensure_rule_config_key().unwrap();
+        drop(initialized);
         let plaintext = "https://example.com/pending-hook";
         let damaged = format!("{}:invalid", rule_config_crypto::RULE_CONFIG_PREFIX);
         insert_rule_config_fixture(&db_path, "plaintext", plaintext);
@@ -1963,7 +2163,7 @@ mod tests {
         let existing_key = insert_encrypted_rule_config_fixture(&db_path);
 
         let reopened = Alerts::new(&db_path).unwrap();
-        assert!(reopened.rule_config_key.as_ref() == &existing_key);
+        assert_eq!(reopened.current_rule_config_key().unwrap(), existing_key);
         drop(reopened);
         cleanup_rule_config_db(&db_path);
     }
