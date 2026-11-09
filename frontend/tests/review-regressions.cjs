@@ -666,6 +666,540 @@ async function renderPage(filename, panel, onSetup, overrides = {}, props = {}) 
   return require('@vue/server-renderer').renderToString(vue.createSSRApp(component, props))
 }
 
+test('server validation SSR names every check in order while preserving scopes, statuses and localized results', async (context) => {
+  const vue = require('vue')
+  const { translations } = load('lib/translations.ts')
+  // Synthetic display-only fixtures: no validation action, HTTP or persisted settings are used.
+  const fixtures = [
+    ['本地配置校验通过', '本地配置', 'Local configuration', true, 'Local configuration passed'],
+    ['本地配置校验失败', '本地配置', 'Local configuration', false, 'Local configuration failed'],
+    ['反代端口重复', '反代端口', 'Proxy port', false, 'Duplicate proxy port'],
+    ['反代端口正在由当前服务监听', '反代端口', 'Proxy port', true, 'The current service is listening on this proxy port'],
+    ['反代端口可用', '反代端口', 'Proxy port', true, 'Proxy port is available'],
+    ['反代端口已被占用', '反代端口', 'Proxy port', false, 'Proxy port is already in use'],
+    ['Emby API Key 可用', 'Emby API', 'Emby API', true, 'Emby API key is valid'],
+    ['Emby 连接失败', 'Emby API', 'Emby API', false, 'Emby connection failed'],
+    ['OpenList 连接可用', 'OpenList 连接', 'OpenList connection', true, 'OpenList connection is available'],
+    ['OpenList 连接失败', 'OpenList 连接', 'OpenList connection', false, 'OpenList connection failed'],
+    ['未配置，已跳过', 'OpenList 连接', 'OpenList connection', true, 'Not configured; skipped'],
+    ['fixture unknown validation message', '配置检查', 'Configuration check', false, 'fixture unknown validation message'],
+  ]
+  context.mock.method(globalThis, 'fetch', () => assert.fail('Display-only SSR must not make HTTP requests'))
+  for (const locale of ['zh-CN', 'en-US']) {
+    const translate = (source) => locale === 'en-US' ? translations[source] || source : source
+    const localized = []
+    const results = fixtures.map(([message, , , ok], index) => ({
+      message, ok,
+      scope: index === 0 ? '配置' : index === 10 ? 'OpenList' : index === 11 ? '' : '用户',
+      detail: index === 0 ? '配置' : index === 10 ? '' : `fixture detail ${index}`,
+    }))
+    const panel = {
+      t: translate,
+      settings: {
+        servers: [], openlist_addr: null, openlist_token: null,
+        cache_domain_filter_mode: 'off', cache_domain_whitelist: '',
+        enable_internal_redirect: false, internal_redirect_timeout_seconds: 15,
+        strm_url_mappings: '', strm_url_mapping_enabled: true,
+        cache_ttl_seconds: 180, cache_max_capacity: 10000, cache_enabled: true,
+        connectivity_check_enabled: true, connectivity_check_interval_seconds: 60,
+        connectivity_check_timeout_seconds: 5, connectivity_auto_restart_seconds: 180,
+      },
+      saving: vue.ref(false), error: vue.ref(''), restartingServerId: vue.ref(''),
+      validationResults: vue.ref(results), defaultCdnHeaders: [], realIpModeOptions: [],
+      proxyStatusById: vue.ref({}), strmMappingPlaceholder: vue.ref('fixture mappings'),
+      validateSettings: () => assert.fail('Display-only SSR must not run validateSettings'),
+      api: () => assert.fail('Display-only SSR must not fetch settings'),
+      validationClass: (result) => result.ok ? 'success' : 'warn',
+      localizeValidationText: (source) => { localized.push(source); return translate(source) },
+    }
+    const html = await renderPage('ServersPage.vue', panel, (state) => {
+      state.validationDialogOpen.value = true
+    }, {
+      '@/components/ui/SettingsDialogShell.vue': {
+        props: ['open'], setup: (props, { slots }) => () => props.open ? vue.h('dialog', slots.default?.()) : null,
+      },
+    })
+    const dialog = html.match(/<dialog\b[^>]*>([\s\S]*?)<\/dialog>/)?.[1]
+    assert.ok(dialog, `${locale}: validation dialog renders`)
+    assert.match(dialog, /class="validation-list" role="list"/)
+    const rows = [...dialog.matchAll(/<div class="validation-row ([^"]+)" role="listitem">\s*<div class="validation-check">\s*<strong>([^<]+)<\/strong>([\s\S]*?)<\/div>\s*<span>([^<]*)<\/span>\s*<small>([^<]*)<\/small>\s*<\/div>/g)]
+    assert.equal(rows.length, fixtures.length, `${locale}: all eleven messages and the unknown fixture remain visible`)
+    assert.deepEqual(rows.map((row) => row[2]), fixtures.map((fixture) => fixture[locale === 'en-US' ? 2 : 1]))
+    for (const [index, row] of rows.entries()) {
+      const result = results[index]
+      assert.equal(row[1], result.ok ? 'success' : 'warn', `${locale}: ${result.message} status`)
+      assert.equal(row[3].match(/<small>([^<]*)<\/small>/)?.[1] ?? '', result.scope, `${locale}: scope is not translated`)
+      assert.equal(row[4], locale === 'en-US' ? fixtures[index][4] : result.message, `${locale}: original message stays in its row`)
+      assert.equal(row[5], index === 0 && locale === 'en-US' ? 'Configuration' : result.detail || '--', `${locale}: detail or empty placeholder stays in its row`)
+    }
+    assert.equal(rows[10][1], 'success', `${locale}: skipped OpenList remains successful`)
+    assert.equal(rows[10][5], '--', `${locale}: skipped OpenList keeps its empty detail placeholder`)
+    assert.deepEqual(localized, results.flatMap((result) => result.detail ? [result.message, result.detail] : [result.message]), `${locale}: messages and nonempty details still use localizeValidationText in order`)
+    assert.ok(!html.includes('undefined'), `${locale}: synthetic settings provide all rendered defaults`)
+  }
+})
+
+test('server policy SSR preserves all fifteen field heads, statuses, help and clear controls with scoped CSS', async (context) => {
+  const vue = require('vue')
+  const { parse } = require('@vue/compiler-sfc')
+  const filename = path.resolve(__dirname, '../src/pages/ServersPage.vue')
+  const { descriptor, errors } = parse(readFileSync(filename, 'utf8'), { filename })
+  assert.deepEqual(errors, [])
+  const requiredRules = {
+    '.server-policy-grid': { 'align-items': 'start' },
+    '.server-policy-field': { display: 'grid', 'align-content': 'start', gap: '7px' },
+    '.server-policy-field-head': { display: 'flex', 'flex-wrap': 'wrap' },
+    '.server-policy-field-head > span:first-child': { 'font-size': '11px', 'font-weight': '700' },
+    '.server-policy-field-head > .muted': { 'font-size': '11px', 'font-weight': '400' },
+    '.server-policy-field-head > button': { 'font-size': 'var(--font-size-control)', 'font-weight': '600' },
+    '.server-policy-field > .field-help': { 'font-size': '12px', 'line-height': '1.6' },
+    '.server-policy-toggle-field > .settings-card-switch': { 'justify-self': 'start' },
+  }
+  const rules = new Map()
+  for (const style of descriptor.styles) {
+    for (const [, selectorText, body] of style.content.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      const selector = selectorText.trim()
+      if (!selector.includes('.server-policy-')) continue
+      assert.equal(style.scoped, true, `${selector}: policy styles remain scoped`)
+      assert.ok(Object.hasOwn(requiredRules, selector), `${selector}: only targeted policy selectors`)
+      assert.equal(rules.has(selector), false, `${selector}: no conflicting duplicate rule`)
+      assert.doesNotMatch(selector, /\b(?:input|textarea|select)\b/, 'policy CSS does not target input typography')
+      const declarations = new Map([...body.matchAll(/([\w-]+)\s*:\s*([^;]+);?/g)].map((match) => [match[1], match[2].trim()]))
+      if ('font-size' in requiredRules[selector]) {
+        assert.equal(declarations.has('font'), false, `${selector}: no overriding font shorthand`)
+      } else {
+        assert.equal(declarations.has('font'), false, `${selector}: no inherited input font shorthand`)
+        assert.equal(declarations.has('font-size'), false, `${selector}: no inherited input font size`)
+      }
+      rules.set(selector, declarations)
+    }
+  }
+  for (const [selector, declarations] of Object.entries(requiredRules)) {
+    assert.ok(rules.has(selector), `${selector}: policy rule exists`)
+    for (const [property, value] of Object.entries(declarations)) {
+      assert.equal(rules.get(selector).get(property), value, `${selector}: ${property}`)
+    }
+  }
+
+  // Synthetic display-only drafts: no API, validation, save or clear action is executed.
+  const fields = [
+    ['OpenList 地址', 'openlist_addr_override', 'https://openlist.invalid'],
+    ['OpenList Token', 'openlist_token_override', null],
+    ['STRM URL 映射', 'strm_url_mappings_override', 'fixture mapping'],
+    ['启用 STRM URL 映射', 'strm_url_mapping_enabled_override', false],
+    ['启用缓存', 'cache_enabled_override', false],
+    ['缓存秒数', 'cache_ttl_seconds_override', 0],
+    ['缓存最大条数', 'cache_max_capacity_override', 200],
+    ['缓存过滤模式', 'cache_domain_filter_mode_override', 'off'],
+    ['缓存过滤域名', 'cache_domain_whitelist_override', 'fixture.invalid'],
+    ['开启内部重定向 HEAD 解析', 'enable_internal_redirect_override', false],
+    ['HEAD 超时秒数', 'internal_redirect_timeout_seconds_override', 10],
+    ['启用服务器连通性巡检', 'connectivity_check_enabled_override', false],
+    ['巡检间隔秒数', 'connectivity_check_interval_seconds_override', 60],
+    ['单项超时秒数', 'connectivity_check_timeout_seconds_override', 5],
+    ['反代无响应自动重启秒数', 'connectivity_auto_restart_seconds_override', 0],
+  ]
+  context.mock.method(globalThis, 'fetch', () => assert.fail('Display-only SSR must not make HTTP requests'))
+  for (const overridden of [false, true]) {
+    const panel = {
+      t,
+      settings: {
+        servers: [], openlist_addr: null, openlist_token: null,
+        cache_domain_filter_mode: 'off', cache_domain_whitelist: '',
+        enable_internal_redirect: false, internal_redirect_timeout_seconds: 15,
+        strm_url_mappings: '', strm_url_mapping_enabled: true,
+        cache_ttl_seconds: 180, cache_max_capacity: 10000, cache_enabled: true,
+        connectivity_check_enabled: true, connectivity_check_interval_seconds: 60,
+        connectivity_check_timeout_seconds: 5, connectivity_auto_restart_seconds: 180,
+      },
+      saving: vue.ref(false), error: vue.ref(''), restartingServerId: vue.ref(''),
+      validationResults: vue.ref([]), defaultCdnHeaders: [], realIpModeOptions: [],
+      proxyStatusById: vue.ref({}), strmMappingPlaceholder: vue.ref('fixture mappings'),
+      apiKeyInputValue: () => '', apiKeyPlaceholder: () => 'fixture placeholder',
+      isApiKeyVisible: () => false, isApiKeyRevealLoading: () => false,
+      needsRealIpHeader: () => false,
+      api: () => assert.fail('Display-only SSR must not fetch settings'),
+      saveSettings: () => assert.fail('Display-only SSR must not save settings'),
+      validateSettings: () => assert.fail('Display-only SSR must not run validation'),
+    }
+    const html = await renderPage('ServersPage.vue', panel, (state) => {
+      state.serverDraft.value = {
+        id: 'policy-fixture', name: 'Synthetic policy server', emby_host: 'https://emby.invalid',
+        emby_api_key: '', port: 18096, block_web_ui: false, real_ip_mode: 'system', trusted_proxy_cidrs: '',
+        ...Object.fromEntries(fields.map(([, key, value]) => [key, overridden ? value : null])),
+        openlist_token_override_configured: overridden,
+      }
+      state.serverEditorOpen.value = true
+    }, {
+      '@/components/ui/SettingsDialogShell.vue': {
+        props: ['open'], setup: (props, { slots }) => () => props.open ? vue.h('dialog', slots.default?.()) : null,
+      },
+      '@/components/ui/UiSwitch.vue': loadPageComponent('../components/ui/UiSwitch.vue', {}),
+      'reka-ui': { DialogClose: { inheritAttrs: false, setup: (_, { slots }) => () => slots.default?.() } },
+    })
+    const section = html.match(/<section class="server-policy-overrides"[^>]*>([\s\S]*?)<\/section>/)?.[1]
+    assert.ok(section, 'open server editor renders the policy section')
+    const rows = section.split(/<div class="server-policy-field(?: server-policy-toggle-field)?">/).slice(1)
+    assert.equal(rows.length, 15, 'all fifteen policy fields remain visible')
+    for (const [index, row] of rows.entries()) {
+      const head = row.match(/<div class="server-policy-field-head">([\s\S]*?)<\/div>/)?.[1]
+      assert.ok(head, `${fields[index][0]}: field head exists`)
+      assert.equal(head.match(/<span>([^<]+)<\/span>/)?.[1], fields[index][0], 'field labels stay ordered')
+      const status = head.match(/<span class="muted">([^<]+)<\/span>/)?.[1]
+      // The Token field shares the paired OpenList status and restore control in the address head.
+      assert.equal(status, index === 1 ? undefined : overridden ? index === 0 ? '地址与 Token 均覆盖' : '已设置覆盖' : '继承全局', `${fields[index][0]}: status`)
+      const clearButtons = [...head.matchAll(/<button\b[^>]*type="button"[^>]*>([^<]+)<\/button>/g)]
+      assert.deepEqual(clearButtons.map((match) => match[1]), overridden && index !== 1 ? [index === 0 ? '恢复全局' : '清除覆盖'] : [], `${fields[index][0]}: clear control`)
+    }
+    assert.deepEqual([...section.matchAll(/<small class="field-help">([^<]+)<\/small>/g)].map((match) => match[1]), [
+      '地址与 Token 按最终有效配置成对使用；允许只覆盖其中一项并继承另一项。恢复全局会同时清除两项覆盖。',
+      'Token 只显示为密码框；留空且不清除时保持已有安全值。',
+    ])
+    assert.equal([...section.matchAll(/class="settings-card-switch[^\"]*"[^>]*role="switch"/g)].length, 4, 'four policy switches retain their root class')
+    assert.ok(!section.includes('undefined'), 'synthetic draft supplies every displayed policy value')
+  }
+})
+
+// Check selected typography declarations, not a snapshot or a browser cascade simulator.
+function assertTypographyRule(css, selector, expected) {
+  const declarations = new Map()
+  css.walkRules((rule) => {
+    if (!rule.selectors.includes(selector)) return
+    rule.walkDecls((declaration) => {
+      assert.notEqual(declaration.prop, 'font', `${selector}: no font shorthand resets the role`)
+      if (!Object.hasOwn(expected, declaration.prop)) return
+      assert.equal(declaration.important, undefined, `${selector}: no important typography override`)
+      assert.equal(declaration.value, expected[declaration.prop], `${selector}: ${declaration.prop}`)
+      declarations.set(declaration.prop, declaration.value)
+    })
+  })
+  assert.deepEqual(Object.fromEntries(declarations), expected, `${selector}: required typography declarations`)
+}
+
+test('typography shared roles preserve body, labels, checkbox, dialogs, navigation and mobile inputs', () => {
+  const { parse } = require('postcss')
+  const css = parse(readFileSync(path.resolve(__dirname, '../src/style.css'), 'utf8'))
+  const roles = { page: 22, panel: 17, dialog: 16, section: 14, body: 13, control: 12, label: 11, meta: 11, help: 12 }
+  for (const [role, size] of Object.entries(roles)) {
+    const declarations = []
+    css.walkDecls(`--font-size-${role}`, (declaration) => {
+      assert.equal(declaration.parent.selector, ':root', `${role}: shared root role`)
+      declarations.push(declaration.value)
+    })
+    assert.deepEqual(declarations, [`${size}px`], `${role}: one stable role value`)
+  }
+  css.walkRules((rule) => {
+    if (!rule.selectors.some((selector) => /^(?:html|:root)(?:$|[.:\s])/.test(selector))) return
+    rule.walkDecls((declaration) => {
+      assert.ok(!['font', 'font-size'].includes(declaration.prop), 'html/root keep the default rem scale')
+    })
+  })
+  assertTypographyRule(css, 'body', { 'font-size': 'var(--font-size-body)', 'font-weight': '400', 'line-height': '1.6' })
+  for (const selector of ['.check', '.check > span']) {
+    assertTypographyRule(css, selector, { 'font-size': 'var(--font-size-body)', 'font-weight': '400' })
+  }
+  assertTypographyRule(css, 'label:not(.check)', { 'font-size': 'var(--font-size-label)', 'font-weight': '700' })
+  assertTypographyRule(css, '.settings-dialog-title', { 'font-size': 'var(--font-size-dialog)', 'font-weight': '700', 'line-height': '1.4' })
+  assertTypographyRule(css, '.panel-head h2', { 'font-size': 'var(--font-size-panel)', 'font-weight': '700', 'line-height': '1.4' })
+  assertTypographyRule(css, '.field-help', { 'font-size': 'var(--font-size-help)', 'font-weight': '400', 'line-height': '1.6' })
+  for (const selector of ['.nav-item', '.language-trigger', '.language-menu-item', '.profile-trigger', '.profile-menu-item']) {
+    assertTypographyRule(css, selector, { 'font-size': 'var(--font-size-body)', 'font-weight': '600' })
+  }
+  // The final global form rules must retain the <=700px 16px protection.
+  for (const selector of ['input', 'select', 'textarea']) {
+    const sizes = []
+    css.walkRules((rule) => {
+      if (!rule.selectors.includes(selector)) return
+      rule.walkDecls((declaration) => {
+        if (declaration.prop === 'font') {
+          assert.equal(sizes.length, 0, `${selector}: no shorthand after explicit sizes`)
+          assert.equal(declaration.value, 'inherit')
+        }
+        if (declaration.prop !== 'font-size') return
+        assert.equal(declaration.important, undefined)
+        sizes.push(declaration.value)
+        if (sizes.length === 1) assert.equal(rule.parent.type, 'root', `${selector}: desktop form rule`)
+        else {
+          assert.equal(rule.parent.name, 'media')
+          assert.equal(rule.parent.params, '(max-width: 700px)')
+        }
+      })
+    })
+    assert.deepEqual(sizes, ['var(--font-size-body)', '16px'], `${selector}: mobile form text remains 16px`)
+  }
+  const shell = readFileSync(path.resolve(__dirname, '../src/components/ui/SettingsDialogShell.vue'), 'utf8')
+  const checkbox = readFileSync(path.resolve(__dirname, '../src/components/ui/CheckboxField.vue'), 'utf8')
+  assert.match(shell, /<DialogTitle class="settings-dialog-title"/)
+  assert.match(checkbox, /<label class="check">[\s\S]*<span>{{ label }}<\/span>/)
+  const { parse: parseSfc } = require('@vue/compiler-sfc')
+  const policy = parseSfc(readFileSync(path.resolve(__dirname, '../src/components/UserPolicyFields.vue'), 'utf8')).descriptor
+  const policyCss = parse(policy.styles.map((style) => style.content).join('\n'))
+  assertTypographyRule(policyCss, '.user-policy-subsection > span:not(.muted)', {
+    'font-size': 'var(--font-size-section)', 'font-weight': '700', 'line-height': '1.4',
+  })
+  policyCss.walkRules((rule) => {
+    assert.ok(!rule.selectors.includes('.user-policy-subsection > span'), 'subsection titles must exclude muted helper text')
+  })
+  assertTypographyRule(css, '.muted', { 'font-size': 'var(--font-size-help)', 'font-weight': '400', 'line-height': '1.6' })
+})
+
+test('typography fifteen-route CSS contracts and synthetic AdminSecurity SSR retain page and secondary roles', async (context) => {
+  const vue = require('vue')
+  const { parse: parseSfc } = require('@vue/compiler-sfc')
+  const { parse } = require('postcss')
+  const globalCss = parse(readFileSync(path.resolve(__dirname, '../src/style.css'), 'utf8'))
+  // One representative secondary role per route, plus the existing standalone headers.
+  const contracts = {
+    'OverviewPage.vue': [/<h2>/, '.health-subtitle', 'meta'],
+    'ServersPage.vue': [/<h2>/, '.config-section-head h3', 'section'],
+    'ClientsPage.vue': [/<h2>/, '.client-table th', 'label'],
+    'UsersPage.vue': [/<h2>/, '.users-section-title', 'section'],
+    'NotificationsPage.vue': [/<h2>/, '.muted', 'help'],
+    'BackupPage.vue': [/<h2>/, '.backup-card h3', 'section'],
+    'LogsPage.vue': [/<h2>/, '.log-title strong', 'body'],
+    'AccountPage.vue': [/<h2>/, '.audit-row small', 'meta'],
+    'SessionsPage.vue': [/class="sessions-page p-6"/, '.sessions-detail dt', 'label'],
+    'LibraryTasksPage.vue': [/<h2>/, '.library-card-title h4', 'section', '.library-page-heading h2'],
+    'DiagnosticsPage.vue': [/<h1>/, '.detail-summary dt', 'label', '.page-heading h1'],
+    'HistoryPage.vue': [/<h1>/, '.filter-field > span', 'label', '.history-head h1'],
+    'CacheManagementPage.vue': [/<h2>/, '.cache-table th', 'label'],
+    'AlertsPage.vue': [/<h2>/, '.alert-rule-head h3', 'section'],
+    'AdminSecurityPage.vue': [/<h1>/, '.row-meta', 'meta', '.page-head h1'],
+  }
+  const router = readFileSync(path.resolve(__dirname, '../src/router/index.ts'), 'utf8')
+  assert.deepEqual([...router.matchAll(/import\('@\/pages\/([^']+)'\)/g)].map((match) => match[1]).sort(), Object.keys(contracts).sort())
+  assert.equal(Object.keys(contracts).length, 15)
+  for (const [filename, [heading, selector, role, pageHeading]] of Object.entries(contracts)) {
+    const { descriptor, errors } = parseSfc(readFileSync(path.resolve(__dirname, '../src/pages', filename), 'utf8'))
+    assert.deepEqual(errors, [], filename)
+    assert.match(descriptor.template.content, heading, `${filename}: existing heading structure`)
+    const scopedCss = parse(descriptor.styles.map((style) => {
+      assert.equal(style.scoped, true, `${filename}: local styles remain scoped`)
+      return style.content
+    }).join('\n'))
+    const css = scopedCss.clone()
+    css.prepend(globalCss.nodes.map((node) => node.clone()))
+    assertTypographyRule(css, selector, { 'font-size': `var(--font-size-${role})` })
+    if (pageHeading) {
+      assertTypographyRule(scopedCss, pageHeading, { 'font-size': 'var(--font-size-page)', 'font-weight': '700', 'line-height': '1.3' })
+    }
+    if (filename === 'HistoryPage.vue' || filename === 'DiagnosticsPage.vue') {
+      const inputSelector = filename === 'HistoryPage.vue' ? '.filter-field select' : '.diagnostics-filters input'
+      const sizes = []
+      scopedCss.walkRules((rule) => {
+        if (!rule.selectors.includes(inputSelector)) return
+        rule.walkDecls((declaration) => {
+          if (declaration.prop === 'font') {
+            assert.equal(sizes.length, 0, `${filename}: no shorthand after explicit sizes`)
+            assert.equal(declaration.value, 'inherit', `${filename}: no small font shorthand`)
+          }
+          if (declaration.prop !== 'font-size') return
+          assert.equal(declaration.important, undefined, `${filename}: mobile size cannot be blocked`)
+          sizes.push(declaration.value)
+          if (sizes.length === 1) assert.equal(rule.parent.type, 'root', `${filename}: desktop input rule`)
+          else {
+            assert.equal(rule.parent.name, 'media')
+            assert.equal(rule.parent.params, '(max-width: 700px)')
+          }
+        })
+      })
+      assert.deepEqual(sizes, ['var(--font-size-body)', '16px'], `${filename}: scoped mobile input wins with no later size override`)
+    }
+    if (filename === 'AdminSecurityPage.vue') {
+      for (const selector of ['.admin-security-page', '.dialog-form', '.secret-result', '.recovery-codes']) {
+        assertTypographyRule(scopedCss, selector, { 'font-size': 'var(--font-size-body)', 'line-height': '1.6' })
+      }
+      assertTypographyRule(scopedCss, '.section-head h2', { 'font-size': 'var(--font-size-section)', 'font-weight': '700', 'line-height': '1.4' })
+      assertTypographyRule(scopedCss, '.dialog-form > label:not(.check)', { 'font-size': 'var(--font-size-label)', 'font-weight': '700' })
+      assertTypographyRule(scopedCss, '.dialog-form input', { 'font-weight': '400' })
+      assertTypographyRule(scopedCss, '.security-row small', { 'font-size': '12px', 'line-height': '1.6' })
+      assertTypographyRule(scopedCss, '.primary-button', { 'font-size': '12px', 'font-weight': '600', 'line-height': '1.4' })
+      assertTypographyRule(scopedCss, '.secret-result code', { 'font-size': '12px', 'font-weight': '400', 'overflow-wrap': 'anywhere', 'user-select': 'all', 'white-space': 'pre-wrap' })
+    }
+  }
+
+  // Render normal rows and a portal-shell stub using only synthetic setup state.
+  // Never load the controller, click an action, submit a form or create a credential.
+  context.mock.method(globalThis, 'fetch', () => assert.fail('Typography SSR must not make HTTP requests'))
+  const noAction = () => assert.fail('Typography SSR must not execute actions')
+  const admin = {
+    id: 701, username: 'typography-fixture', display_name: 'Synthetic administrator', enabled: true,
+    role_keys: ['super_admin'], permission_keys: [], server_grants: [], totp_enabled: false,
+  }
+  const panel = { t, api: noAction, encryptPayload: noAction, showNotice: noAction, serverOptions: vue.ref([]), locale: vue.ref('zh-CN') }
+  const html = await renderPage('AdminSecurityPage.vue', panel, (state) => {
+    state.admins.value = [admin]
+    state.currentUserId.value = admin.id
+    state.roles.value = [{ id: 801, key: 'fixture-role', name: 'Synthetic role', permissions: [] }]
+    state.sessions.value = [{ id: 901, device_label: 'Synthetic device', auth_method: 'fixture', last_seen_at: '2025-01-01T00:00:00Z', expires_at: '2025-01-02T00:00:00Z' }]
+    state.showRoleDialog.value = true
+    state.selectedAdmin.value = admin
+    state.roleDraft.value = ['fixture-role']
+  }, {
+    '@/components/ui/CheckboxField.vue': loadPageComponent('../components/ui/CheckboxField.vue', {}),
+    '@/components/ui/SettingsDialogShell.vue': {
+      props: ['open', 'title', 'description', 'closeLabel', 'showDescription'], setup: (props, { slots }) => () => props.open ? vue.h('dialog', { class: 'settings-dialog-content' }, [
+        vue.h('h2', { class: 'settings-dialog-title' }, props.title), ...(slots.default?.() ?? []), ...(slots.footer?.() ?? []),
+      ]) : null,
+    },
+    '@/composables/useActionDialog': { useActionDialog: () => ({ confirmAction: noAction, promptAction: noAction }) },
+  })
+  assert.match(html, /<h1>管理员安全<\/h1>/)
+  assert.equal([...html.matchAll(/class="security-section(?: two-factor-section)?"/g)].length, 4)
+  assert.match(html, /<strong>Synthetic administrator<\/strong>/)
+  assert.match(html, /<strong>Synthetic device<\/strong>/)
+  assert.match(html, /class="row-meta"/)
+  assert.match(html, /<dialog class="settings-dialog-content"><h2 class="settings-dialog-title">编辑角色<\/h2>/)
+  assert.match(html, /class="dialog-form choice-list"[\s\S]*<label class="check"><input[^>]*checked[^>]*><span>Synthetic role \(fixture-role\)<\/span>/)
+  assert.doesNotMatch(html, /undefined/)
+})
+
+test('refresh button renders shared labels and guards single-flight actions through success and failure', async (context) => {
+  const vue = require('vue')
+  const filename = '../components/ui/RefreshButton.vue'
+  const labels = { label: t('刷新'), loadingLabel: t('刷新中') }
+  // Only the icon is stubbed; the actual button template owns its decorative attributes.
+  const overrides = { '@lucide/vue': { RefreshCw: { render: () => vue.h('svg') } } }
+  for (const flags of [{}, { loading: true }, { disabled: true }, { loading: true, disabled: true }]) {
+    const busy = Boolean(flags.loading)
+    const html = await renderPage(filename, {}, undefined, overrides, {
+      ...labels, ...flags, action: () => assert.fail('SSR must not invoke the refresh action'),
+    })
+    const button = html.match(/<button\b[^>]*>/)?.[0]
+    assert.ok(button, JSON.stringify(flags))
+    assert.match(button, /\btype="button"/)
+    assert.equal(/\sdisabled(?:[\s=>])/.test(button), busy || Boolean(flags.disabled))
+    assert.ok(button.includes(`aria-busy="${busy}"`))
+    assert.ok(button.includes(`aria-label="${busy ? labels.loadingLabel : labels.label}"`))
+    assert.ok(button.includes(`title="${labels.label}"`))
+    assert.ok(html.includes(`<span>${busy ? labels.loadingLabel : labels.label}</span>`))
+    const icon = html.match(/<svg\b[^>]*>/)?.[0]
+    assert.ok(icon, 'the icon stub retains the template attributes, not real icon geometry')
+    assert.match(icon, /aria-hidden="true"/)
+    assert.match(icon, /class="refresh-button-icon(?: is-spinning)?"/)
+    assert.equal(icon.includes('is-spinning'), busy)
+  }
+
+  const calls = []
+  let completion = deferred()
+  const action = (...args) => { calls.push(args); return completion.promise }
+  const props = vue.reactive({ ...labels, loading: false, disabled: false, action })
+  const component = loadPageComponent(filename, {}, overrides)
+  const scope = vue.effectScope()
+  context.after(() => scope.stop())
+  const state = scope.run(() => component.setup(props, { expose: () => {} }))
+  assert.equal(state.pending.value, false)
+  assert.equal(state.busy.value, false)
+
+  const succeeded = state.refresh({ type: 'click' })
+  assert.equal(state.pending.value, true)
+  assert.equal(state.busy.value, true)
+  assert.deepEqual(calls, [[]], 'the action receives no click event or other arguments')
+  await state.refresh()
+  assert.equal(calls.length, 1, 'pending refresh is single-flight')
+  completion.resolve('done')
+  await succeeded
+  assert.equal(state.pending.value, false)
+  assert.equal(state.busy.value, false)
+
+  completion = deferred()
+  const failure = new Error('synthetic refresh failure')
+  const failed = state.refresh()
+  const rejected = assert.rejects(failed, (error) => error === failure)
+  assert.equal(state.pending.value, true)
+  assert.equal(state.busy.value, true)
+  await state.refresh()
+  assert.equal(calls.length, 2, 'a failing in-flight action also excludes duplicates')
+  completion.reject(failure)
+  await rejected
+  assert.equal(state.pending.value, false, 'finally clears pending after rejection')
+  assert.equal(state.busy.value, false)
+
+  const synchronousFailure = new Error('synthetic synchronous refresh failure')
+  props.action = () => { throw synchronousFailure }
+  await assert.rejects(state.refresh(), (error) => error === synchronousFailure)
+  assert.equal(state.pending.value, false)
+  assert.equal(state.busy.value, false)
+  props.action = action
+  for (const flags of [
+    { loading: true, disabled: false },
+    { loading: false, disabled: true },
+    { loading: true, disabled: true },
+  ]) {
+    Object.assign(props, flags)
+    assert.equal(state.busy.value, flags.loading)
+    await state.refresh()
+    assert.equal(calls.length, 2, 'external loading or disabled skips the action')
+    assert.equal(state.pending.value, false)
+  }
+  Object.assign(props, { loading: false, disabled: false })
+  completion = deferred()
+  const recovered = state.refresh()
+  assert.equal(state.pending.value, true)
+  assert.deepEqual(calls, [[], [], []], 'refresh can run again after failures and external guards clear')
+  completion.resolve()
+  await recovered
+  assert.equal(state.pending.value, false)
+  assert.equal(state.busy.value, false)
+})
+
+test('refresh button contracts stay unified across twelve pages and sixteen manual refresh controls', () => {
+  const { parse } = require('@vue/compiler-sfc')
+  const contracts = {
+    'AccountPage.vue': [{ action: 'refreshAuditLogs' }],
+    'AdminSecurityPage.vue': [{ action: 'refreshPage', loading: 'loading || refreshing', disabled: 'loading || refreshing' }],
+    'AlertsPage.vue': [
+      { action: 'refreshAll', loading: 'loading', disabled: 'loading' },
+      { action: '() => loadDeliveries()', loading: 'deliveriesLoading', disabled: 'deliveriesLoading' },
+    ],
+    'CacheManagementPage.vue': [{ action: 'refreshPage', loading: 'loading || refreshing', disabled: 'loading || refreshing || cleaning' }],
+    'ClientsPage.vue': [{ action: 'refreshClientControl' }, { action: 'refreshRateLimitStatus' }],
+    'DiagnosticsPage.vue': [{ action: '() => loadDiagnostics()', loading: 'loading', disabled: 'loading || cleaning' }],
+    'HistoryPage.vue': [{ action: 'refreshPage', loading: 'loading || refreshing', disabled: 'loading || refreshing' }],
+    'LibraryTasksPage.vue': [{ action: 'refreshPage', loading: 'loading || refreshing', disabled: 'loading || refreshing' }],
+    'LogsPage.vue': [{ action: 'refreshActivityLogs', loading: 'logsLoading', disabled: 'logsLoading' }],
+    'OverviewPage.vue': [
+      { action: 'refreshOperationalData' },
+      { action: 'refreshRateLimitStatus' },
+      { action: 'refreshPlaybackSessions', loading: 'playbackLoading', disabled: 'playbackLoading' },
+    ],
+    'SessionsPage.vue': [{ action: 'refreshPage', loading: 'loading || refreshing', disabled: 'loading || refreshing' }],
+    'UsersPage.vue': [{ action: 'refresh', loading: 'loading', disabled: 'loading' }],
+  }
+  const names = new Set(['action', 'loading', 'disabled', 'label', 'loading-label'])
+  let count = 0
+  assert.equal(Object.keys(contracts).length, 12)
+  for (const [filename, expected] of Object.entries(contracts)) {
+    const absolute = path.resolve(__dirname, '../src/pages', filename)
+    const { descriptor, errors } = parse(readFileSync(absolute, 'utf8'), { filename: absolute })
+    assert.deepEqual(errors, [], filename)
+    const buttons = []
+    function visit(node) {
+      if (node.tag === 'RefreshButton') buttons.push(node)
+      node.children?.forEach(visit)
+    }
+    visit(descriptor.template.ast)
+    assert.equal(buttons.length, expected.length, `${filename}: refresh control count`)
+    buttons.forEach((button, index) => {
+      const bindings = {}
+      for (const prop of button.props) {
+        const name = prop.type === 7 ? prop.arg?.content : prop.name
+        if (!names.has(name)) continue
+        assert.equal(prop.type, 7, `${filename}: ${name} must be bound`)
+        assert.equal(prop.name, 'bind', `${filename}: ${name} binding`)
+        assert.equal(prop.arg.isStatic, true, `${filename}: explicit ${name} argument`)
+        assert.equal(Object.hasOwn(bindings, name), false, `${filename}: no duplicate ${name}`)
+        bindings[name] = prop.exp?.content.trim().replace(/\s+/g, ' ')
+      }
+      assert.deepEqual(bindings, {
+        label: "t('刷新')", 'loading-label': "t('刷新中')", ...expected[index],
+      }, `${filename}: refresh control ${index + 1} preserves its action and original busy/disabled conditions`)
+    })
+    count += buttons.length
+  }
+  assert.equal(count, 16, 'all manual refresh controls are covered without inventing external loading flags')
+})
+
 function chartHarness(context, input) {
   const vue = require('vue')
   const mounted = [], unmounted = []
@@ -1019,7 +1553,7 @@ test('library tasks SSR maps configured names in library cards, task rows and fa
     capabilities: { path: { available: false }, progress: { available: false }, last_run: { available: false } },
   }
   const html = await renderPage('LibraryTasksPage.vue', panel, (state) => {
-    state.libraries.value = [{ server_id: 'server-cn', name: '电影媒体库', path: null, capabilities: { path: { available: false } } }]
+    state.libraries.value = [{ server_id: 'server-cn', name: '电影媒体库', path: '/media/movies', capabilities: { path: { available: true } } }]
     state.tasks.value = [task]
     state.selectedTask.value = task
     state.dialogOpen.value = true
@@ -1029,14 +1563,160 @@ test('library tasks SSR maps configured names in library cards, task rows and fa
       props: ['open'], setup: (props, { slots }) => () => props.open ? vue.h('dialog', slots.default?.()) : null,
     },
   })
-  for (const [tag, content] of [['article', '电影媒体库'], ['tbody', '电影扫描'], ['dialog', '模拟失败摘要']]) {
-    const section = html.match(new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)</${tag}>`))?.[1]
-    assert.ok(section, `${tag} must render`)
-    assert.ok(section.includes(content), `${tag} contains its fixture`)
-    assert.ok(section.includes('家庭影音'), `${tag} displays the configured name`)
-    assert.equal(section.includes('server-cn'), false, `${tag} must not display the raw server ID`)
+  for (const [label, pattern, content] of [
+    ['article', /<article\b[^>]*>([\s\S]*?)<\/article>/, '电影媒体库'],
+    ['library-task-list', /<ul\b[^>]*class="library-task-list"[^>]*>([\s\S]*?)<\/ul>/, '电影扫描'],
+    ['dialog', /<dialog\b[^>]*>([\s\S]*?)<\/dialog>/, '模拟失败摘要'],
+  ]) {
+    const section = html.match(pattern)?.[1]
+    assert.ok(section, `${label} must render`)
+    assert.ok(section.includes(content), `${label} contains its fixture`)
+    assert.ok(section.includes('家庭影音'), `${label} displays the configured name`)
+    assert.equal(section.includes('server-cn'), false, `${label} must not display the raw server ID`)
   }
+  const taskList = html.match(/<ul\b[^>]*class="library-task-list"[^>]*>/)?.[0]
+  assert.ok(taskList && /\brole="list"/.test(taskList), 'task list preserves explicit list semantics when markers are hidden')
+  assert.ok(html.includes('class="library-path-list"'), 'library paths also render a separate list')
   assert.ok(html.includes('value="server-cn"'))
+})
+
+test('library task metrics render complete counts or unknown placeholders in valid definition lists', async () => {
+  const vue = require('vue')
+  const panel = {
+    t, api: async () => { assert.fail('SSR must not fetch page data') },
+    encryptPayload: async () => ({}), showNotice: () => {}, clearNotice: () => {},
+    confirmAction: async () => false, promptAction: async () => null, formatLogTime: () => 'fixture-time',
+    serverOptions: vue.ref([{ id: 'server-cn', name: '家庭影音' }]),
+  }
+  const labels = ['媒体库', '运行中', '空闲', '异常任务']
+  for (const status of ['complete', 'loading', 'error', 'partialError']) {
+    for (const populated of [true, false]) {
+      const html = await renderPage('LibraryTasksPage.vue', panel, (state) => {
+        if (populated) {
+          state.libraries.value = ['电影', '剧集'].map((name) => ({
+            server_id: 'server-cn', name, path: null, capabilities: { path: { available: false } },
+          }))
+          state.tasks.value = ['Running', 'Idle', 'Idle', 'Failed', 'failed', 'Completed'].map((taskState, index) => ({
+            id: `scan-${index}`, server_id: 'server-cn', name: `扫描-${index}`, state: taskState,
+            type: null, path: null, progress: null, last_run: null,
+            error: taskState === 'Completed' ? '模拟任务错误' : null,
+            capabilities: { path: { available: false }, progress: { available: false }, last_run: { available: false } },
+          }))
+        }
+        if (status === 'loading') state.loading.value = true
+        if (status === 'error') state.error.value = '模拟加载失败'
+        if (status === 'partialError') state.partialError.value = '模拟部分服务器失败'
+      })
+      const metrics = html.match(/<section\b[^>]*class="library-metrics"[^>]*aria-label="任务概览"[^>]*>([\s\S]*?)<\/section>/)?.[1]
+      assert.ok(metrics, `${status}/${populated}: metrics use a labeled section`)
+      const groups = [...metrics.matchAll(/<div class="library-metric">([\s\S]*?)<\/div>/g)]
+      assert.equal(groups.length, 4)
+      const expected = status !== 'complete' ? ['—', '—', '—', '—'] : populated ? ['2', '1', '2', '3'] : ['0', '0', '0', '0']
+      groups.forEach((group, index) => {
+        assert.match(group[1], /^<span\b[^>]*aria-hidden="true"[^>]*>[\s\S]*?<\/span>\s*<dl><dt>[^<]+<\/dt><dd>[^<]+<\/dd><\/dl>$/,
+          'each metric keeps its decorative icon outside a definition list containing one term/value pair')
+        assert.deepEqual([...group[1].matchAll(/<d[td]>([^<]+)<\/d[td]>/g)].map((match) => match[1]),
+          [labels[index], expected[index]], `${status}/${populated}: ${labels[index]}`)
+      })
+    }
+  }
+})
+
+test('library cards prefer all locations, fall back to path and label unavailable capabilities', async () => {
+  const vue = require('vue')
+  const panel = {
+    t, api: async () => { assert.fail('SSR must not fetch page data') },
+    encryptPayload: async () => ({}), showNotice: () => {}, clearNotice: () => {},
+    confirmAction: async () => false, promptAction: async () => null, formatLogTime: () => 'fixture-time',
+    serverOptions: vue.ref([{ id: 'server-cn', name: '家庭影音' }]),
+  }
+  const longPath = `/media/电影/${'完整目录/'.repeat(16)}最终目录`
+  const fixtures = [
+    { name: '多路径优先', path: '/legacy/ignored', locations: [longPath, '/media/剧集 第二路径'], expected: [longPath, '/media/剧集 第二路径'] },
+    { name: '仅多路径', path: null, locations: ['/media/纪录片', '/media/动画'], expected: ['/media/纪录片', '/media/动画'] },
+    { name: '空列表回退', path: longPath, locations: [], expected: [longPath] },
+    { name: '缺失列表回退', path: '/media/音乐', expected: ['/media/音乐'] },
+    { name: '空列表无路径', path: null, locations: [], expected: [], unavailable: '不可用' },
+    { name: '缺失列表无路径', path: null, expected: [], unavailable: 'Emby 未提供', reason: 'emby_not_provided' },
+  ]
+  const html = await renderPage('LibraryTasksPage.vue', panel, (state) => {
+    state.libraries.value = fixtures.map(({ name, path, locations, reason, expected }) => ({
+      server_id: 'server-cn', name, path,
+      ...(locations === undefined ? {} : { locations }),
+      capabilities: { path: { available: expected.length > 0, unavailable_reason: reason } },
+    }))
+  })
+  const cards = [...html.matchAll(/<article\b[^>]*class="library-card"[^>]*>([\s\S]*?)<\/article>/g)]
+  assert.equal(cards.length, fixtures.length)
+  cards.forEach((card, index) => {
+    const fixture = fixtures[index], content = card[1]
+    assert.ok(content.includes(`<h4>${fixture.name}</h4>`), fixture.name)
+    assert.deepEqual([...content.matchAll(/<code>([^<]*)<\/code>/g)].map((match) => match[1]), fixture.expected,
+      `${fixture.name}: full paths render in order without the legacy fallback`)
+    const rows = [...content.matchAll(/<li\b[^>]*class="library-path-item"[^>]*>([\s\S]*?)<\/li>/g)]
+    const buttons = [...content.matchAll(/<button\b[^>]*class="library-validate"[^>]*>/g)]
+    assert.equal(rows.length, fixture.expected.length, `${fixture.name}: one row per path`)
+    assert.equal(buttons.length, fixture.expected.length, `${fixture.name}: one validation button per path`)
+    fixture.expected.forEach((path, pathIndex) => {
+      assert.ok(rows[pathIndex][1].includes(`<code>${path}</code>`))
+      assert.ok(buttons[pathIndex][0].includes(`aria-label="验证路径: ${path}"`), `${fixture.name}: path-specific accessible name`)
+      assert.ok(buttons[pathIndex][0].includes(`title="验证路径: ${path}"`), `${fixture.name}: full path in button title`)
+    })
+    if (fixture.expected.length) {
+      assert.match(content, /<ul\b[^>]*class="library-path-list"[^>]*aria-label="路径"/)
+      assert.equal(content.includes('class="library-unavailable"'), false)
+    } else {
+      assert.ok(content.includes(`<p class="library-unavailable">${fixture.unavailable}</p>`), fixture.name)
+      assert.equal(content.includes('class="library-path-list"'), false)
+    }
+    assert.equal(content.includes('/legacy/ignored'), false, `${fixture.name}: no fallback duplication`)
+  })
+})
+
+test('library cards render validation status summaries and disable every path button while busy', async () => {
+  const vue = require('vue')
+  const panel = {
+    t, api: async () => { assert.fail('SSR must not fetch page data') },
+    encryptPayload: async () => ({}), showNotice: () => {}, clearNotice: () => {},
+    confirmAction: async () => false, promptAction: async () => null, formatLogTime: () => 'fixture-time',
+    serverOptions: vue.ref([{ id: 'server-cn', name: '家庭影音' }]),
+  }
+  const fixtures = [
+    { path: '/media/缺失状态', label: '未校验', title: '需要显式验证', className: 'is-neutral' },
+    { path: '/media/尚未校验', status: 'unvalidated', label: '未校验', title: '需要显式验证', className: 'is-neutral' },
+    { path: '/media/可用目录', status: 'valid', label: '可用', title: '可用', className: 'is-success' },
+    { path: '/media/失败目录', status: 'invalid', label: '校验失败', title: '校验失败', className: 'is-danger', error: '模拟目录暂不可用' },
+  ]
+  for (const actionTaskId of [null, '', 'server-cn:another-task']) {
+    const html = await renderPage('LibraryTasksPage.vue', panel, (state) => {
+      state.libraries.value = [{
+        server_id: 'server-cn', name: '校验状态矩阵', path: null,
+        locations: fixtures.map((fixture) => fixture.path),
+        location_statuses: fixtures.filter((fixture) => fixture.status).map(({ path, status, error }) => ({ path, status, error })).reverse(),
+        capabilities: { path: { available: true } },
+      }]
+      state.actionTaskId.value = actionTaskId
+    })
+    const card = html.match(/<article\b[^>]*class="library-card"[^>]*>([\s\S]*?)<\/article>/)?.[1]
+    assert.ok(card, 'validation matrix renders a library card')
+    const rows = [...card.matchAll(/<li\b[^>]*class="library-path-item"[^>]*>([\s\S]*?)<\/li>/g)]
+    assert.equal(rows.length, fixtures.length)
+    rows.forEach((row, index) => {
+      const fixture = fixtures[index], content = row[1]
+      const label = `${fixture.path}/${actionTaskId ?? 'null'}`
+      assert.ok(content.includes(`<code>${fixture.path}</code>`), label)
+      const status = content.match(/<span class="library-status ([^"]+)" title="([^"]+)"><span\b[^>]*><\/span>\s*([^<]*?)<\/span>/)
+      assert.ok(status, `${label}: status badge renders`)
+      assert.deepEqual([status[1], status[2], status[3].trim()], [fixture.className, fixture.title, fixture.label],
+        `${label}: class, descriptive title and compact visible label match the path's status`)
+      const errors = [...content.matchAll(/<p class="library-error-text">([^<]*)<\/p>/g)].map((match) => match[1].trim())
+      assert.deepEqual(errors, fixture.error ? [`错误摘要: ${fixture.error}`] : [], `${label}: error summary belongs only to the failed path`)
+      const buttons = [...content.matchAll(/<button\b[^>]*class="library-validate"[^>]*>/g)]
+      assert.equal(buttons.length, 1, label)
+      assert.ok(buttons[0][0].includes(`aria-label="验证路径: ${fixture.path}"`), label)
+      assert.equal(/\sdisabled(?:\s|=|>)/.test(buttons[0][0]), Boolean(actionTaskId), `${label}: validation disabled only while busy`)
+    })
+  }
 })
 
 test('diagnostics summary keeps long step details out of the list and marks only actual failed or bypassed steps', async () => {

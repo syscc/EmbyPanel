@@ -5,7 +5,6 @@ import {
   Copy,
   KeyRound,
   Plus,
-  RefreshCw,
   Search,
   Settings2,
   ShieldCheck,
@@ -17,6 +16,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { usePanelContext } from '@/composables/panel-context'
 import { useUsersController } from '@/composables/useUsersController'
 import UserPolicyFields from '@/components/UserPolicyFields.vue'
+import RefreshButton from '@/components/ui/RefreshButton.vue'
 import SettingsDialogShell from '@/components/ui/SettingsDialogShell.vue'
 import UiSwitch from '@/components/ui/UiSwitch.vue'
 import {
@@ -279,9 +279,13 @@ onMounted(() => void refresh())
           <p class="muted">{{ t('跨服务器用户与访问策略') }}</p>
         </div>
         <div class="panel-actions">
-          <button class="secondary" type="button" :disabled="loading" @click="refresh">
-            <RefreshCw :size="15" />{{ loading ? t('加载中') : t('刷新') }}
-          </button>
+          <RefreshButton
+            :label="t('刷新')"
+            :loading-label="t('刷新中')"
+            :action="refresh"
+            :loading="loading"
+            :disabled="loading"
+          />
           <button class="secondary" type="button" :disabled="!servers.length || templateLoading" @click="openTemplateEditor(servers[0]?.id || '')">
             <Copy :size="15" />{{ t('新建模板') }}
           </button>
@@ -524,7 +528,7 @@ onMounted(() => void refresh())
 .users-panel > .panel-head .panel-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .users-toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) minmax(150px, 220px) minmax(130px, 180px) auto; align-items: end; gap: 12px; margin-bottom: 16px; }
 .users-toolbar label, .users-field-grid label { display: grid; gap: 6px; }
-.users-toolbar label > span, .users-field-grid label > span { color: var(--muted); font-size: 12px; }
+.users-toolbar label > span, .users-field-grid label > span { color: var(--muted); font-size: var(--font-size-label); font-weight: 700; }
 .users-search { display: flex !important; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: 6px; padding: 0 10px; min-height: 38px; }
 .users-search input { border: 0; outline: 0; background: transparent; width: 100%; min-width: 0; }
 .users-table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 6px; }
@@ -537,7 +541,7 @@ onMounted(() => void refresh())
 .users-col-streams { width: 8%; }
 .users-col-actions { width: 216px; }
 .users-table th, .users-table td { padding: 11px 12px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: middle; }
-.users-table th { color: var(--muted); font-size: 12px; font-weight: 600; white-space: nowrap; }
+.users-table th { color: var(--muted); font-size: var(--font-size-label); font-weight: 700; white-space: nowrap; }
 .users-table td { font-size: 13px; }
 .users-table tbody tr:last-child td { border-bottom: 0; }
 .users-table td small, .users-table td > span + small { display: block; color: var(--muted); margin-top: 3px; font-size: 11px; }
@@ -559,18 +563,18 @@ onMounted(() => void refresh())
 .users-template-actions { display: flex; flex: 0 0 auto; gap: 5px; }
 .users-template-apply { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 10px; }
 .users-template-apply label { display: grid; gap: 6px; }
-.users-template-apply label > span { color: var(--muted); font-size: 12px; }
+.users-template-apply label > span { color: var(--muted); font-size: var(--font-size-label); font-weight: 700; }
 .users-policy-form, .users-password-form { display: grid; gap: 14px; padding: 18px; }
 .users-dialog-meta-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .users-dialog-meta-grid label { display: grid; gap: 6px; }
-.users-dialog-meta-grid label > span { color: var(--muted); font-size: 12px; }
+.users-dialog-meta-grid label > span { color: var(--muted); font-size: var(--font-size-label); font-weight: 700; }
 .users-toggle-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 16px; }
 .users-field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .users-field-grid label:last-child:nth-child(odd) { grid-column: 1 / -1; }
 .users-access-list { display: grid; align-content: start; gap: 7px; min-height: 92px; max-height: 150px; overflow: auto; padding: 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--subtle-bg); }
 .users-access-list.disabled { opacity: .55; }
 .users-limit-section, .users-password-form { border-top: 1px solid var(--border); }
-.users-section-title { display: flex; align-items: center; gap: 7px; font-weight: 600; font-size: 13px; margin-bottom: 10px; }
+.users-section-title { display: flex; align-items: center; gap: 7px; font-weight: 700; font-size: var(--font-size-section); line-height: 1.4; margin-bottom: 10px; }
 .users-password-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; }
 .notice.warning { color: var(--warning, #a16207); }
 @media (max-width: 760px) {
@@ -580,7 +584,8 @@ onMounted(() => void refresh())
   .users-toolbar > button { justify-self: stretch; min-height: 40px; }
   .users-toggle-grid, .users-field-grid, .users-password-row, .users-dialog-meta-grid { grid-template-columns: 1fr; }
   .users-panel > .panel-head .panel-actions { justify-content: flex-start; width: 100%; }
-  .users-panel > .panel-head .panel-actions button { flex: 1 1 120px; min-height: 40px; }
+  .users-panel > .panel-head .panel-actions button { flex: 1 1 120px; }
+  .users-panel > .panel-head .panel-actions button:not(.refresh-button) { min-height: 40px; }
   .users-template-apply { grid-template-columns: 1fr; }
   .users-template-row { align-items: stretch; flex-direction: column; }
   .users-template-actions { width: 100%; }
@@ -619,8 +624,8 @@ onMounted(() => void refresh())
   .users-table td::before {
     content: attr(data-label);
     color: var(--muted);
-    font-size: 11px;
-    font-weight: 600;
+    font-size: var(--font-size-label);
+    font-weight: 700;
   }
   .users-table td.users-cell-primary,
   .users-table td.users-cell-actions { grid-column: 1 / -1; }

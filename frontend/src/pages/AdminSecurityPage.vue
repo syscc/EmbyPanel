@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { usePanelContext } from '@/composables/panel-context'
 import { useAdminSecurityController, type Admin } from '@/composables/useAdminSecurityController'
+import RefreshButton from '@/components/ui/RefreshButton.vue'
 import SettingsDialogShell from '@/components/ui/SettingsDialogShell.vue'
 import UiSwitch from '@/components/ui/UiSwitch.vue'
 import CheckboxField from '@/components/ui/CheckboxField.vue'
@@ -392,9 +393,13 @@ function closeRecoveryDialog(open: boolean) {
         <h1>{{ t('管理员安全') }}</h1>
         <p>{{ t('多管理员安全管理') }}</p>
       </div>
-      <button class="secondary-button" type="button" :disabled="loading || refreshing" @click="refreshPage">
-        {{ t('刷新') }}
-      </button>
+      <RefreshButton
+        :label="t('刷新')"
+        :loading-label="t('刷新中')"
+        :action="refreshPage"
+        :loading="loading || refreshing"
+        :disabled="loading || refreshing"
+      />
     </header>
 
     <div v-if="loading" class="state-message">{{ t('加载中') }}</div>
@@ -673,27 +678,47 @@ function closeRecoveryDialog(open: boolean) {
 
 <style scoped>
 .admin-security-page { display: grid; gap: 1rem; }
-.page-head, .section-head, .security-row, .two-factor-actions, .section-actions { display: flex; align-items: center; justify-content: space-between; gap: .75rem; }
-.page-head p, .security-row small, .state-message, .roles-details, .two-factor-section > small { color: var(--muted); }
+.admin-security-page, .dialog-form, .secret-result, .recovery-codes { font-size: var(--font-size-body); line-height: 1.6; }
+.page-head, .section-head, .security-row, .two-factor-actions, .section-actions { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .75rem; }
+.page-head h1 { margin: 0; font-size: var(--font-size-page); font-weight: 700; line-height: 1.3; }
+.section-head h2 { font-size: var(--font-size-section); font-weight: 700; line-height: 1.4; }
+.page-head p { margin: .25rem 0 0; }
+.page-head p, .security-row small, .state-message, .roles-details, .two-factor-section > small, .secret-result small { color: var(--muted); }
+.page-head p, .security-row small, .state-message, .section-head > span, .section-actions > span, .compact-list span, .two-factor-section > small, .secret-result small { font-size: 12px; line-height: 1.6; }
+.security-row strong, .compact-list strong { font-size: 13px; font-weight: 600; }
 .security-section { display: grid; gap: .75rem; }
 .security-list { display: grid; gap: .5rem; list-style: none; padding: 0; margin: 0; }
 .security-row { align-items: flex-start; border: 1px solid var(--border); border-radius: .5rem; padding: .75rem; }
-.security-row > div:first-child { display: grid; gap: .25rem; min-width: 0; }
-.row-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: .5rem; }
-.row-meta { display: grid; gap: .25rem; text-align: right; color: var(--muted); font-size: .8rem; }
+.security-row > div:first-child { display: grid; flex: 1 1 16rem; gap: .25rem; min-width: 0; overflow-wrap: anywhere; }
+.row-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: .5rem; min-width: 0; max-width: 100%; }
+.row-meta { display: grid; gap: .25rem; min-width: 0; text-align: right; color: var(--muted); font-size: var(--font-size-meta); line-height: 1.6; overflow-wrap: anywhere; }
 .compact-list { margin-top: .75rem; }
-.compact-list li { display: flex; justify-content: space-between; gap: 1rem; }
+.compact-list li { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 1rem; }
+.compact-list li > * { min-width: 0; overflow-wrap: anywhere; }
 .state-message.error { color: var(--danger, #b42318); }
 .state-message.warning { color: var(--warning, #a15c00); }
 .dialog-form { display: grid; gap: .75rem; padding: 1rem; }
-.dialog-form label, .secret-result label { display: grid; gap: .35rem; }
-.dialog-form input { min-width: 0; }
+.dialog-form > label:not(.check), .secret-result label { display: grid; gap: .35rem; min-width: 0; color: var(--muted-strong); font-size: var(--font-size-label); font-weight: 700; }
+.dialog-form input { min-width: 0; font-weight: 400; }
 .choice-group { display: grid; gap: .5rem; min-width: 0; margin: 0; padding: .75rem; border: 1px solid var(--border); border-radius: .5rem; }
+.choice-group legend { color: var(--muted-strong); font-size: 11px; font-weight: 700; }
+.dialog-form :deep(.check) { min-width: 0; }
+.dialog-form :deep(.check input) { flex-shrink: 0; }
+.dialog-form :deep(.check span) { min-width: 0; overflow-wrap: anywhere; }
 .choice-list { align-content: start; }
 .secret-result, .recovery-codes { display: grid; gap: .75rem; padding: 1rem; }
-.secret-result code, .recovery-codes code { overflow-wrap: anywhere; user-select: all; white-space: pre-wrap; }
-.primary-button, .secondary-button, .danger-button { border: 1px solid var(--border); border-radius: .4rem; padding: .45rem .7rem; cursor: pointer; }
+.secret-result code, .recovery-codes code { min-width: 0; color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; font-weight: 400; overflow-wrap: anywhere; user-select: all; white-space: pre-wrap; }
+.primary-button, .secondary-button, .danger-button { border: 1px solid var(--border); border-radius: .4rem; padding: .45rem .7rem; font-size: 12px; font-weight: 600; line-height: 1.4; cursor: pointer; }
 .primary-button { background: var(--primary, #2563eb); color: white; }
+.secondary-button { background: var(--button-bg); color: var(--button-text); }
 .danger-button { color: var(--danger, #b42318); }
-button:disabled { cursor: not-allowed; opacity: .55; }
+button:disabled:not(.refresh-button) { cursor: not-allowed; opacity: .55; }
+@media (max-width: 700px) {
+  .page-head, .section-head { align-items: flex-start; }
+  .security-row > div:first-child { flex-basis: 100%; }
+  .row-actions { width: 100%; justify-content: flex-start; }
+  .row-meta { text-align: left; }
+  .compact-list li { gap: .35rem; }
+  .compact-list li > * { flex-basis: 100%; }
+}
 </style>

@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { MessageCircle, RefreshCw, StopCircle } from '@lucide/vue'
+import { MessageCircle, StopCircle } from '@lucide/vue'
 import { usePanelContext } from '@/composables/panel-context'
 import { useSessionsController, type SessionDetail } from '@/composables/useSessionsController'
 import { formatTicks } from '@/lib/panel-formatters'
+import RefreshButton from '@/components/ui/RefreshButton.vue'
 import SettingsDialogShell from '@/components/ui/SettingsDialogShell.vue'
 
 const panel = usePanelContext()
@@ -112,7 +113,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="p-6">
+  <div class="sessions-page p-6">
     <div v-if="error" class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4">
       {{ error }}
     </div>
@@ -126,16 +127,13 @@ onUnmounted(() => {
             {{ option.label }}
           </option>
         </select>
-        <button
-          type="button"
+        <RefreshButton
+          :label="t('刷新')"
+          :loading-label="t('刷新中')"
+          :action="refreshPage"
+          :loading="loading || refreshing"
           :disabled="loading || refreshing"
-          class="secondary icon-button shrink-0 disabled:cursor-not-allowed disabled:opacity-50"
-          :aria-label="t('刷新')"
-          :title="t('刷新')"
-          @click="refreshPage"
-        >
-          <RefreshCw class="h-4 w-4" :class="{ 'animate-spin': loading }" aria-hidden="true" />
-        </button>
+        />
       </div>
       <div class="text-sm text-gray-500">{{ selectedCountLabel }}</div>
     </div>
@@ -222,7 +220,7 @@ onUnmounted(() => {
       :close-label="t('关闭')"
       @update:open="onDetailOpenChange"
     >
-      <dl v-if="selectedSession" class="grid gap-3 p-4 sm:grid-cols-2">
+      <dl v-if="selectedSession" class="sessions-detail grid gap-3 p-4 sm:grid-cols-2">
         <div><dt class="font-semibold">{{ t('服务器') }}</dt><dd>{{ sessionValue(selectedSession.server_name) }}</dd></div>
         <div><dt class="font-semibold">{{ t('用户') }}</dt><dd>{{ sessionValue(selectedSession.user_name) }}</dd></div>
         <div><dt class="font-semibold">{{ t('设备') }}</dt><dd>{{ sessionValue(selectedSession.device_name) }} · {{ sessionValue(selectedSession.client) }}</dd></div>
@@ -241,3 +239,34 @@ onUnmounted(() => {
     </SettingsDialogShell>
   </div>
 </template>
+
+<style scoped>
+.sessions-page table {
+  font-size: var(--font-size-body);
+}
+
+.sessions-page th {
+  font-size: var(--font-size-label);
+  font-weight: 700;
+}
+
+.sessions-page .text-xs,
+.sessions-page .text-sm {
+  font-size: var(--font-size-meta);
+}
+
+.sessions-page td button {
+  font-size: var(--font-size-control);
+  font-weight: 600;
+}
+
+.sessions-detail dt {
+  font-size: var(--font-size-label);
+  font-weight: 700;
+}
+
+.sessions-detail dd {
+  font-size: var(--font-size-body);
+  font-weight: 400;
+}
+</style>

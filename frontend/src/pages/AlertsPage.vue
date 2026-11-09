@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { Bell, History, Plus, RefreshCw, Trash2, Webhook } from '@lucide/vue'
+import { Bell, History, Plus, Trash2, Webhook } from '@lucide/vue'
 import { computed, onBeforeUnmount, onMounted } from 'vue'
 import CheckboxField from '@/components/ui/CheckboxField.vue'
+import RefreshButton from '@/components/ui/RefreshButton.vue'
 import SettingsDialogShell from '@/components/ui/SettingsDialogShell.vue'
 import UiSwitch from '@/components/ui/UiSwitch.vue'
 import { usePanelContext } from '@/composables/panel-context'
@@ -112,15 +113,13 @@ function handleDialogOpenChange(open: boolean) {
           </p>
         </div>
         <div class="panel-actions">
-          <button
-            class="secondary"
-            type="button"
+          <RefreshButton
+            :label="t('刷新')"
+            :loading-label="t('刷新中')"
+            :action="refreshAll"
+            :loading="loading"
             :disabled="loading"
-            @click="refreshAll"
-          >
-            <RefreshCw :size="15" />
-            {{ loading ? t('加载中') : t('刷新') }}
-          </button>
+          />
           <button class="primary" type="button" @click="openCreateDialog">
             <Plus :size="15" />
             {{ t('添加规则') }}
@@ -242,15 +241,13 @@ function handleDialogOpenChange(open: boolean) {
           <p class="muted">{{ t('最近交付') }}</p>
         </div>
         <div class="panel-actions">
-          <button
-            class="secondary"
-            type="button"
+          <RefreshButton
+            :label="t('刷新')"
+            :loading-label="t('刷新中')"
+            :action="() => loadDeliveries()"
+            :loading="deliveriesLoading"
             :disabled="deliveriesLoading"
-            @click="loadDeliveries()"
-          >
-            <RefreshCw :size="15" />
-            {{ deliveriesLoading ? t('加载中') : t('刷新') }}
-          </button>
+          />
         </div>
       </div>
 
@@ -542,7 +539,8 @@ function handleDialogOpenChange(open: boolean) {
 
 .alert-rule-head h3 {
   margin: 0 0 0.25rem;
-  font-size: 1rem;
+  font-size: var(--font-size-section);
+  font-weight: 700;
 }
 
 .alert-rule-meta {
@@ -550,13 +548,14 @@ function handleDialogOpenChange(open: boolean) {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0.75rem;
   margin: 0.9rem 0;
-  font-size: 0.9rem;
+  font-size: var(--font-size-body);
 }
 
 .meta-label {
   display: block;
   color: var(--muted, #8b93a7);
-  font-size: 0.78rem;
+  font-size: var(--font-size-label);
+  font-weight: 700;
   margin-bottom: 0.15rem;
 }
 
@@ -578,7 +577,12 @@ function handleDialogOpenChange(open: boolean) {
 .delivery-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 0.9rem;
+  font-size: var(--font-size-body);
+}
+
+.delivery-table th {
+  font-size: var(--font-size-label);
+  font-weight: 700;
 }
 
 .delivery-table th,
@@ -603,6 +607,7 @@ function handleDialogOpenChange(open: boolean) {
 }
 
 .history-item {
+  font-size: var(--font-size-body);
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 0.75rem 0.9rem;
@@ -615,9 +620,13 @@ function handleDialogOpenChange(open: boolean) {
   margin-bottom: 0.35rem;
 }
 
+.history-item .muted {
+  font-size: var(--font-size-meta);
+}
+
 .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 0.8rem;
+  font-size: 12px;
 }
 
 .grid.two {

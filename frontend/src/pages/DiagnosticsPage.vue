@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ChevronLeft, ChevronRight, Film, GitBranch, Monitor, RefreshCw, RotateCcw, Search, Server, Trash2, TriangleAlert } from '@lucide/vue'
 import { useDiagnosticsController, type DiagnosisRecord, type DiagnosisStep } from '@/composables/useDiagnosticsController'
 import { usePanelContext } from '@/composables/panel-context'
+import RefreshButton from '@/components/ui/RefreshButton.vue'
 import SettingsDialogShell from '@/components/ui/SettingsDialogShell.vue'
 
 const { t, showNotice, clearNotice, api, confirmAction } = usePanelContext()
@@ -68,10 +69,13 @@ onUnmounted(dispose)
         </div>
       </div>
       <div class="header-actions">
-        <button type="button" class="secondary" :disabled="loading || cleaning" @click="() => loadDiagnostics()">
-          <RefreshCw :size="15" :class="{ spinning: loading }" aria-hidden="true" />
-          {{ loading ? t('加载中') : t('刷新') }}
-        </button>
+        <RefreshButton
+          :label="t('刷新')"
+          :loading-label="t('刷新中')"
+          :action="() => loadDiagnostics()"
+          :loading="loading"
+          :disabled="loading || cleaning"
+        />
         <button
           v-if="canGlobalCleanup"
           type="button"
@@ -302,11 +306,11 @@ onUnmounted(dispose)
   color: var(--brand);
   background: color-mix(in srgb, var(--brand) 7%, var(--panel-bg));
 }
-.page-heading h1 { margin: 0; font-size: 21px; font-weight: 650; letter-spacing: -0.5px; }
+.page-heading h1 { margin: 0; font-size: var(--font-size-page); font-weight: 700; line-height: 1.3; letter-spacing: -0.5px; }
 .header-actions,
 .filter-actions,
 .pager-actions { gap: 8px; flex-shrink: 0; }
-.diagnostics-page button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; font-size: 12px; }
+.diagnostics-page button:not(.refresh-button) { display: inline-flex; align-items: center; justify-content: center; gap: 7px; font-size: var(--font-size-control); font-weight: 600; }
 .diagnostics-page button:focus-visible { outline: 2px solid var(--brand); outline-offset: 3px; }
 
 .diagnostics-filters {
@@ -320,8 +324,8 @@ onUnmounted(dispose)
   background: var(--panel-bg);
 }
 .diagnostics-filters label { display: grid; gap: 6px; min-width: 0; }
-.diagnostics-filters label > span { color: var(--muted-strong); font-size: 11px; font-weight: 600; }
-.diagnostics-filters input { width: 100%; min-width: 0; height: 34px; padding: 0 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--app-bg); color: var(--text); font-size: 12px; }
+.diagnostics-filters label > span { color: var(--muted-strong); font-size: var(--font-size-label); font-weight: 700; }
+.diagnostics-filters input { width: 100%; min-width: 0; height: 34px; padding: 0 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--app-bg); color: var(--text); font-size: var(--font-size-body); font-weight: 400; }
 .diagnostics-filters input:focus { border-color: var(--brand); outline: 2px solid color-mix(in srgb, var(--brand) 16%, transparent); }
 .filter-submit { color: var(--panel-bg); background: var(--primary); }
 .filter-submit:hover:not(:disabled) { opacity: 0.9; }
@@ -329,7 +333,7 @@ onUnmounted(dispose)
 .diagnostics-results { min-width: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 12px; background: var(--panel-bg); box-shadow: 0 4px 18px var(--shadow-soft); }
 .results-header { min-height: 58px; padding: 14px 18px; flex-wrap: wrap; border-bottom: 1px solid var(--border-soft); }
 .results-heading { gap: 9px; }
-.results-heading h2 { margin: 0; font-size: 14px; font-weight: 650; }
+.results-heading h2 { margin: 0; font-size: var(--font-size-section); font-weight: 700; }
 .record-count { min-width: 24px; padding: 2px 7px; border-radius: 6px; background: var(--button-bg); color: var(--muted-strong); text-align: center; font: 11px ui-monospace, monospace; }
 .results-summary { gap: 18px; color: var(--muted); font-size: 11px; }
 .results-summary strong { margin-left: 5px; color: var(--text); font-variant-numeric: tabular-nums; }
@@ -345,10 +349,10 @@ onUnmounted(dispose)
 .diagnostic-record.is-cancelled { box-shadow: inset 3px 0 var(--warn-text); }
 .diagnostic-record.is-cancelled .record-error { color: var(--warn-text); }
 .record-title { min-width: 0; gap: 9px; flex-wrap: wrap; }
-.diagnostics-page .request-link { min-width: 0; max-width: 100%; height: auto; padding: 2px 0; border-radius: 3px; background: transparent; color: var(--text); font-weight: 650; }
+.diagnostics-page .request-link { min-width: 0; max-width: 100%; height: auto; padding: 2px 0; border-radius: 3px; background: transparent; color: var(--text); font-weight: 600; }
 .request-link code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
 .request-link:hover { color: var(--brand); }
-.status-badge { gap: 5px; padding: 3px 7px; border: 1px solid var(--border-soft); border-radius: 5px; font-size: 10px; line-height: 1.3; }
+.status-badge { gap: 5px; padding: 3px 7px; border: 1px solid var(--border-soft); border-radius: 5px; font-size: var(--font-size-meta); line-height: 1.4; }
 .status-badge.is-neutral { color: var(--muted); background: var(--subtle-bg); }
 .status-badge.is-hit { border-color: color-mix(in srgb, var(--success-text) 16%, var(--border-soft)); color: var(--success-text); background: var(--success-bg); }
 .status-badge.is-failed { color: var(--danger-text); background: var(--danger-bg); border-color: var(--danger-border); }
@@ -368,7 +372,7 @@ onUnmounted(dispose)
 .chain-step { display: inline-flex; align-items: center; gap: 6px; min-width: 0; padding: 5px 9px; border: 1px solid var(--border-soft); border-radius: 6px; background: var(--subtle-bg); font-size: 11px; line-height: 1.4; }
 .step-dot { flex-shrink: 0; width: 5px; height: 5px; border-radius: 50%; background: var(--brand); }
 .step-name { color: var(--text-soft); overflow-wrap: anywhere; }
-.step-duration { color: var(--text); font-variant-numeric: tabular-nums; white-space: nowrap; font-size: 10px; }
+.step-duration { color: var(--text); font-variant-numeric: tabular-nums; white-space: nowrap; font-size: var(--font-size-meta); }
 .duration-unit { color: var(--muted); }
 .chain-step.skipped { border-style: dashed; background: transparent; }
 .chain-step.skipped .step-dot { background: var(--muted); }
@@ -383,7 +387,7 @@ onUnmounted(dispose)
 .chain-step.cancelled .step-name,
 .chain-step.cancelled .step-duration { color: var(--warn-text); }
 .no-steps { margin: 10px 0 0; color: var(--muted); font-size: 12px; }
-.record-error { margin: 9px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--danger-text); font-size: 11px; }
+.record-error { margin: 9px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--danger-text); font-size: var(--font-size-help); }
 .diagnostics-pager { min-height: 60px; padding: 12px 18px; border-top: 1px solid var(--border-soft); color: var(--muted); font-size: 11px; }
 .diagnostics-pager strong { margin-left: 3px; color: var(--text); }
 .pager-divider { margin: 0 8px; color: var(--border-strong); }
@@ -393,11 +397,11 @@ onUnmounted(dispose)
 .diagnostics-detail { padding: 20px; min-width: 0; }
 .detail-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin: 0 0 24px; padding-bottom: 18px; border-bottom: 1px solid var(--border-soft); }
 .detail-summary > div { min-width: 0; }
-.detail-summary dt { margin-bottom: 6px; color: var(--muted); font-size: 11px; }
-.detail-summary dd { margin: 0; color: var(--text); font-size: 12px; overflow-wrap: anywhere; }
+.detail-summary dt { margin-bottom: 6px; color: var(--muted); font-size: var(--font-size-label); font-weight: 700; }
+.detail-summary dd { margin: 0; color: var(--text); font-size: var(--font-size-body); overflow-wrap: anywhere; }
 .detail-ua { grid-column: span 2; }
 .detail-summary .cache-hit-text { color: var(--success-text); }
-.detail-section h3 { display: flex; align-items: center; gap: 8px; margin: 0 0 18px; font-size: 13px; font-weight: 650; }
+.detail-section h3 { display: flex; align-items: center; gap: 8px; margin: 0 0 18px; font-size: var(--font-size-section); font-weight: 700; }
 .detail-section h3 > span { color: var(--muted); font-size: 11px; font-weight: 400; }
 .detail-timeline { margin: 0; padding: 0; list-style: none; }
 .detail-step { position: relative; display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 12px; padding-bottom: 19px; }
@@ -407,15 +411,15 @@ onUnmounted(dispose)
 .detail-step.skipped .step-index { color: var(--muted); background: var(--subtle-bg); border-style: dashed; }
 .detail-step.cancelled .step-index { color: var(--warn-text); background: var(--warn-bg); }
 .detail-step-head { gap: 9px; min-height: 26px; flex-wrap: wrap; }
-.detail-step-head h4 { margin: 0; font-size: 12px; font-weight: 650; }
-.detail-step-state { color: var(--muted); font-size: 10px; }
+.detail-step-head h4 { margin: 0; font-size: var(--font-size-body); font-weight: 600; }
+.detail-step-state { color: var(--muted); font-size: var(--font-size-meta); }
 .detail-step.failed .detail-step-state { color: var(--danger-text); }
 .detail-step.cancelled .detail-step-state { color: var(--warn-text); }
 .detail-step-duration { margin-left: auto; color: var(--text-soft); font: 11px ui-monospace, monospace; }
 .step-details { margin: 7px 0 0; padding: 10px 12px; border: 1px solid var(--border-soft); border-radius: 7px; background: var(--subtle-bg); color: var(--text-soft); font: 11px/1.8 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .detail-step.failed .step-details { border-color: var(--danger-border); }
-.detail-errors { padding: 14px; border: 1px solid var(--danger-border); border-radius: 8px; color: var(--danger-text); background: var(--danger-bg); font-size: 12px; overflow-wrap: anywhere; }
-.detail-errors h3 { display: flex; align-items: center; gap: 6px; margin: 0 0 8px; font-size: 12px; }
+.detail-errors { padding: 14px; border: 1px solid var(--danger-border); border-radius: 8px; color: var(--danger-text); background: var(--danger-bg); font-size: var(--font-size-body); overflow-wrap: anywhere; }
+.detail-errors h3 { display: flex; align-items: center; gap: 6px; margin: 0 0 8px; font-size: var(--font-size-section); font-weight: 700; }
 .detail-errors p { margin: 6px 0; }
 .detail-errors ul { margin: 8px 0 0; padding-left: 18px; white-space: pre-wrap; }
 .detail-errors.is-cancelled { color: var(--warn-text); background: var(--warn-bg); border-color: color-mix(in srgb, var(--warn-text) 24%, var(--border)); }
@@ -427,17 +431,19 @@ onUnmounted(dispose)
   .filter-actions { justify-content: flex-end; }
   .number-field { max-width: none; }
 }
+@media (max-width: 700px) {
+  .diagnostics-filters input { font-size: 16px; }
+}
 @media (max-width: 640px) {
   .diagnostics-page { gap: 14px; }
   .diagnostics-header { align-items: flex-start; flex-direction: column; }
-  .page-heading h1 { font-size: 19px; }
   .heading-icon { width: 38px; height: 38px; }
   .header-actions { width: 100%; }
   .diagnostics-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 10px; padding: 14px; }
   .filter-actions { align-self: end; }
   .filter-actions button { flex: 1; padding: 0 9px; }
   .results-header { padding: 13px 14px; gap: 10px; }
-  .results-summary { gap: 12px; font-size: 10px; }
+  .results-summary { gap: 12px; font-size: var(--font-size-meta); }
   .diagnostic-record { padding: 14px; }
   .record-title { gap: 6px; }
   .record-meta { flex-wrap: wrap; gap: 7px 14px; }
@@ -445,7 +451,7 @@ onUnmounted(dispose)
   .meta-media { flex: 0 1 36%; }
   .meta-client { flex: 1 1 50%; }
   .step-chain { gap: 5px; }
-  .chain-step { padding: 5px 7px; font-size: 10px; }
+  .chain-step { padding: 5px 7px; font-size: var(--font-size-meta); }
   .diagnostics-pager { padding: 12px 14px; gap: 10px; flex-wrap: wrap; }
   .pager-actions { margin-left: auto; }
   .pager-actions button { padding: 0 9px; }

@@ -3,12 +3,12 @@ import {
   Check,
   Clock3,
   Plus,
-  RefreshCw,
   ShieldCheck,
   Trash2,
   Users,
 } from '@lucide/vue'
 import CheckboxField from '@/components/ui/CheckboxField.vue'
+import RefreshButton from '@/components/ui/RefreshButton.vue'
 import { usePanelContext } from '@/composables/panel-context'
 import UiSwitch from '@/components/ui/UiSwitch.vue'
 
@@ -59,9 +59,11 @@ const {
           </p>
         </div>
         <div class="panel-actions">
-          <button class="secondary" @click="refreshClientControl">
-            <RefreshCw :size="15" />{{ t('刷新') }}
-          </button>
+          <RefreshButton
+            :label="t('刷新')"
+            :loading-label="t('刷新中')"
+            :action="refreshClientControl"
+          />
           <button
             class="primary"
             :disabled="savingClientControl"
@@ -189,9 +191,11 @@ const {
             {{ t('显示当前检测窗口内各 IP 的播放请求计数。') }}
           </p>
         </div>
-        <button class="secondary" @click="refreshRateLimitStatus">
-          <RefreshCw :size="15" />{{ t('刷新') }}
-        </button>
+        <RefreshButton
+          :label="t('刷新')"
+          :loading-label="t('刷新中')"
+          :action="refreshRateLimitStatus"
+        />
       </div>
       <div v-if="rateLimitWindows.length" class="rate-window-table-wrap">
         <table class="rate-window-table">

@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { Check, FileText, RefreshCw, UserRound } from '@lucide/vue'
+import { Check, FileText, UserRound } from '@lucide/vue'
+import RefreshButton from '@/components/ui/RefreshButton.vue'
 import { usePanelContext } from '@/composables/panel-context'
 
 const {
@@ -107,9 +108,11 @@ const {
             }}
           </p>
         </div>
-        <button class="secondary" @click="refreshAuditLogs">
-          <RefreshCw :size="15" />{{ t('刷新') }}
-        </button>
+        <RefreshButton
+          :label="t('刷新')"
+          :loading-label="t('刷新中')"
+          :action="refreshAuditLogs"
+        />
       </div>
       <div class="audit-toolbar">
         <label>

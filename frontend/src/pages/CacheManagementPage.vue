@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { RefreshCw, Search, Trash2 } from '@lucide/vue'
+import { Search, Trash2 } from '@lucide/vue'
+import RefreshButton from '@/components/ui/RefreshButton.vue'
 import { useCacheManagementController } from '@/composables/useCacheManagementController'
 import { usePanelContext } from '@/composables/panel-context'
 
@@ -89,15 +90,13 @@ onBeforeUnmount(() => {
           </p>
         </div>
         <div class="panel-actions">
-          <button
-            type="button"
-            class="secondary"
+          <RefreshButton
+            :label="t('刷新')"
+            :loading-label="t('刷新中')"
+            :action="refreshPage"
+            :loading="loading || refreshing"
             :disabled="loading || refreshing || cleaning"
-            @click="refreshPage"
-          >
-            <RefreshCw :size="15" />
-            {{ loading || refreshing ? t('加载中') : t('刷新') }}
-          </button>
+          />
           <button
             v-if="canCleanupAll"
             type="button"
@@ -329,7 +328,8 @@ onBeforeUnmount(() => {
 
 .cache-stat-label {
   color: var(--muted, #888);
-  font-size: 0.85rem;
+  font-size: var(--font-size-label);
+  font-weight: 700;
 }
 
 .cache-toolbar {
@@ -351,9 +351,10 @@ onBeforeUnmount(() => {
   flex: 1;
 }
 
-.cache-field span {
+.cache-field > span {
   color: var(--muted, #888);
-  font-size: 0.85rem;
+  font-size: var(--font-size-label);
+  font-weight: 700;
 }
 
 .cache-field input {
@@ -374,6 +375,12 @@ onBeforeUnmount(() => {
 .cache-table {
   width: 100%;
   border-collapse: collapse;
+  font-size: var(--font-size-body);
+}
+
+.cache-table th {
+  font-size: var(--font-size-label);
+  font-weight: 700;
 }
 
 .cache-table th,
@@ -412,6 +419,8 @@ onBeforeUnmount(() => {
   .cache-table td::before {
     content: attr(data-label);
     color: var(--muted, #888);
+    font-size: var(--font-size-label);
+    font-weight: 700;
   }
 }
 </style>

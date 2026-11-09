@@ -69,7 +69,7 @@ function itemKey(item: MetricItem, index: number) {
   min-height: 0;
   padding: 0;
   background: transparent;
-  font-size: 0.875rem;
+  font-size: var(--font-size-body);
 }
 
 .metric-item {
@@ -109,7 +109,7 @@ function itemKey(item: MetricItem, index: number) {
   overflow: hidden;
   margin-bottom: 0.45rem;
   color: var(--muted);
-  font-size: 0.72rem;
+  font-size: var(--font-size-label);
   font-weight: 700;
   letter-spacing: 0.04em;
   text-overflow: ellipsis;
@@ -121,7 +121,7 @@ function itemKey(item: MetricItem, index: number) {
   color: var(--text);
   font-size: 1.45rem;
   font-variant-numeric: tabular-nums;
-  font-weight: 750;
+  font-weight: 700;
   line-height: 1.1;
 }
 
@@ -141,15 +141,15 @@ function itemKey(item: MetricItem, index: number) {
   min-height: 1.25rem;
   margin-top: 0.5rem;
   color: var(--muted);
-  font-size: 0.72rem;
-  line-height: 1.45;
+  font-size: var(--font-size-help);
+  line-height: 1.6;
 }
 
 .metric-empty {
   width: 100%;
   padding: 0.75rem;
   color: var(--muted);
-  font-size: 0.875rem;
+  font-size: var(--font-size-body);
   text-align: center;
 }
 

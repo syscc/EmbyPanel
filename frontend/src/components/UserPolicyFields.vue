@@ -273,7 +273,7 @@ function removeSchedule(index: number) {
 <style scoped>
 .user-policy-fields { display: grid; gap: 10px; }
 .user-policy-section { min-width: 0; overflow: hidden; padding: 0 14px 14px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel-bg); }
-.user-policy-section > summary { display: flex; align-items: center; gap: 8px; min-height: 44px; margin: 0 -14px; padding: 10px 14px; cursor: pointer; list-style: none; color: var(--text); font-size: 13px; font-weight: 700; }
+.user-policy-section > summary { display: flex; align-items: center; gap: 8px; min-height: 44px; margin: 0 -14px; padding: 10px 14px; cursor: pointer; list-style: none; color: var(--text); font-size: var(--font-size-section); font-weight: 700; line-height: 1.4; }
 .user-policy-section > summary::-webkit-details-marker { display: none; }
 .user-policy-section > summary:hover { background: var(--subtle-bg); }
 .user-policy-section > summary:focus-visible { outline: 2px solid color-mix(in srgb, var(--focus-ring) 72%, transparent); outline-offset: -2px; }
@@ -284,13 +284,14 @@ function removeSchedule(index: number) {
 .user-policy-field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
 .user-policy-field-grid.compact { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .user-policy-field-grid > label, .user-policy-full-field { display: grid; gap: 6px; }
-.user-policy-field-grid > label > span, .user-policy-full-field > span, .user-policy-subsection > span { color: var(--muted); font-size: 12px; }
+.user-policy-field-grid > label > span, .user-policy-full-field > span { color: var(--muted); font-size: var(--font-size-label); font-weight: 700; }
+.user-policy-subsection > span:not(.muted), .user-policy-subsection-head > span { color: var(--muted); font-size: var(--font-size-section); font-weight: 700; line-height: 1.4; }
 .user-policy-field-grid textarea { min-height: 74px; resize: vertical; }
 .user-policy-access-list { display: grid; gap: 4px; max-height: 138px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; background: var(--subtle-bg); }
 .user-policy-access-list.disabled { opacity: .55; }
 .user-policy-full-field { margin-top: 12px; }
 .user-policy-subsection { display: grid; gap: 9px; margin-top: 13px; }
-.user-policy-subsection-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--muted); }
+.user-policy-subsection-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: var(--font-size-help); color: var(--muted); }
 .user-policy-schedule { display: grid; grid-template-columns: minmax(130px, 1fr) 92px auto 92px 34px; align-items: center; gap: 8px; }
 .user-policy-schedule .icon-button { width: 34px; height: 34px; }
 .user-policy-fields :deep(.check) { min-height: 34px; }

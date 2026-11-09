@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { RefreshCw } from '@lucide/vue'
 import { formatMetric, useHistoryController } from '@/composables/useHistoryController'
 import { usePanelContext } from '@/composables/panel-context'
 import P2LineChart from '@/components/ui/P2LineChart.vue'
 import P2MetricStrip from '@/components/ui/P2MetricStrip.vue'
+import RefreshButton from '@/components/ui/RefreshButton.vue'
 
 const panel = usePanelContext()
 const { t, api, serverOptions: authorizedServers } = panel
@@ -112,16 +112,13 @@ function onServerChange(event: Event) {
           {{ t('按日聚合的反代请求统计趋势') }}
         </p>
       </div>
-      <button
-        type="button"
-        class="refresh-button"
-        :title="t('刷新')"
+      <RefreshButton
+        :label="t('刷新')"
+        :loading-label="t('刷新中')"
+        :action="refreshPage"
+        :loading="loading || refreshing"
         :disabled="loading || refreshing"
-        @click="refreshPage"
-      >
-        <RefreshCw :size="15" :class="{ spinning: loading || refreshing }" />
-        {{ loading ? t('加载中') : t('刷新') }}
-      </button>
+      />
     </header>
 
     <div class="history-filter-band" role="group" :aria-label="t('历史')">
@@ -263,8 +260,8 @@ function onServerChange(event: Event) {
   align-items: center;
   gap: 0.45rem;
   color: var(--brand);
-  font-size: 0.68rem;
-  font-weight: 750;
+  font-size: var(--font-size-meta);
+  font-weight: 700;
   letter-spacing: 0.12em;
   line-height: 1;
   text-transform: uppercase;
@@ -280,18 +277,19 @@ function onServerChange(event: Event) {
 
 .history-head h1 {
   margin: 0.1rem 0 0;
-  font-size: 1.65rem;
-  line-height: 1.12;
+  font-size: var(--font-size-page);
+  font-weight: 700;
+  line-height: 1.3;
   letter-spacing: 0;
 }
 
 .muted {
   margin: 0;
   color: var(--muted);
-  font-size: 0.875rem;
+  font-size: var(--font-size-help);
+  line-height: 1.6;
 }
 
-.refresh-button,
 .link-button {
   display: inline-flex;
   align-items: center;
@@ -303,22 +301,9 @@ function onServerChange(event: Event) {
   padding: 0.55rem 0.85rem;
   cursor: pointer;
   font: inherit;
+  font-size: var(--font-size-control);
+  font-weight: 600;
   box-shadow: 0 4px 14px var(--shadow-soft);
-}
-
-.refresh-button:hover:not(:disabled) {
-  border-color: var(--border-strong);
-  background: var(--button-hover);
-  transform: translateY(-1px);
-}
-
-.refresh-button:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-
-.refresh-button svg.spinning {
-  animation: history-spin 0.9s linear infinite;
 }
 
 .link-button {
@@ -356,7 +341,7 @@ function onServerChange(event: Event) {
 
 .history-filter-label {
   color: var(--muted);
-  font-size: 0.7rem;
+  font-size: var(--font-size-label);
   font-weight: 700;
   letter-spacing: 0.09em;
   text-transform: uppercase;
@@ -365,7 +350,8 @@ function onServerChange(event: Event) {
 .history-filter-intro strong {
   overflow: hidden;
   color: var(--text);
-  font-size: 0.95rem;
+  font-size: var(--font-size-section);
+  line-height: 1.4;
   font-weight: 700;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -376,7 +362,7 @@ function onServerChange(event: Event) {
   border: 1px solid var(--border);
   border-radius: 999px;
   color: var(--muted);
-  font-size: 0.72rem;
+  font-size: var(--font-size-meta);
   padding: 0.3rem 0.58rem;
 }
 
@@ -398,10 +384,10 @@ function onServerChange(event: Event) {
   min-width: 0;
 }
 
-.filter-field span {
+.filter-field > span {
   color: var(--muted);
-  font-size: 0.72rem;
-  font-weight: 650;
+  font-size: var(--font-size-label);
+  font-weight: 700;
 }
 
 .filter-field select {
@@ -413,6 +399,8 @@ function onServerChange(event: Event) {
   color: var(--text);
   padding: 0 0.7rem;
   font: inherit;
+  font-size: var(--font-size-body);
+  font-weight: 400;
   transition: border-color 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
 }
 
@@ -453,15 +441,15 @@ function onServerChange(event: Event) {
   min-width: 0;
 }
 
-@keyframes history-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
 @media (max-width: 900px) {
   .history-filters {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 700px) {
+  .filter-field select {
+    font-size: 16px;
   }
 }
 

@@ -26,6 +26,15 @@
 }
 
 :root {
+  --font-size-page: 22px;
+  --font-size-panel: 17px;
+  --font-size-dialog: 16px;
+  --font-size-section: 14px;
+  --font-size-body: 13px;
+  --font-size-control: 12px;
+  --font-size-label: 11px;
+  --font-size-meta: 11px;
+  --font-size-help: 12px;
   --app-bg: #eef2f7;
   --sidebar-bg: #f7f9fc;
   --panel-bg: #ffffff;
@@ -131,6 +140,8 @@ textarea {
 }
 
 button {
+  font-size: var(--font-size-control);
+  font-weight: 600;
   border: 0;
   border-radius: 6px;
   height: 36px;
@@ -248,8 +259,8 @@ button:disabled {
   padding: 1px 6px;
   background: var(--chip-bg);
   color: var(--chip-text);
-  font-size: 11px;
-  font-weight: 800;
+  font-size: var(--font-size-meta);
+  font-weight: 700;
 }
 
 .brand-version-badge.update {
@@ -404,7 +415,7 @@ nav {
 
 .panel-head h3 {
   margin: 0;
-  font-size: 14px;
+  font-size: var(--font-size-section);
 }
 
 .panel-actions {
@@ -421,9 +432,40 @@ nav {
   justify-content: flex-end;
 }
 
+h1 {
+  font-size: var(--font-size-page);
+  font-weight: 700;
+  line-height: 1.3;
+}
+
 h2 {
   margin: 0;
-  font-size: 16px;
+  font-size: var(--font-size-panel);
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+h3 {
+  font-size: var(--font-size-section);
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+h4,
+h5,
+h6 {
+  font-size: var(--font-size-body);
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+table {
+  font-size: var(--font-size-body);
+}
+
+th {
+  font-size: var(--font-size-label);
+  font-weight: 700;
 }
 
 .muted {
@@ -471,7 +513,7 @@ h2 {
 
 .stat-card span,
 .health-line span,
-label span {
+label > span {
   color: var(--muted-strong);
   font-size: 13px;
   font-weight: 600;
@@ -537,11 +579,13 @@ label span {
 }
 
 .overview-server-row small {
+  font-size: var(--font-size-meta);
   grid-column: 1 / -1;
   color: var(--muted);
 }
 
 .health-subtitle {
+  font-size: var(--font-size-meta);
   display: block;
   margin-top: 4px;
   color: var(--success-text);
@@ -638,6 +682,7 @@ label span {
 }
 
 .connectivity-row small {
+  font-size: var(--font-size-meta);
   color: var(--muted);
   overflow-wrap: anywhere;
 }
@@ -727,8 +772,8 @@ label span {
   min-width: 0;
   overflow: hidden;
   color: var(--muted);
-  font-size: 11px;
-  font-weight: 650;
+  font-size: var(--font-size-meta);
+  font-weight: 600;
   letter-spacing: 0;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -738,8 +783,9 @@ label span {
   min-width: 0;
   overflow: hidden;
   color: var(--text);
-  font-size: 14px;
-  font-weight: 720;
+  font-size: var(--font-size-section);
+  font-weight: 700;
+  line-height: 1.4;
   letter-spacing: 0;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -756,8 +802,8 @@ label span {
   background: color-mix(in srgb, var(--brand) 9%, transparent);
   padding: 3px 7px;
   color: var(--active-text);
-  font-size: 11px;
-  font-weight: 680;
+  font-size: var(--font-size-meta);
+  font-weight: 600;
   letter-spacing: 0;
   line-height: 1.2;
   white-space: nowrap;
@@ -850,6 +896,7 @@ label span {
 }
 
 .empty-state {
+  font-size: var(--font-size-body);
   display: grid;
   place-items: center;
   min-height: 118px;
@@ -914,7 +961,7 @@ label span {
 
 .server-card-endpoint {
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--font-size-meta);
 }
 
 .server-actions {
@@ -963,7 +1010,7 @@ label span {
 .config-section-head h3 {
   margin: 0;
   color: var(--text-soft);
-  font-size: 13px;
+  font-size: var(--font-size-section);
   font-weight: 700;
 }
 
@@ -1093,18 +1140,18 @@ button.settings-card-main {
 .settings-card-label {
   min-width: 0;
   color: var(--muted-strong);
-  font-size: 12px;
-  font-weight: 680;
-  line-height: 1.35;
+  font-size: var(--font-size-label);
+  font-weight: 700;
+  line-height: 1.4;
 }
 
 .settings-card-value {
   min-width: 0;
   overflow: hidden;
   color: var(--text);
-  font-size: 14px;
-  font-weight: 730;
-  line-height: 1.3;
+  font-size: var(--font-size-body);
+  font-weight: 700;
+  line-height: 1.6;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1323,10 +1370,10 @@ button.settings-card-main {
 .settings-dialog-title {
   margin: 0;
   color: var(--text);
-  font-size: 16px;
-  font-weight: 750;
+  font-size: var(--font-size-dialog);
+  font-weight: 700;
   letter-spacing: 0;
-  line-height: 1.35;
+  line-height: 1.4;
 }
 
 .settings-dialog-description {
@@ -1379,8 +1426,8 @@ button.settings-card-main {
   white-space: normal;
   margin: 4px 0 0;
   color: var(--muted);
-  font-size: 13px;
-  line-height: 1.55;
+  font-size: var(--font-size-body);
+  line-height: 1.6;
   overflow-wrap: anywhere;
 }
 
@@ -1403,8 +1450,8 @@ button.settings-card-main {
 
 .action-dialog-input-label > span {
   color: var(--muted);
-  font-size: 12px;
-  font-weight: 600;
+  font-size: var(--font-size-label);
+  font-weight: 700;
 }
 
 .action-dialog-actions {
@@ -1474,6 +1521,7 @@ button.settings-card-main {
 }
 
 .validation-row small {
+  font-size: var(--font-size-meta);
   overflow-wrap: anywhere;
 }
 
@@ -1505,8 +1553,8 @@ button.settings-card-main {
 
 .backup-drop-hint span {
   color: var(--muted);
-  font-size: 13px;
-  line-height: 1.45;
+  font-size: var(--font-size-help);
+  line-height: 1.6;
 }
 
 .backup-page {
@@ -1531,7 +1579,7 @@ button.settings-card-main {
 
 .backup-card h3 {
   margin: 0 0 12px;
-  font-size: 14px;
+  font-size: var(--font-size-section);
 }
 
 .backup-scope-grid {
@@ -1548,10 +1596,15 @@ button.settings-card-main {
   padding: 10px;
 }
 
+.backup-drop-hint strong,
+.backup-scope-grid strong {
+  font-size: var(--font-size-body);
+}
+
 .backup-scope-grid span {
   color: var(--muted);
-  font-size: 13px;
-  line-height: 1.45;
+  font-size: var(--font-size-help);
+  line-height: 1.6;
 }
 
 .backup-note {
@@ -1635,7 +1688,7 @@ button.settings-card-main {
   background: var(--subtle-bg);
   padding: 9px 11px;
   color: var(--muted);
-  font-size: 13px;
+  font-size: var(--font-size-meta);
   min-width: 0;
   max-width: 100%;
   overflow-wrap: anywhere;
@@ -1664,7 +1717,7 @@ button.settings-card-main {
 
 .log-summary span {
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--font-size-meta);
   font-weight: 700;
 }
 
@@ -1731,7 +1784,7 @@ button.settings-card-main {
 
 .log-time {
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--font-size-meta);
   font-weight: 700;
   line-height: 1.45;
   padding-top: 2px;
@@ -1752,6 +1805,7 @@ button.settings-card-main {
 }
 
 .log-title strong {
+  font-size: var(--font-size-body);
   min-width: 0;
   color: var(--text);
   overflow-wrap: anywhere;
@@ -1766,6 +1820,7 @@ button.settings-card-main {
 }
 
 .playback-log-meta strong {
+  font-size: var(--font-size-body);
   min-width: 0;
   color: var(--text);
   overflow-wrap: anywhere;
@@ -1773,7 +1828,7 @@ button.settings-card-main {
 
 .log-full-time {
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--font-size-meta);
   font-weight: 700;
 }
 
@@ -1814,7 +1869,8 @@ button.settings-card-main {
   color: var(--muted);
   border-radius: 8px;
   padding: 10px 12px;
-  font-weight: 700;
+  font-size: var(--font-size-control);
+  font-weight: 600;
   cursor: pointer;
 }
 
@@ -1830,7 +1886,7 @@ button.settings-card-main {
 
 .log-limit-note {
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--font-size-meta);
   text-align: center;
   padding: 6px 0 2px;
 }
@@ -1888,7 +1944,7 @@ button.settings-card-main {
 
 .request-time {
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--font-size-meta);
   font-weight: 700;
 }
 
@@ -1931,7 +1987,7 @@ button.settings-card-main {
   padding: 3px 7px;
   background: var(--chip-bg);
   color: var(--chip-text);
-  font-size: 12px;
+  font-size: var(--font-size-meta);
   font-weight: 700;
 }
 
@@ -1959,7 +2015,7 @@ button.settings-card-main {
 .level-pill {
   border-radius: 999px;
   padding: 3px 7px;
-  font-size: 12px;
+  font-size: var(--font-size-meta);
   font-weight: 700;
 }
 
@@ -1982,7 +2038,7 @@ button.settings-card-main {
   display: block;
   margin-top: 3px;
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--font-size-meta);
   line-height: 1.35;
   overflow-wrap: anywhere;
 }
@@ -2092,6 +2148,7 @@ button.settings-card-main {
 }
 
 .audit-row {
+  font-size: var(--font-size-body);
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 10px;
@@ -2106,6 +2163,10 @@ button.settings-card-main {
   min-width: 0;
   display: grid;
   gap: 4px;
+}
+
+.audit-row small {
+  font-size: var(--font-size-meta);
 }
 
 .audit-row span,
@@ -2151,7 +2212,8 @@ button.settings-card-main {
 
 .rate-block-table th {
   color: var(--muted);
-  font-weight: 800;
+  font-size: var(--font-size-label);
+  font-weight: 700;
 }
 
 .client-rate-block-table {
@@ -2203,7 +2265,8 @@ button.settings-card-main {
 
 .rate-window-table th {
   color: var(--muted);
-  font-weight: 800;
+  font-size: var(--font-size-label);
+  font-weight: 700;
 }
 
 .empty-state.compact {
@@ -2230,6 +2293,8 @@ button.settings-card-main {
 }
 
 .filter-button {
+  font-size: var(--font-size-control);
+  font-weight: 600;
   background: var(--chip-bg);
   color: var(--text-soft);
 }
@@ -2305,7 +2370,7 @@ button.settings-card-main {
 .client-table th {
   background: var(--subtle-bg);
   color: var(--text-soft);
-  font-size: 12px;
+  font-size: var(--font-size-label);
   font-weight: 700;
 }
 
@@ -2359,7 +2424,7 @@ button.settings-card-main {
 
 .client-badge {
   border-radius: 999px;
-  font-size: 12px;
+  font-size: var(--font-size-meta);
   padding: 4px 8px;
 }
 
@@ -2386,8 +2451,8 @@ button.settings-card-main {
 .restart-button {
   height: 28px;
   padding: 0 10px;
-  font-size: 12px;
-  font-weight: 700;
+  font-size: var(--font-size-control);
+  font-weight: 600;
 }
 
 .server-toggle-button {
@@ -2454,6 +2519,11 @@ label {
   gap: 7px;
 }
 
+label:not(.check) {
+  font-size: var(--font-size-label);
+  font-weight: 700;
+}
+
 input,
 select,
 textarea {
@@ -2503,6 +2573,13 @@ textarea:focus {
   align-items: center;
   gap: 10px;
   min-height: 38px;
+  font-size: var(--font-size-body);
+  font-weight: 400;
+}
+
+.check > span {
+  font-size: var(--font-size-body);
+  font-weight: 400;
 }
 
 .compact-check {
@@ -2536,7 +2613,7 @@ textarea:focus {
   border-radius: 6px;
   padding: 10px 12px;
   margin-bottom: 14px;
-  font-size: 14px;
+  font-size: var(--font-size-body);
 }
 
 .toast-notice {
@@ -2552,7 +2629,7 @@ textarea:focus {
   border-radius: 999px;
   background: var(--success-bg);
   color: var(--success-text);
-  font-size: 14px;
+  font-size: var(--font-size-body);
   font-weight: 600;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
   pointer-events: none;
@@ -3079,6 +3156,9 @@ body {
   background: var(--app-bg);
   color: var(--text);
   font-family: Inter, "SF Pro Display", "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-size: var(--font-size-body);
+  font-weight: 400;
+  line-height: 1.6;
   letter-spacing: 0;
   text-rendering: optimizeLegibility;
 }
@@ -3208,8 +3288,8 @@ nav {
   border: 1px solid transparent;
   border-radius: 7px;
   color: var(--muted-strong);
-  font-size: 13px;
-  font-weight: 650;
+  font-size: var(--font-size-body);
+  font-weight: 600;
   letter-spacing: 0.01em;
   transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease, transform 0.2s ease;
 }
@@ -3332,7 +3412,7 @@ nav {
 
 .breadcrumb-root {
   color: var(--brand);
-  font-weight: 750;
+  font-weight: 700;
 }
 
 .top-actions {
@@ -3393,8 +3473,8 @@ nav {
   gap: 8px;
   padding: 0 11px;
   border-radius: 6px;
-  font-size: 12px;
-  font-weight: 650;
+  font-size: var(--font-size-body);
+  font-weight: 600;
   white-space: nowrap;
 }
 
@@ -3438,7 +3518,8 @@ nav {
   border-radius: 5px;
   background: transparent;
   color: var(--text-soft);
-  font-size: 13px;
+  font-size: var(--font-size-body);
+  font-weight: 600;
   text-align: left;
   outline: none;
   cursor: pointer;
@@ -3469,6 +3550,8 @@ nav {
 }
 
 .profile-trigger {
+  font-size: var(--font-size-body);
+  font-weight: 600;
   height: 36px;
   gap: 7px;
   padding: 0 9px;
@@ -3484,8 +3567,8 @@ nav {
 .preference-controls .language-trigger {
   padding-inline: 4px;
   color: var(--text-soft);
-  font-size: 13px;
-  font-weight: 500;
+  font-size: var(--font-size-body);
+  font-weight: 600;
 }
 
 .preference-controls .language-trigger:hover,
@@ -3504,7 +3587,8 @@ nav {
   max-width: 124px;
   overflow: hidden;
   color: var(--text-soft);
-  font-size: 13px;
+  font-size: var(--font-size-body);
+  font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -3550,7 +3634,8 @@ nav {
   border-radius: 5px;
   background: transparent;
   color: var(--text-soft);
-  font-size: 13px;
+  font-size: var(--font-size-body);
+  font-weight: 600;
   text-align: left;
   cursor: pointer;
 }
@@ -3620,7 +3705,9 @@ nav {
 }
 
 .panel-head h2 {
-  font-size: 17px;
+  font-size: var(--font-size-panel);
+  font-weight: 700;
+  line-height: 1.4;
   letter-spacing: 0;
 }
 
@@ -3638,9 +3725,11 @@ nav {
   display: none;
 }
 
-.muted {
+.muted,
+.field-help {
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--font-size-help);
+  font-weight: 400;
   line-height: 1.6;
 }
 
@@ -3654,8 +3743,8 @@ nav {
   gap: 8px;
   min-height: 36px;
   border-radius: 6px;
-  font-size: 12px;
-  font-weight: 700;
+  font-size: var(--font-size-control);
+  font-weight: 600;
 }
 
 .primary {
@@ -3709,9 +3798,9 @@ nav {
 
 .stat-card span,
 .health-line span,
-label span {
+label > span {
   color: var(--muted-strong);
-  font-size: 11px;
+  font-size: var(--font-size-label);
   font-weight: 700;
   letter-spacing: 0;
   text-transform: none;
@@ -3720,7 +3809,7 @@ label span {
 .stat-card strong {
   color: var(--text);
   font-size: 30px;
-  font-weight: 720;
+  font-weight: 700;
   line-height: 1;
   letter-spacing: 0;
 }
@@ -3765,8 +3854,8 @@ label span {
   align-items: center;
   gap: 7px;
   color: var(--success-text);
-  font-size: 11px;
-  font-weight: 750;
+  font-size: var(--font-size-meta);
+  font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
 }
@@ -3843,7 +3932,9 @@ label span {
 }
 
 .server-card-head strong {
-  font-size: 15px;
+  font-size: var(--font-size-section);
+  font-weight: 700;
+  line-height: 1.4;
 }
 
 .server-status-strip {
@@ -3870,7 +3961,8 @@ textarea {
   border-radius: 6px;
   background: var(--glass-strong);
   color: var(--text);
-  font-size: 13px;
+  font-size: var(--font-size-body);
+  font-weight: 400;
   box-shadow: inset 0 1px 0 var(--glass-highlight);
 }
 
@@ -4022,15 +4114,15 @@ textarea:hover {
 
 .eyebrow {
   color: var(--brand);
-  font-size: 10px;
-  font-weight: 800;
+  font-size: var(--font-size-meta);
+  font-weight: 700;
   letter-spacing: 0.16em;
 }
 
 .auth-footnote {
   margin: 2px 0 0;
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--font-size-meta);
   letter-spacing: 0.08em;
   text-align: center;
   text-transform: uppercase;
@@ -4300,10 +4392,6 @@ textarea:hover {
 
   .panel-head {
     align-items: flex-start;
-  }
-
-  .panel-head h2 {
-    font-size: 16px;
   }
 
   .panel-actions,

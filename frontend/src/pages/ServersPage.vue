@@ -30,7 +30,7 @@ import CheckboxField from '@/components/ui/CheckboxField.vue'
 import SettingsDialogShell from '@/components/ui/SettingsDialogShell.vue'
 import UiSwitch from '@/components/ui/UiSwitch.vue'
 import { usePanelContext } from '@/composables/panel-context'
-import type { EmbyServerConfig } from '@/types/panel'
+import type { EmbyServerConfig, ValidationResult } from '@/types/panel'
 
 const {
   settings,
@@ -661,6 +661,24 @@ async function applyServerEditor() {
   serverEditorOpen.value = false
 }
 
+const validationCheckNames: Record<string, string> = {
+  '本地配置校验通过': '本地配置',
+  '本地配置校验失败': '本地配置',
+  '反代端口重复': '反代端口',
+  '反代端口正在由当前服务监听': '反代端口',
+  '反代端口可用': '反代端口',
+  '反代端口已被占用': '反代端口',
+  'Emby API Key 可用': 'Emby API',
+  'Emby 连接失败': 'Emby API',
+  'OpenList 连接可用': 'OpenList 连接',
+  'OpenList 连接失败': 'OpenList 连接',
+  '未配置，已跳过': 'OpenList 连接',
+}
+
+function validationCheckLabel(result: ValidationResult) {
+  return t(validationCheckNames[result.message] ?? '配置检查')
+}
+
 async function runValidation() {
   if (saving.value || validationRunning.value) return
   validationDialogOpen.value = true
@@ -1024,7 +1042,10 @@ async function removeServerAndSave(serverId: string) {
             :class="['validation-row', validationClass(result)]"
             role="listitem"
           >
-            <strong>{{ localizeValidationText(result.scope) }}</strong>
+            <div class="validation-check">
+              <strong>{{ validationCheckLabel(result) }}</strong>
+              <small v-if="result.scope">{{ result.scope }}</small>
+            </div>
             <span>{{ localizeValidationText(result.message) }}</span>
             <small>{{
               result.detail ? localizeValidationText(result.detail) : '--'
@@ -1664,3 +1685,68 @@ async function removeServerAndSave(serverId: string) {
     </SettingsDialogShell>
   </div>
 </template>
+
+
+<style scoped>
+.validation-check {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.validation-check small {
+  color: var(--text-soft);
+  font-size: 11px;
+}
+
+.server-policy-grid {
+  align-items: start;
+  gap: 20px 16px;
+  margin-top: 16px;
+}
+.server-policy-field {
+  display: grid;
+  align-content: start;
+  gap: 7px;
+  min-width: 0;
+}
+.server-policy-field-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  min-height: 20px;
+  min-width: 0;
+  line-height: 1.5;
+}
+.server-policy-field-head > span:first-child {
+  min-width: 0;
+  color: var(--muted-strong);
+  font-size: 11px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+.server-policy-field-head > .muted {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+.server-policy-field-head > button {
+  height: 24px;
+  min-height: 24px;
+  margin-left: auto;
+  padding: 0 8px;
+  font-size: var(--font-size-control);
+  font-weight: 600;
+}
+.server-policy-field > .field-help {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.server-policy-toggle-field > .settings-card-switch {
+  justify-self: start;
+}
+</style>

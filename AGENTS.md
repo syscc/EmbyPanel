@@ -63,11 +63,19 @@
 - 简单确认和单字段输入使用 `frontend/src/composables/useActionDialog.ts`，由 `frontend/src/components/ActionDialogHost.vue` 统一承载。删除确认、危险操作确认和密码输入不得再使用 `window.confirm`、`window.prompt` 或另写一套 Dialog。
 - 复杂表单、详情和结果列表弹窗使用 `frontend/src/components/ui/SettingsDialogShell.vue`，复用其标题、描述、遮罩、关闭按钮、滚动正文和固定 footer。不要在页面中重复拼装 `DialogRoot`、`DialogPortal`、`DialogOverlay`、`DialogContent`；不要把复杂内容强塞进 `ActionDialogHost`，也不要嵌套卡片式弹窗。
 - 二元状态开关使用 `frontend/src/components/ui/UiSwitch.vue`；独立复选项使用 `frontend/src/components/ui/CheckboxField.vue`。禁止页面自行复制 track/knob、`role="switch"`、`aria-checked` 或 `.check` 模板。
+- 数据刷新按钮统一使用 `frontend/src/components/ui/RefreshButton.vue`，传入原 `action`、`loading` 和 `disabled` 条件，文案使用 `t('刷新')` / `t('刷新中')`；重试、测试和检查更新不混入数据刷新。
 - 用户策略表单复用 `frontend/src/components/UserPolicyFields.vue`；策略默认值、用户摘要转换、深拷贝、提交归一化和模板合并统一使用 `frontend/src/lib/user-policy.ts` 的 `defaultPolicyDraft`、`policyFromUser`、`copyPolicy`、`policyPayload`、`applyTemplateTo`。新增策略字段时必须同步类型、这些 helper、表单和后端契约，禁止在页面中再写一套策略转换逻辑。
 - 用户与模板 CRUD 优先扩展 `frontend/src/composables/useUsersController.ts`；备份导入导出优先扩展 `frontend/src/composables/useBackupController.ts`。页面只负责交互编排，不重复实现同一套 API、加密、loading 和错误状态。
 - 只需要服务器 ID/名称的页面复用 `usePanelController.ts` 的 `ensureServerOptions` 和 `serverOptions`，通过 `/api/servers/options` 获取授权选项；不要为了填充筛选器依赖全局配置读取权限。播放控制按钮同时遵循响应中的 `can_control_sessions`，后端继续强制校验 `sessions.control`。
 - 时间、容量、播放进度、URL 和请求状态格式化复用 `frontend/src/lib/panel-formatters.ts`。通用 class 合并使用 `frontend/src/lib/utils.ts` 的 `cn`。禁止各页面复制格式化函数导致显示规则分叉。
 - 所有用户可见文案通过现有 `t()` 和 `frontend/src/lib/translations.ts` 管理；新增中文键时同时补英文映射。禁止在同一功能中混用硬编码文案和翻译键。
+
+### 全站字体规范
+
+- 字体角色统一复用 `frontend/src/style.css` 的 `--font-size-*`：独立页标题 page22、面板 panel17、弹窗 dialog16、分区 section14、正文 body13、操作 control12、字段 label11/700、元数据 meta11、帮助 help12（单位 px）。只有现有独立页标题使用 page，不为普通面板新增标题；移动端不降低页/面板标题。
+- 正文行高 1.6，标题 1.3/1.4；字重使用 400/600/700。字段标签与输入正文分离，Checkbox 正文保持 13/400；Portal 菜单/弹窗同样接入角色，不依赖页面祖先继承。
+- 不修改 html/root 字号，保留默认 16px 的 rem 尺度；≤700px 输入框/select/textarea 保留 16px，scoped CSS 不得压回小字号。导航、账户和语言菜单为 13/600；RefreshButton 的 36px 高度、8px 间距、12px 字号和 UiSwitch 契约不变。
+- 品牌标题（登录 27/移动24）、指标大数字、P2LineChart 刻度、代码等宽与复制/换行规则属于例外，保留专用尺寸；新增局部字体规则应使用角色变量，不复制另一套字号体系。
 
 ### 后端强制复用
 

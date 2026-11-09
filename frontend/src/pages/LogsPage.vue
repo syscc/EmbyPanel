@@ -3,10 +3,10 @@ import {
   Check,
   Download,
   FileText,
-  RefreshCw,
   Settings2,
   SlidersHorizontal,
 } from '@lucide/vue'
+import RefreshButton from '@/components/ui/RefreshButton.vue'
 import { usePanelContext } from '@/composables/panel-context'
 
 const {
@@ -75,13 +75,13 @@ const {
           <span class="status-dot">{{
             logsLoading ? t('刷新中') : t('实时刷新')
           }}</span>
-          <button
-            class="secondary"
+          <RefreshButton
+            :label="t('刷新')"
+            :loading-label="t('刷新中')"
+            :action="refreshActivityLogs"
+            :loading="logsLoading"
             :disabled="logsLoading"
-            @click="refreshActivityLogs"
-          >
-            <RefreshCw :size="15" />{{ logsLoading ? t('刷新中') : t('刷新') }}
-          </button>
+          />
           <button
             v-if="!isRequestDetailLogView"
             class="secondary"

@@ -6,13 +6,13 @@ import {
   MapPin,
   Monitor,
   PlayCircle,
-  RefreshCw,
   Server,
   ShieldCheck,
   UserRound,
   Waypoints,
 } from '@lucide/vue'
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import RefreshButton from '@/components/ui/RefreshButton.vue'
 import { usePanelContext } from '@/composables/panel-context'
 import type { PlaybackSession } from '@/types/panel'
 
@@ -372,9 +372,11 @@ onBeforeUnmount(() => {
           </div>
           <p class="muted">{{ t('健康检查、反代监听和今日请求统计。') }}</p>
         </div>
-        <button class="secondary" @click="refreshOperationalData">
-          <RefreshCw :size="15" />{{ t('刷新') }}
-        </button>
+        <RefreshButton
+          :label="t('刷新')"
+          :loading-label="t('刷新中')"
+          :action="refreshOperationalData"
+        />
       </div>
       <div class="stat-grid four">
         <div class="stat-card">
@@ -473,9 +475,11 @@ onBeforeUnmount(() => {
           </div>
           <p class="muted">{{ t('首页直接查看当前窗口命中和封禁情况。') }}</p>
         </div>
-        <button class="secondary" @click="refreshRateLimitStatus">
-          <RefreshCw :size="15" />{{ t('刷新') }}
-        </button>
+        <RefreshButton
+          :label="t('刷新')"
+          :loading-label="t('刷新中')"
+          :action="refreshRateLimitStatus"
+        />
       </div>
       <div class="stat-grid three">
         <div class="stat-card">
@@ -569,15 +573,13 @@ onBeforeUnmount(() => {
         </div>
         <div class="panel-actions">
           <span class="status-dot">{{ t('在线') }} {{ activePlayCount }}</span>
-          <button
-            class="secondary"
+          <RefreshButton
+            :label="t('刷新')"
+            :loading-label="t('刷新中')"
+            :action="refreshPlaybackSessions"
+            :loading="playbackLoading"
             :disabled="playbackLoading"
-            @click="refreshPlaybackSessions"
-          >
-            <RefreshCw :size="15" />{{
-              playbackLoading ? t('刷新中') : t('刷新')
-            }}
-          </button>
+          />
         </div>
       </div>
       <div v-if="playbackSessions.length" class="playback-strip">

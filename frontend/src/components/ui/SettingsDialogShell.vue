@@ -82,8 +82,8 @@ const hasFooter = Boolean(useSlots().footer)
   clip: auto;
   clip-path: none;
   color: var(--muted);
-  font-size: 12px;
-  line-height: 1.45;
+  font-size: var(--font-size-help);
+  line-height: 1.6;
   white-space: normal;
 }
 </style>
