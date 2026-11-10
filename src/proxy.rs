@@ -48,6 +48,29 @@ pub async fn proxy_to_emby(
     body: Bytes,
     peer_ip: IpAddr,
 ) -> AppResult<Response> {
+    proxy_to_emby_observed(
+        client,
+        config,
+        method,
+        uri,
+        headers,
+        body,
+        peer_ip,
+        &mut Default::default(),
+    )
+    .await
+}
+
+pub(crate) async fn proxy_to_emby_observed(
+    client: &reqwest::Client,
+    config: &Config,
+    method: Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: Bytes,
+    peer_ip: IpAddr,
+    observation: &mut diagnostics::UpstreamObservation,
+) -> AppResult<Response> {
     let target = config.emby_url(
         uri.path_and_query()
             .map(|value| value.as_str())
@@ -61,7 +84,7 @@ pub async fn proxy_to_emby(
         request = request.body(body);
     }
 
-    let response = send_upstream(request).await?;
+    let response = send_upstream_observed(request, observation).await?;
     response_to_axum(response)
 }
 
@@ -125,10 +148,30 @@ async fn proxy_to_reqwest(
 }
 
 async fn send_upstream(request: reqwest::RequestBuilder) -> AppResult<reqwest::Response> {
-    tokio::time::timeout(UPSTREAM_RESPONSE_HEADERS_TIMEOUT, request.send())
-        .await
-        .map_err(|_| AppError::BadGateway("Emby upstream response headers timed out".to_string()))?
-        .map_err(AppError::from)
+    send_upstream_observed(request, &mut Default::default()).await
+}
+
+async fn send_upstream_observed(
+    request: reqwest::RequestBuilder,
+    observation: &mut diagnostics::UpstreamObservation,
+) -> AppResult<reqwest::Response> {
+    let started = Instant::now();
+    let response = diagnostics::network::observe_send(observation, async {
+        tokio::time::timeout(UPSTREAM_RESPONSE_HEADERS_TIMEOUT, request.send()).await
+    })
+    .await;
+    let response = response
+        .map_err(|_| {
+            observation.error_kind = Some("timeout".to_string());
+            AppError::BadGateway("Emby upstream response headers timed out".to_string())
+        })?
+        .map_err(|err| {
+            observation.error_kind = Some(crate::error::reqwest_error_kind(&err).to_string());
+            AppError::from(err)
+        })?;
+    observation.response_headers_ms = Some(started.elapsed().as_millis() as u64);
+    observation.status = Some(response.status().as_u16());
+    Ok(response)
 }
 
 fn response_to_axum(response: reqwest::Response) -> AppResult<Response> {
@@ -441,6 +484,10 @@ pub(crate) const STEP_OPENLIST: &str = "OpenList";
 pub(crate) const STEP_RAW_URL: &str = "raw_url";
 pub(crate) const STEP_CACHE: &str = "缓存";
 pub(crate) const STEP_REDIRECT: &str = "302";
+pub(crate) const STEP_INTERNAL_REDIRECT: &str = "内部跳转";
+pub(crate) const STEP_PROXY: &str = "Emby Proxy";
+pub(crate) const STEP_CONTEXT: &str = "请求上下文";
+pub(crate) const STEP_POLICY: &str = "播放策略";
 
 /// A step that is currently waiting on an async operation. Keeping this state in the
 /// trace makes cancellation observable even though `Drop` cannot await.
@@ -457,14 +504,28 @@ struct ActiveDiagnosisStep {
 /// If the request future is cancelled, `Drop` emits a sanitized cancellation record
 /// synchronously, so no in-flight node disappears from the trace.
 pub(crate) struct PlaybackDiagnosisTrace {
+    pub(crate) request_id: String,
+    pub(crate) context: diagnostics::DiagnosisContext,
+    pub(crate) result: diagnostics::DiagnosisResult,
+    pub(crate) cache: diagnostics::DiagnosisCache,
+    pub(crate) paths: diagnostics::DiagnosisPaths,
+    pub(crate) timing: diagnostics::DiagnosisTiming,
+    pub(crate) observation: diagnostics::UpstreamObservation,
+    operation_intervals: Vec<(Instant, Instant)>,
+    cache_duration: Duration,
+    failure_log: Option<Box<dyn FnOnce(&diagnostics::DiagnosisRecord) + Send>>,
     server_id: String,
     media_id: String,
     ua: String,
+    started: Instant,
+    started_at_ms: i64,
     steps: Vec<DiagnosisStep>,
     cache_hit: bool,
     failure_node: Option<String>,
     active_step: Option<ActiveDiagnosisStep>,
     cache_duration_ms: u64,
+    cache_started_at_ms: Option<i64>,
+    cache_finished_at_ms: Option<i64>,
     cache_pending: bool,
     finished: bool,
 }
@@ -472,17 +533,81 @@ pub(crate) struct PlaybackDiagnosisTrace {
 impl PlaybackDiagnosisTrace {
     pub(crate) fn new(server_id: &str, media_id: &str, ua: &str) -> Self {
         Self {
+            request_id: diagnostics::current_request_id()
+                .unwrap_or_else(diagnostics::new_request_id),
+            context: Default::default(),
+            result: Default::default(),
+            cache: diagnostics::DiagnosisCache {
+                status: Some("not_checked".to_string()),
+                ..Default::default()
+            },
+            paths: Default::default(),
+            timing: diagnostics::DiagnosisTiming {
+                connection_observation: Some("not_observed".to_string()),
+                ..Default::default()
+            },
+            observation: Default::default(),
+            operation_intervals: Vec::new(),
+            cache_duration: Duration::ZERO,
+            failure_log: None,
             server_id: server_id.to_string(),
             media_id: media_id.to_string(),
             ua: ua.to_string(),
+            started: Instant::now(),
+            started_at_ms: chrono::Utc::now().timestamp_millis(),
             steps: Vec::with_capacity(6),
             cache_hit: false,
             failure_node: None,
             active_step: None,
             cache_duration_ms: 0,
+            cache_started_at_ms: None,
+            cache_finished_at_ms: None,
             cache_pending: false,
             finished: false,
         }
+    }
+
+    // Anchor all wall-clock timestamps to one clock sample so clock adjustments cannot
+    // reverse a running trace. Durations always come from the monotonic clock.
+    fn timestamp_at(&self, instant: Instant) -> i64 {
+        self.started_at_ms
+            .saturating_add(instant.saturating_duration_since(self.started).as_millis() as i64)
+    }
+
+    fn timed_step(
+        &self,
+        name: &str,
+        started: Instant,
+        finished: Instant,
+        details: &str,
+    ) -> DiagnosisStep {
+        DiagnosisStep {
+            name: name.to_string(),
+            started_at_ms: Some(self.timestamp_at(started)),
+            finished_at_ms: Some(self.timestamp_at(finished)),
+            duration_ms: finished.saturating_duration_since(started).as_millis() as u64,
+            details: details.to_string(),
+            state: Some("recorded".to_string()),
+            connection_observation: Some("not_observed".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn observed_step(&self, mut step: DiagnosisStep) -> DiagnosisStep {
+        step.upstream_status = self.observation.status;
+        step.response_headers_ms = self.observation.response_headers_ms;
+        step.response_body_ms = self.observation.response_body_ms;
+        step.error_kind = self.observation.error_kind.clone();
+        // Copy before merge_into_timing drains the completed event totals, so
+        // step and trace describe the same events without double counting.
+        step.name_resolution_ms = self.observation.name_resolution_ms;
+        step.name_resolution_calls = self.observation.name_resolution_calls;
+        step.connection_setup_ms = self.observation.connection_setup_ms;
+        step.connection_attempts = self.observation.connection_attempts;
+        if self.observation.connection_observation.is_some() {
+            step.connection_observation = self.observation.connection_observation.clone();
+        }
+        step
     }
 
     /// Start a real operation. If the future is cancelled before completion, this
@@ -491,6 +616,7 @@ impl PlaybackDiagnosisTrace {
         if self.finished || self.failure_node.is_some() {
             return;
         }
+        self.observation = Default::default();
         self.active_step = Some(ActiveDiagnosisStep {
             name: name.to_string(),
             started: Instant::now(),
@@ -505,37 +631,50 @@ impl PlaybackDiagnosisTrace {
         let Some(active) = self.active_step.take() else {
             return;
         };
-        let duration_ms = active.started.elapsed().as_millis() as u64;
+        let finished = Instant::now();
+        self.operation_intervals.push((active.started, finished));
+        let step =
+            self.observed_step(self.timed_step(&active.name, active.started, finished, details));
+        diagnostics::network::merge_into_timing(&mut self.observation, &mut self.timing);
         if active.name == STEP_CACHE {
-            self.cache_duration_ms = self.cache_duration_ms.saturating_add(duration_ms);
+            self.cache_duration += finished.saturating_duration_since(active.started);
+            self.cache_duration_ms = self.cache_duration.as_millis() as u64;
+            self.cache_started_at_ms = self.cache_started_at_ms.or(step.started_at_ms);
+            self.cache_finished_at_ms = step.finished_at_ms;
             self.cache_pending = true;
         } else {
-            self.steps.push(DiagnosisStep {
-                name: active.name,
-                duration_ms,
-                details: details.to_string(),
-            });
+            self.steps.push(step);
         }
     }
 
-    /// Record a non-failure step with real wall-clock duration from `started`.
+    /// Record a non-failure step with monotonic elapsed time from `started`.
     /// No-ops after the first failure or after finish (prevents forged later success).
     pub(crate) fn push_step(&mut self, name: &str, started: Instant, details: &str) {
         if self.finished || self.failure_node.is_some() {
             return;
         }
-        self.steps.push(DiagnosisStep {
-            name: name.to_string(),
-            duration_ms: started.elapsed().as_millis() as u64,
-            details: details.to_string(),
-        });
+        let finished = Instant::now();
+        self.operation_intervals.push((started, finished));
+        self.steps
+            .push(self.timed_step(name, started, finished, details));
     }
 
-    /// Mark remaining named nodes as bypassed (near-zero duration).
+    /// Bypasses are decisions, not real busy intervals.
     pub(crate) fn bypass_steps(&mut self, names: &[&str]) {
         for name in names {
-            self.push_step(name, Instant::now(), "bypassed");
+            self.skip_step(name, "bypassed");
         }
+    }
+
+    pub(crate) fn skip_step(&mut self, name: &str, reason: &str) {
+        if self.finished || self.failure_node.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        let mut step = self.timed_step(name, now, now, "bypassed");
+        step.state = Some("skipped".to_string());
+        step.reason = Some(reason.to_string());
+        self.steps.push(step);
     }
 
     /// Append the deferred logical cache node after raw URL resolution.
@@ -545,8 +684,13 @@ impl PlaybackDiagnosisTrace {
         }
         self.steps.push(DiagnosisStep {
             name: STEP_CACHE.to_string(),
+            started_at_ms: self.cache_started_at_ms,
+            finished_at_ms: self.cache_finished_at_ms,
             duration_ms: self.cache_duration_ms,
             details: details.to_string(),
+            state: Some("recorded".to_string()),
+            connection_observation: Some("not_observed".to_string()),
+            ..Default::default()
         });
         self.cache_pending = false;
     }
@@ -561,19 +705,79 @@ impl PlaybackDiagnosisTrace {
             .take()
             .filter(|active| active.name == name)
             .map(|active| active.started);
-        let duration_ms = if name == STEP_CACHE {
+        let started = active_started.unwrap_or(started);
+        let finished = Instant::now();
+        self.operation_intervals.push((started, finished));
+        let mut step = self.observed_step(self.timed_step(name, started, finished, details));
+        diagnostics::network::merge_into_timing(&mut self.observation, &mut self.timing);
+        let cancelled = details.starts_with("cancelled");
+        step.state = Some(if cancelled { "cancelled" } else { "failed" }.to_string());
+        step.reason = Some(details.to_string());
+        self.result.outcome = Some(if cancelled { "cancelled" } else { "failed" }.to_string());
+        if cancelled {
+            self.result.status_code = None;
+        }
+        self.result.reason = Some(details.to_string());
+        self.result.error_kind = step.error_kind.clone();
+        self.result.upstream_status = step.upstream_status;
+        if name == STEP_CACHE {
             self.cache_pending = false;
-            self.cache_duration_ms
-                .saturating_add(active_started.unwrap_or(started).elapsed().as_millis() as u64)
-        } else {
-            active_started.unwrap_or(started).elapsed().as_millis() as u64
-        };
-        self.steps.push(DiagnosisStep {
-            name: name.to_string(),
-            duration_ms,
-            details: details.to_string(),
-        });
+            self.cache_duration += finished.saturating_duration_since(started);
+            self.cache_duration_ms = self.cache_duration.as_millis() as u64;
+            step.duration_ms = self.cache_duration_ms;
+            step.started_at_ms = self.cache_started_at_ms.or(step.started_at_ms);
+        }
+        self.steps.push(step);
         self.failure_node = Some(name.to_string());
+    }
+
+    /// One-shot fallback for existing request/activity logs when no normal log path completed.
+    pub(crate) fn on_unlogged_failure(
+        &mut self,
+        callback: impl FnOnce(&diagnostics::DiagnosisRecord) + Send + 'static,
+    ) {
+        self.failure_log = Some(Box::new(callback));
+    }
+
+    pub(crate) fn failure_logged(&mut self) {
+        self.failure_log = None;
+    }
+
+    pub(crate) fn mark_upstream_status_failure(&mut self) {
+        if let Some(step) = self.steps.last_mut() {
+            step.state = Some("failed".to_string());
+            step.error_kind = Some("upstream_http".to_string());
+            step.reason = Some("upstream returned non-success status".to_string());
+            self.failure_node = Some(step.name.clone());
+        }
+    }
+
+    pub(crate) fn fail_error(&mut self, name: &str, error: &AppError) {
+        self.observation
+            .error_kind
+            .get_or_insert_with(|| error.diagnostic_kind().to_string());
+        self.fail_step(name, Instant::now(), &error.safe_log_message());
+        self.result.status_code = Some(error.status().as_u16());
+    }
+
+    pub(crate) fn set_redirect(&mut self, url: &str, reason: &str) {
+        self.result.outcome = Some("redirect".to_string());
+        self.result.status_code = Some(302);
+        self.result.target_host = diagnostics::target_host(url);
+        self.result.reason = Some(reason.to_string());
+        self.paths.final_url = Some(diagnostics::sanitize_path(url));
+    }
+
+    /// Internal redirect failure is a real failed step but falls back to the original URL.
+    pub(crate) fn complete_redirect_fallback(&mut self, error: &AppError) {
+        self.observation
+            .error_kind
+            .get_or_insert_with(|| error.diagnostic_kind().to_string());
+        self.complete_step(&error.safe_log_message());
+        if let Some(step) = self.steps.last_mut() {
+            step.state = Some("failed".to_string());
+            step.reason = Some("using original URL after internal redirect failure".to_string());
+        }
     }
 
     pub(crate) fn set_cache_hit(&mut self, hit: bool) {
@@ -604,19 +808,81 @@ impl PlaybackDiagnosisTrace {
 
     /// Emit one record via the shared collector. Safe to call once; extra calls no-op.
     pub(crate) async fn finish(mut self) {
+        self.record();
+    }
+
+    fn record(&mut self) {
         if self.finished {
             return;
         }
         self.finished = true;
-        record_playback_diagnosis(
+        if self.server_id.trim().is_empty() || self.media_id.trim().is_empty() {
+            return;
+        }
+        let finished = Instant::now();
+        // Lookup/set work must remain observable even when a later node fails.
+        if self.cache_pending {
+            self.steps.push(DiagnosisStep {
+                name: STEP_CACHE.to_string(),
+                started_at_ms: self.cache_started_at_ms,
+                finished_at_ms: self.cache_finished_at_ms,
+                duration_ms: self.cache_duration_ms,
+                details: self
+                    .cache
+                    .status
+                    .clone()
+                    .unwrap_or_else(|| "not_checked".to_string()),
+                state: Some("recorded".to_string()),
+                reason: self.cache.reason.clone(),
+                connection_observation: Some("not_observed".to_string()),
+                ..Default::default()
+            });
+            self.cache_pending = false;
+        }
+        let mut record = diagnostics::create_diagnosis_record(
             &self.server_id,
             &self.media_id,
             &self.ua,
             std::mem::take(&mut self.steps),
             self.cache_hit,
             self.failure_node.take(),
-        )
-        .await;
+        );
+        record.request_id = self.request_id.clone();
+        record.context = std::mem::take(&mut self.context);
+        record.result = std::mem::take(&mut self.result);
+        record.cache = std::mem::take(&mut self.cache);
+        record.paths = std::mem::take(&mut self.paths);
+        diagnostics::network::merge_into_timing(&mut self.observation, &mut self.timing);
+        record.timing = std::mem::take(&mut self.timing);
+        if let Some(step) = record
+            .steps
+            .iter()
+            .filter(|step| step.state.as_deref() != Some("skipped"))
+            .max_by_key(|step| step.duration_ms)
+        {
+            record.timing.slowest_step = Some(step.name.clone());
+            record.timing.slowest_step_ms = Some(step.duration_ms);
+        }
+        record.timing.unaccounted_ms = Some(
+            unaccounted_duration(self.started, finished, &mut self.operation_intervals).as_millis()
+                as u64,
+        );
+        record.started_at_ms = Some(self.started_at_ms);
+        record.finished_at_ms = Some(self.timestamp_at(finished));
+        record.duration_ms = Some(finished.duration_since(self.started).as_millis() as u64);
+        let record = diagnostics::sanitize_diagnosis_record(record);
+        if matches!(
+            record.result.outcome.as_deref(),
+            Some("failed" | "cancelled")
+        ) {
+            if let Some(callback) = self.failure_log.take() {
+                callback(&record);
+            }
+        }
+        tracing::info!(request_id = %record.request_id, server_id = %record.server_id,
+            media_id = %record.media_id, outcome = ?record.result.outcome,
+            status_code = ?record.result.status_code, "playback diagnosis completed");
+        diagnostics::record_diagnosis_now(record);
     }
 }
 
@@ -626,76 +892,48 @@ impl Drop for PlaybackDiagnosisTrace {
             return;
         }
         if let Some(active) = self.active_step.take() {
-            let duration_ms = if active.name == STEP_CACHE {
-                self.cache_pending = false;
-                self.cache_duration_ms
-                    .saturating_add(active.started.elapsed().as_millis() as u64)
-            } else {
-                active.started.elapsed().as_millis() as u64
-            };
-            let name = active.name;
-            self.steps.push(DiagnosisStep {
-                name: name.clone(),
-                duration_ms,
-                details: format!("cancelled: {}", active.details),
-            });
-            self.failure_node = Some(name);
+            self.fail_step(
+                &active.name,
+                active.started,
+                &format!("cancelled: {}", active.details),
+            );
         } else if self.failure_node.is_none() {
             // A trace created immediately before an unexpected cancellation still
             // produces a useful, sanitized record instead of disappearing.
-            self.steps.push(DiagnosisStep {
-                name: STEP_EMBY_PATH.to_string(),
-                duration_ms: 0,
-                details: "cancelled before step started".to_string(),
-            });
+            let now = Instant::now();
+            self.steps.push(self.timed_step(
+                STEP_EMBY_PATH,
+                now,
+                now,
+                "cancelled before step started",
+            ));
+            if let Some(step) = self.steps.last_mut() {
+                step.state = Some("cancelled".to_string());
+            }
             self.failure_node = Some(STEP_EMBY_PATH.to_string());
+            self.result.outcome = Some("cancelled".to_string());
+            self.result.reason = Some("cancelled before step started".to_string());
         }
-        self.finished = true;
-        let steps = std::mem::take(&mut self.steps);
-        record_playback_diagnosis_sync(
-            &self.server_id,
-            &self.media_id,
-            &self.ua,
-            steps,
-            self.cache_hit,
-            self.failure_node.take(),
-        );
+        self.record();
     }
 }
 
-/// Records at most one DiagnosisRecord for an eligible media request.
-/// Empty server/media identity is silent. Collector failures are ignored.
-pub(crate) async fn record_playback_diagnosis(
-    server_id: &str,
-    media_id: &str,
-    ua: &str,
-    steps: Vec<DiagnosisStep>,
-    cache_hit: bool,
-    failure_node: Option<String>,
-) {
-    record_playback_diagnosis_sync(server_id, media_id, ua, steps, cache_hit, failure_node);
-}
-
-fn record_playback_diagnosis_sync(
-    server_id: &str,
-    media_id: &str,
-    ua: &str,
-    steps: Vec<DiagnosisStep>,
-    cache_hit: bool,
-    failure_node: Option<String>,
-) {
-    if server_id.trim().is_empty() || media_id.trim().is_empty() {
-        return;
+/// Union monotonic operation intervals before rounding; cache spans and bypasses are excluded.
+fn unaccounted_duration(
+    start: Instant,
+    end: Instant,
+    intervals: &mut [(Instant, Instant)],
+) -> Duration {
+    intervals.sort_by_key(|interval| interval.0);
+    let mut covered = Duration::ZERO;
+    let mut cursor = start;
+    for &(from, until) in intervals.iter() {
+        let from = from.max(start).max(cursor).min(end);
+        let until = until.min(end).max(from);
+        covered += until.saturating_duration_since(from);
+        cursor = cursor.max(until);
     }
-    let record = diagnostics::create_diagnosis_record(
-        server_id,
-        media_id,
-        ua,
-        steps,
-        cache_hit,
-        failure_node,
-    );
-    diagnostics::record_diagnosis_now(record);
+    end.saturating_duration_since(start).saturating_sub(covered)
 }
 
 #[cfg(test)]
@@ -1242,6 +1480,218 @@ mod tests {
         assert!(!copied.contains_key(header::CONNECTION));
         assert!(!copied.contains_key("x-remove-me"));
     }
+
+    fn assert_diagnosis_timing(record: &diagnostics::DiagnosisRecord) {
+        let started = record.started_at_ms.expect("trace start timestamp");
+        let finished = record.finished_at_ms.expect("trace end timestamp");
+        assert!(started > 0);
+        assert_eq!(finished - started, record.duration_ms.unwrap() as i64);
+        for step in &record.steps {
+            let step_start = step.started_at_ms.expect("step start timestamp");
+            let step_end = step.finished_at_ms.expect("step end timestamp");
+            assert!(step_start >= started);
+            assert!(step_end >= step_start);
+            assert!(step_end <= finished);
+        }
+    }
+
+    #[test]
+    fn operation_union_excludes_cache_gaps_overlaps_and_rounding_artifacts() {
+        let start = Instant::now();
+        let at = |micros| start + Duration::from_micros(micros);
+        let mut intervals = [(at(5000), at(5600)), (at(0), at(600)), (at(200), at(900))];
+        assert_eq!(
+            unaccounted_duration(start, at(10000), &mut intervals),
+            Duration::from_micros(8500)
+        );
+        let mut rounded = [(at(0), at(600)), (at(600), at(1200))];
+        assert_eq!(
+            unaccounted_duration(start, at(1200), &mut rounded),
+            Duration::ZERO
+        );
+    }
+
+    #[tokio::test]
+    async fn playback_trace_failure_callback_is_sanitized_once_and_can_be_disarmed() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut trace = PlaybackDiagnosisTrace::new("s", "callback", "UA");
+        let shared = calls.clone();
+        trace.on_unlogged_failure(move |record| {
+            assert_eq!(record.result.outcome.as_deref(), Some("cancelled"));
+            assert!(!record.steps[0].details.contains("synthetic-secret"));
+            shared.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        trace.begin_step(STEP_EMBY_PATH, "query token=synthetic-secret");
+        drop(trace);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let mut trace = PlaybackDiagnosisTrace::new("s", "already-logged", "UA");
+        trace.on_unlogged_failure(move |_| panic!("disarmed callback must not run"));
+        trace.fail_error(
+            STEP_EMBY_PATH,
+            &AppError::BadGateway("upstream failed".to_string()),
+        );
+        trace.failure_logged();
+        trace.finish().await;
+    }
+
+    #[tokio::test]
+    async fn playback_trace_network_totals_merge_on_success_failure_and_cancel_without_double_counting()
+     {
+        for outcome in ["success", "failure", "cancel"] {
+            diagnostics::clean_diagnostics();
+            let mut trace = PlaybackDiagnosisTrace::new("s", "network-totals", "UA");
+            trace.begin_step(STEP_EMBY_PATH, "query");
+            trace.observation.name_resolution_ms = Some(700);
+            trace.observation.name_resolution_calls = Some(1);
+            trace.observation.connection_setup_ms = Some(900);
+            trace.observation.connection_attempts = Some(1);
+            trace.observation.connection_observation = Some("observed".to_string());
+            trace.complete_step("query completed");
+            trace.begin_step(STEP_OPENLIST, "get");
+            trace.observation.name_resolution_ms = Some(800);
+            trace.observation.name_resolution_calls = Some(2);
+            trace.observation.connection_setup_ms = Some(1000);
+            trace.observation.connection_attempts = Some(2);
+            trace.observation.connection_observation = Some(
+                if outcome == "cancel" {
+                    "partial"
+                } else {
+                    "observed"
+                }
+                .to_string(),
+            );
+            match outcome {
+                "success" => {
+                    trace.complete_step("completed");
+                    trace.finish().await;
+                }
+                "failure" => {
+                    trace.fail_error(
+                        STEP_OPENLIST,
+                        &AppError::BadGateway("synthetic failure".to_string()),
+                    );
+                    trace.finish().await;
+                }
+                _ => drop(trace),
+            }
+            let record = diagnostics::get_diagnosis_records().pop().unwrap();
+            assert_eq!(record.timing.name_resolution_ms, Some(1500));
+            assert_eq!(record.timing.name_resolution_calls, Some(3));
+            assert_eq!(record.timing.connection_setup_ms, Some(1900));
+            assert_eq!(record.timing.connection_attempts, Some(3));
+            assert_eq!(
+                record.timing.connection_observation.as_deref(),
+                Some(if outcome == "cancel" {
+                    "partial"
+                } else {
+                    "observed"
+                })
+            );
+            assert!(record.timing.unaccounted_ms.unwrap() <= record.duration_ms.unwrap());
+            assert_eq!(record.steps[0].name_resolution_ms, Some(700));
+            assert_eq!(record.steps[0].name_resolution_calls, Some(1));
+            assert_eq!(record.steps[0].connection_setup_ms, Some(900));
+            assert_eq!(record.steps[0].connection_attempts, Some(1));
+            assert_eq!(
+                record.steps[0].connection_observation.as_deref(),
+                Some("observed")
+            );
+            assert_eq!(record.steps[1].name_resolution_ms, Some(800));
+            assert_eq!(record.steps[1].name_resolution_calls, Some(2));
+            assert_eq!(record.steps[1].connection_setup_ms, Some(1000));
+            assert_eq!(record.steps[1].connection_attempts, Some(2));
+            assert_eq!(
+                record.steps[1].connection_observation,
+                record.timing.connection_observation
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn playback_trace_timing_covers_total_and_deferred_cache_operations() {
+        diagnostics::clean_diagnostics();
+        let mut trace = PlaybackDiagnosisTrace::new("server-1", "timed-success", "UA");
+        let started_at_ms = trace.started_at_ms;
+        trace.begin_step(STEP_CACHE, "lookup");
+        trace.complete_step("miss");
+        let cache_started_at_ms = trace.cache_started_at_ms;
+        let first_cache_duration = trace.cache_duration_ms;
+
+        // The cache node spans lookup and set, but its duration excludes work in between.
+        tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+        trace.begin_step(STEP_EMBY_PATH, "query");
+        trace.complete_step("resolved");
+        trace.begin_step(STEP_CACHE, "set");
+        trace.complete_step("miss");
+        let cache_finished_at_ms = trace.cache_finished_at_ms;
+        trace.bypass_steps(&[STEP_MAPPING, STEP_OPENLIST, STEP_RAW_URL]);
+        trace.append_cache_step("miss");
+        trace.push_step(STEP_REDIRECT, Instant::now(), "redirect");
+        trace.finish().await;
+
+        let records = diagnostics::get_diagnosis_records();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_diagnosis_timing(record);
+        assert_eq!(record.started_at_ms, Some(started_at_ms));
+        let cache = record
+            .steps
+            .iter()
+            .find(|step| step.name == STEP_CACHE)
+            .unwrap();
+        assert_eq!(cache.started_at_ms, cache_started_at_ms);
+        assert_eq!(cache.finished_at_ms, cache_finished_at_ms);
+        assert!(cache.duration_ms >= first_cache_duration);
+        let cache_span = cache.finished_at_ms.unwrap() - cache.started_at_ms.unwrap();
+        assert!(cache_span >= cache.duration_ms as i64 + 5);
+        assert!(record.duration_ms.unwrap() > record.steps.iter().map(|s| s.duration_ms).sum());
+    }
+
+    #[tokio::test]
+    async fn playback_trace_failure_and_cache_cancellation_retain_original_start() {
+        for cancelled in [false, true] {
+            diagnostics::clean_diagnostics();
+            let mut trace = PlaybackDiagnosisTrace::new("server-1", "timed-failure", "UA");
+            trace.begin_step(STEP_CACHE, "lookup");
+            trace.complete_step("miss");
+            let cache_started_at_ms = trace.cache_started_at_ms;
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            trace.begin_step(STEP_CACHE, "set");
+            if cancelled {
+                drop(trace);
+            } else {
+                trace.fail_step(STEP_CACHE, Instant::now(), "failed");
+                trace.finish().await;
+            }
+            let records = diagnostics::get_diagnosis_records();
+            assert_eq!(records.len(), 1);
+            let record = &records[0];
+            assert_diagnosis_timing(record);
+            assert_eq!(record.failure_node.as_deref(), Some(STEP_CACHE));
+            assert_eq!(record.steps[0].started_at_ms, cache_started_at_ms);
+            assert_eq!(record.steps[0].details.starts_with("cancelled:"), cancelled);
+        }
+    }
+
+    #[tokio::test]
+    async fn playback_trace_active_failure_uses_operation_start_and_empty_drop_has_timing() {
+        diagnostics::clean_diagnostics();
+        let mut trace = PlaybackDiagnosisTrace::new("server-1", "timed-active", "UA");
+        trace.begin_step(STEP_OPENLIST, "fs_get");
+        let started_at_ms = trace.timestamp_at(trace.active_step.as_ref().unwrap().started);
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        trace.fail_step(STEP_OPENLIST, Instant::now(), "failed");
+        trace.finish().await;
+        drop(PlaybackDiagnosisTrace::new("server-1", "timed-empty", "UA"));
+        let records = diagnostics::get_diagnosis_records();
+        assert_eq!(records.len(), 2);
+        for record in &records {
+            assert_diagnosis_timing(record);
+        }
+        assert_eq!(records[0].steps[0].started_at_ms, Some(started_at_ms));
+        assert!(records[0].steps[0].duration_ms >= 2);
+        assert_eq!(records[1].steps[0].details, "cancelled before step started");
+    }
     #[tokio::test]
     async fn playback_trace_success_chain_order_cache_hit_and_redirect() {
         diagnostics::init_diagnostics();
@@ -1713,6 +2163,7 @@ mod tests {
             .expect("cancellation diagnosis record");
         assert_eq!(record.failure_node.as_deref(), Some(STEP_OPENLIST));
         assert!(record.steps[0].details.contains("cancelled"));
+        assert_diagnosis_timing(&record);
         let json = serde_json::to_string(&record).unwrap();
         for secret in ["upstream-secret", "body-secret", "ua-secret"] {
             assert!(!json.contains(secret), "secret leaked: {json}");

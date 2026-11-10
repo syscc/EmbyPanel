@@ -726,6 +726,7 @@ async fn main() -> AppResult<()> {
     let cache = direct_link_cache_from_config(&config);
     let proxy_manager = Arc::new(ProxyManager::new());
     let telemetry_writes = TelemetryWriteQueue::start(settings_store.clone())?;
+    diagnostics::enable_persistence(telemetry_writes.clone());
     let alerts = Alerts::new(db::database_path())?;
     let alert_runtime = AlertRuntime::start(alerts.clone(), client.clone());
     let state = AppState {
@@ -853,7 +854,7 @@ async fn main() -> AppResult<()> {
 async fn healthcheck_command() -> AppResult<()> {
     let addr = management_listen_addr()?;
     let url = format!("http://127.0.0.1:{}/healthz", addr.port());
-    let response = build_http_client()?.get(url).send().await?;
+    let response = diagnostics::network::send(build_http_client()?.get(url)).await?;
     if response.status().is_success() {
         Ok(())
     } else {
@@ -865,7 +866,7 @@ async fn healthcheck_command() -> AppResult<()> {
 }
 
 fn build_http_client() -> AppResult<reqwest::Client> {
-    reqwest::Client::builder()
+    diagnostics::network::instrument_client(reqwest::Client::builder())
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .timeout(HTTP_REQUEST_TIMEOUT)
@@ -876,7 +877,7 @@ fn build_http_client() -> AppResult<reqwest::Client> {
 }
 
 fn build_proxy_http_client() -> AppResult<reqwest::Client> {
-    reqwest::Client::builder()
+    diagnostics::network::instrument_client(reqwest::Client::builder())
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .read_timeout(PROXY_RESPONSE_BODY_IDLE_TIMEOUT)
@@ -937,6 +938,20 @@ pub(crate) fn management_listen_addr() -> AppResult<SocketAddr> {
 async fn handle_request(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    request: Request,
+) -> AppResult<Response> {
+    let request_id = diagnostics::new_request_id();
+    let span = tracing::info_span!("proxy_request", request_id = %request_id);
+    tracing::Instrument::instrument(
+        diagnostics::REQUEST_ID.scope(request_id, handle_request_scoped(state, peer_addr, request)),
+        span,
+    )
+    .await
+}
+
+async fn handle_request_scoped(
+    state: AppState,
+    peer_addr: SocketAddr,
     request: Request,
 ) -> AppResult<Response> {
     let timing = RequestTiming {
@@ -1030,14 +1045,43 @@ async fn handle_request(
         if let Some(rule) = client_control::matched_block_rule(&state, &headers)? {
             let (server_id, server_name) = config_server_label(&request_config);
             let playback_ip = proxy::real_ip_for_log(&request_config, &headers, peer_addr.ip());
-            client_control::notify_client_rule_hit(
-                &state,
-                &rule,
-                &server_id,
-                &server_name,
-                &playback_ip,
-                method.as_str(),
-                path,
+            let mut diagnosis = if rewrite::is_video_stream(path) {
+                rewrite::parse_item_id(path).map(|item_id| {
+                    let ua = header_value(&headers, "User-Agent").unwrap_or_default();
+                    let mut trace = proxy::PlaybackDiagnosisTrace::new(&server_id, &item_id, &ua);
+                    trace.context = playback_diagnosis_context(
+                        &server_name,
+                        &method,
+                        &uri,
+                        &headers,
+                        &playback_ip,
+                    );
+                    // Rule metadata describes an earlier observation, not this request's user.
+                    trace.context.user_name = query_param(uri.query().unwrap_or(""), "UserName")
+                        .filter(|name| !name.trim().is_empty() && name != "--");
+                    attach_diagnosis_failure_log(&mut trace, &state, &request_config, timing);
+                    trace.begin_step(proxy::STEP_POLICY, "client policy block notification");
+                    trace
+                })
+            } else {
+                None
+            };
+            let mut untraced_observation = diagnostics::UpstreamObservation::default();
+            let observation = diagnosis
+                .as_mut()
+                .map(|trace| &mut trace.observation)
+                .unwrap_or(&mut untraced_observation);
+            diagnostics::network::observe_operation(
+                observation,
+                client_control::notify_client_rule_hit(
+                    &state,
+                    &rule,
+                    &server_id,
+                    &server_name,
+                    &playback_ip,
+                    method.as_str(),
+                    path,
+                ),
             )
             .await;
             record_proxy_request(
@@ -1048,6 +1092,16 @@ async fn handle_request(
             )
             .await;
             record_stat(&state, &request_config, RequestStatKind::Block);
+            if let Some(mut trace) = diagnosis.take() {
+                trace.complete_step("client policy notification completed");
+                trace.result = diagnostics::DiagnosisResult {
+                    outcome: Some("blocked".to_string()),
+                    status_code: Some(403),
+                    reason: Some("client policy blocked request".to_string()),
+                    ..Default::default()
+                };
+                trace.finish().await;
+            }
             record_proxy_request_detail(
                 &state,
                 &request_config,
@@ -1059,7 +1113,9 @@ async fn handle_request(
                     outcome: "UA 拦截",
                     started_at_ms: timing.started_at_ms,
                     duration_ms: timing.started.elapsed().as_millis(),
-                    playback_user: &rule.user_name,
+                    playback_user: query_param(uri.query().unwrap_or(""), "UserName")
+                        .as_deref()
+                        .unwrap_or("--"),
                     playback_ip: &playback_ip,
                     cache_hit: false,
                     blocked: true,
@@ -1186,6 +1242,7 @@ async fn handle_request(
             playback_user: "--".to_string(),
             playback_ip: proxy::real_ip_for_log(&request_config, &headers, peer_addr.ip()),
         }),
+        None,
     )
     .await
 }
@@ -1510,7 +1567,7 @@ async fn record_proxy_request(
     };
     let (server_id, server_name) = config_server_label(&config);
     let message = message.into();
-    let detail = detail.into();
+    let detail = correlated_detail(&detail.into());
     state.activity_log.record(
         ActivityKind::General,
         level,
@@ -1581,7 +1638,7 @@ async fn record_proxy_request_detail(
 ) {
     let (server_id, server_name) = config_server_label(config);
     let path = sanitized_uri_for_log(input.uri);
-    let detail = sanitized_detail_for_log(input.detail);
+    let detail = correlated_detail(input.detail);
     state
         .telemetry_writes
         .proxy_request_detail(ProxyRequestDetailWrite {
@@ -1704,7 +1761,7 @@ async fn record_significant_proxy_result(
         return;
     };
     let (server_id, server_name) = config_server_label(config);
-    let detail = format!(
+    let detail = correlated_detail(&format!(
         "{} {} status={} duration={}ms type={} user={} ip={}",
         method,
         sanitized_uri_for_log(uri),
@@ -1713,7 +1770,7 @@ async fn record_significant_proxy_result(
         path_type,
         empty_log_value(playback_user),
         empty_log_value(playback_ip)
-    );
+    ));
     state.activity_log.record(
         ActivityKind::General,
         level,
@@ -1766,6 +1823,14 @@ fn sanitized_uri_for_log(uri: &Uri) -> String {
     }
 }
 
+fn correlated_detail(detail: &str) -> String {
+    let detail = diagnostics::sanitize_diagnostic_text(&sanitized_detail_for_log(detail));
+    match diagnostics::current_request_id() {
+        Some(id) => format!("request_id={id} {detail}").trim_end().to_string(),
+        None => detail,
+    }
+}
+
 fn sanitized_detail_for_log(detail: &str) -> String {
     let trimmed = detail.trim();
     if trimmed.is_empty() {
@@ -1799,6 +1864,8 @@ fn sanitized_url_for_log(value: &str) -> Option<String> {
     if url.query().is_some() {
         url.set_query(Some("***"));
     }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
     url.set_fragment(None);
     Some(url.to_string())
 }
@@ -1816,9 +1883,21 @@ async fn proxy_to_emby_recorded(
     body: Bytes,
     peer_ip: IpAddr,
     trace: Option<ProxyRequestTrace>,
+    mut diagnosis: Option<&mut proxy::PlaybackDiagnosisTrace>,
 ) -> AppResult<Response> {
     let method_label = method.as_str().to_string();
-    let result = proxy::proxy_to_emby(
+    let mut untraced_observation = diagnostics::UpstreamObservation::default();
+    if let Some(diagnosis) = diagnosis.as_deref_mut() {
+        diagnosis.begin_step(
+            proxy::STEP_PROXY,
+            "forward request through response headers; stream not measured",
+        );
+    }
+    let observation = match diagnosis.as_deref_mut() {
+        Some(diagnosis) => &mut diagnosis.observation,
+        None => &mut untraced_observation,
+    };
+    let result = proxy::proxy_to_emby_observed(
         &state.proxy_client,
         config,
         method,
@@ -1826,8 +1905,31 @@ async fn proxy_to_emby_recorded(
         headers,
         body,
         peer_ip,
+        observation,
     )
     .await;
+    if let Some(diagnosis) = diagnosis.as_deref_mut() {
+        match &result {
+            Ok(response) => {
+                diagnosis
+                    .complete_step("upstream response headers received; media stream not measured");
+                let status = response.status().as_u16();
+                diagnosis.result.outcome =
+                    Some(if status >= 400 { "failed" } else { "proxy" }.to_string());
+                diagnosis.result.status_code = Some(status);
+                diagnosis.result.upstream_status = Some(status);
+                diagnosis.result.target_host = diagnostics::target_host(&config.emby_host);
+                if status >= 400 {
+                    let reason = diagnosis.result.reason.clone().unwrap_or_default();
+                    diagnosis.result.reason =
+                        Some(format!("{reason}; upstream response status {status}"));
+                    diagnosis.result.error_kind = Some("upstream_http".to_string());
+                    diagnosis.mark_upstream_status_failure();
+                }
+            }
+            Err(error) => diagnosis.fail_error(proxy::STEP_PROXY, error),
+        }
+    }
     match &result {
         Ok(response) => {
             if let Some(trace) = trace {
@@ -1864,11 +1966,29 @@ async fn proxy_to_emby_recorded(
                     &trace.playback_ip,
                 )
                 .await;
+                if diagnosis.is_some()
+                    && !status.is_client_error()
+                    && !status.is_server_error()
+                    && duration_ms < 3000
+                {
+                    let (server_id, server_name) = config_server_label(config);
+                    state.activity_log.record(
+                        ActivityKind::General,
+                        ActivityLevel::Info,
+                        Some(&server_id),
+                        &server_name,
+                        "回源响应头已返回",
+                        correlated_detail(&format!(
+                            "status={} media_stream_not_measured",
+                            status.as_u16()
+                        )),
+                    );
+                }
             }
         }
         Err(err) => {
             let (server_id, server_name) = config_server_label(config);
-            let error_detail = sanitized_detail_for_log(&err.safe_log_message());
+            let error_detail = correlated_detail(&err.safe_log_message());
             record_stat(state, config, RequestStatKind::Error);
             if let Some(metrics) = state.proxy_metrics.as_ref() {
                 metrics.record_error(error_detail.clone());
@@ -1904,6 +2024,9 @@ async fn proxy_to_emby_recorded(
                 .await;
             }
         }
+    }
+    if let Some(diagnosis) = diagnosis.as_deref_mut() {
+        diagnosis.failure_logged();
     }
     result
 }
@@ -1970,14 +2093,15 @@ async fn update_check(
         html_url: String,
     }
     let current = app_version();
-    let release = state
-        .client
-        .get("https://api.github.com/repos/syscc/EmbyPanel/releases/latest")
-        .header(header::USER_AGENT, "EmbyPanel")
-        .send()
-        .await?
-        .json::<GithubRelease>()
-        .await?;
+    let release = diagnostics::network::send(
+        state
+            .client
+            .get("https://api.github.com/repos/syscc/EmbyPanel/releases/latest")
+            .header(header::USER_AGENT, "EmbyPanel"),
+    )
+    .await?
+    .json::<GithubRelease>()
+    .await?;
     let response = UpdateCheckResponse {
         current_version: current.clone(),
         latest_version: release.tag_name.clone(),
@@ -2241,24 +2365,57 @@ async fn handle_video_stream(
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    let playback_user = playback_user_name(&state.client, &config, query, &headers, state).await;
-    let playback_ip = proxy::real_ip_for_log(&config, &headers, peer_addr.ip());
     let (server_id, server_name) = config_server_label(&config);
+    let mut trace = proxy::PlaybackDiagnosisTrace::new(&server_id, &item_id, user_agent);
+    let playback_ip = proxy::real_ip_for_log(&config, &headers, peer_addr.ip());
+    trace.context = playback_diagnosis_context(&server_name, &method, &uri, &headers, &playback_ip);
+    attach_diagnosis_failure_log(&mut trace, state, config, timing);
+    trace.begin_step(proxy::STEP_CONTEXT, "resolve playback user");
+    let playback_user = diagnostics::network::observe_operation(
+        &mut trace.observation,
+        playback_user_name(&state.client, &config, query, &headers, state),
+    )
+    .await;
+    trace.context.user_name = (playback_user != "--").then(|| playback_user.clone());
+    trace.complete_step("playback user resolution completed");
+    if method == Method::HEAD {
+        trace.skip_step(
+            proxy::STEP_POLICY,
+            "HEAD request does not enforce playback limits",
+        );
+    } else {
+        trace.begin_step(proxy::STEP_POLICY, "playback limits");
+    }
     let concurrent_limited = method != Method::HEAD
-        && client_control::enforce_concurrent_playback_limit(
-            state,
-            client_control::ConcurrentPlaybackLimitInput {
-                runtime_config: &config,
-                server_id: &server_id,
-                server_name: &server_name,
-                playback_user: &playback_user,
-                playback_ip: &playback_ip,
-                item_id: &item_id,
-                device_id: device_id.as_deref(),
-            },
+        && diagnostics::network::observe_operation(
+            &mut trace.observation,
+            client_control::enforce_concurrent_playback_limit(
+                state,
+                client_control::ConcurrentPlaybackLimitInput {
+                    runtime_config: &config,
+                    server_id: &server_id,
+                    server_name: &server_name,
+                    playback_user: &playback_user,
+                    playback_ip: &playback_ip,
+                    item_id: &item_id,
+                    device_id: device_id.as_deref(),
+                },
+            ),
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            trace.fail_error(proxy::STEP_POLICY, &error);
+            error
+        })?;
     if concurrent_limited {
+        trace.complete_step("concurrent playback limit");
+        trace.result = diagnostics::DiagnosisResult {
+            outcome: Some("blocked".to_string()),
+            status_code: Some(429),
+            reason: Some("concurrent playback limit".to_string()),
+            ..Default::default()
+        };
+        trace.finish().await;
         record_stat(state, &config, RequestStatKind::Block);
         record_proxy_request_detail(
             state,
@@ -2286,22 +2443,37 @@ async fn handle_video_stream(
             .into_response());
     }
     let rate_limited = method != Method::HEAD
-        && client_control::enforce_playback_rate_limit(
-            state,
-            client_control::PlaybackRateLimitInput {
-                runtime_config: &config,
-                client: &state.client,
-                server_id: &server_id,
-                server_name: &server_name,
-                playback_user: &playback_user,
-                playback_ip: &playback_ip,
-                playback_event: &item_id,
-                skip_recent_event: false,
-                record_recent_event: false,
-            },
+        && diagnostics::network::observe_operation(
+            &mut trace.observation,
+            client_control::enforce_playback_rate_limit(
+                state,
+                client_control::PlaybackRateLimitInput {
+                    runtime_config: &config,
+                    client: &state.client,
+                    server_id: &server_id,
+                    server_name: &server_name,
+                    playback_user: &playback_user,
+                    playback_ip: &playback_ip,
+                    playback_event: &item_id,
+                    skip_recent_event: false,
+                    record_recent_event: false,
+                },
+            ),
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            trace.fail_error(proxy::STEP_POLICY, &error);
+            error
+        })?;
     if rate_limited {
+        trace.complete_step("playback rate limit");
+        trace.result = diagnostics::DiagnosisResult {
+            outcome: Some("blocked".to_string()),
+            status_code: Some(429),
+            reason: Some("playback rate limit".to_string()),
+            ..Default::default()
+        };
+        trace.finish().await;
         record_stat(state, &config, RequestStatKind::Block);
         record_proxy_request_detail(
             state,
@@ -2328,8 +2500,7 @@ async fn handle_video_stream(
         )
             .into_response());
     }
-    let server_id = config_server_label(&config).0;
-    let mut trace = proxy::PlaybackDiagnosisTrace::new(&server_id, &item_id, &user_agent);
+    trace.complete_step("playback limits passed");
     let cache_key = DirectLinkCache::key(
         state.proxy_server_id.as_deref().unwrap_or("default"),
         &item_id,
@@ -2339,21 +2510,58 @@ async fn handle_video_stream(
 
     trace.begin_step(proxy::STEP_CACHE, "lookup");
     let cache = state.cache.read().await.clone();
-    let cached = cache.get(&cache_key).await;
-    let valid_hit = cached
+    let lookup = cache.get_observed(&cache_key).await;
+    let valid_hit = lookup
+        .value
         .as_ref()
         .is_some_and(|value| should_cache_direct_link(&config, value));
+    trace.cache = diagnostics::DiagnosisCache {
+        status: Some(
+            if !lookup.enabled {
+                "disabled"
+            } else if valid_hit {
+                "hit"
+            } else {
+                "miss"
+            }
+            .to_string(),
+        ),
+        stored: None,
+        reason: Some(
+            if !lookup.enabled {
+                "cache policy disabled"
+            } else if valid_hit {
+                "cached target accepted"
+            } else if lookup.value.is_some() {
+                "cached target rejected by domain policy"
+            } else {
+                "no cached entry observed"
+            }
+            .to_string(),
+        ),
+        ttl_seconds: Some(lookup.ttl_seconds),
+        remaining_ttl_ms: valid_hit.then_some(lookup.remaining_ttl_ms).flatten(),
+        target_host: lookup.value.as_deref().and_then(diagnostics::target_host),
+    };
     trace.set_cache_hit(valid_hit);
     trace.complete_step(if valid_hit { "hit" } else { "miss" });
-    let cached = cached.filter(|_| valid_hit);
+    let cached = lookup.value.filter(|_| valid_hit);
     if let Some(cached) = cached {
-        trace.bypass_steps(&[
+        for step in [
             proxy::STEP_EMBY_PATH,
             proxy::STEP_MAPPING,
             proxy::STEP_OPENLIST,
             proxy::STEP_RAW_URL,
-        ]);
+        ] {
+            trace.skip_step(step, "cache hit; media path resolution not needed");
+        }
+        trace.skip_step(
+            proxy::STEP_INTERNAL_REDIRECT,
+            "cache hit; cached final URL reused",
+        );
         trace.append_cache_step("hit");
+        let response =
+            playback_redirect_response(&mut trace, &cached, "cache hit; redirect response only")?;
         trace.push_step(
             proxy::STEP_REDIRECT,
             Instant::now(),
@@ -2401,20 +2609,32 @@ async fn handle_video_stream(
             PLAYBACK_MODE_DIRECT_LINK,
         )
         .await;
-        return Ok(proxy::redirect_response(cached));
+        return Ok(response);
     }
 
     trace.begin_step(proxy::STEP_EMBY_PATH, "query");
-    let media_path = match emby::get_media_path(
+    let media_resolution = emby::get_media_path_observed(
         &state.client,
         &config,
         &item_id,
         media_source_id.as_deref(),
         user_agent,
+        &mut trace.observation,
     )
-    .await
-    {
+    .await;
+    if let Ok(resolution) = &media_resolution {
+        trace.context.media_name = resolution.media_name.clone();
+        trace.context.series_name = resolution.series_name.clone();
+        trace.context.season_number = resolution.season_number;
+        trace.context.episode_number = resolution.episode_number;
+        trace.context.media_source_id = resolution
+            .media_source_id
+            .clone()
+            .or(trace.context.media_source_id.take());
+    }
+    let media_path = match media_resolution.map(|resolution| resolution.path) {
         Ok(Some(path)) => {
+            trace.paths.original = Some(diagnostics::sanitize_path(&path));
             trace.complete_step(&diagnostics::sanitize_diagnostic_text(&format!(
                 "resolved path={path}"
             )));
@@ -2423,14 +2643,22 @@ async fn handle_video_stream(
         Ok(None) => {
             tracing::info!(item = item_id, "media source not found; proxying to Emby");
             trace.complete_step("not found");
-            trace.bypass_steps(&[
+            for step in [
                 proxy::STEP_MAPPING,
                 proxy::STEP_OPENLIST,
                 proxy::STEP_RAW_URL,
-            ]);
+                proxy::STEP_INTERNAL_REDIRECT,
+            ] {
+                trace.skip_step(step, "media source path not found; using Emby proxy");
+            }
+            trace.cache.stored = Some(false);
+            trace.cache.reason =
+                Some("media source path not found; no cache insertion".to_string());
             trace.append_cache_step("miss");
-            trace.push_step(proxy::STEP_REDIRECT, Instant::now(), "proxy");
-            trace.finish().await;
+            trace.skip_step(proxy::STEP_REDIRECT, "source not found; proxy to Emby");
+            trace.result.reason = Some(
+                "requested media source path not found; proxy response headers only".to_string(),
+            );
             let result = proxy_to_emby_recorded(
                 state,
                 &config,
@@ -2446,8 +2674,10 @@ async fn handle_video_stream(
                     playback_user,
                     playback_ip,
                 }),
+                Some(&mut trace),
             )
             .await;
+            trace.finish().await;
             if let Ok(response) = &result
                 && let Some(mode) = playback_mode_for_proxy_response(response)
             {
@@ -2464,51 +2694,54 @@ async fn handle_video_stream(
             return result;
         }
         Err(err) => {
-            trace.fail_step(
-                proxy::STEP_EMBY_PATH,
-                Instant::now(),
-                &err.safe_log_message(),
-            );
-            record_proxy_request_detail(
-                state,
-                &config,
-                ProxyRequestDetailInput {
-                    method: &method_label,
-                    uri: &uri,
-                    path_type: "video_stream",
-                    status_code: StatusCode::BAD_GATEWAY.as_u16(),
-                    outcome: "读取媒体失败",
-                    started_at_ms: timing.started_at_ms,
-                    duration_ms: timing.started.elapsed().as_millis(),
-                    playback_user: &playback_user,
-                    playback_ip: &playback_ip,
-                    cache_hit: false,
-                    blocked: false,
-                    detail: &err.safe_log_message(),
-                },
-            )
-            .await;
+            trace.fail_error(proxy::STEP_EMBY_PATH, &err);
             trace.finish().await;
             return Err(err);
         }
     };
     let mapping_started = Instant::now();
-    let (media_path, mapping_details) = apply_strm_url_mappings_with_details(&config, &media_path);
-    trace.push_step(proxy::STEP_MAPPING, mapping_started, &mapping_details);
+    let (media_path, mapping_details, matched_rules) =
+        apply_strm_url_mappings_observed(&config, &media_path);
+    trace.paths.mapped = Some(diagnostics::sanitize_path(&media_path));
+    trace.paths.matched_rules = matched_rules;
+    if config.strm_url_mapping_enabled {
+        trace.push_step(proxy::STEP_MAPPING, mapping_started, &mapping_details);
+    } else {
+        trace.skip_step(proxy::STEP_MAPPING, "URL mapping disabled");
+    }
 
     if is_direct_url(&media_path) && config.openlist_addr.is_none() {
-        let redirect_url =
-            maybe_resolve_internal_redirect(&state.proxy_client, &config, &media_path, user_agent)
-                .await;
+        let redirect_url = maybe_resolve_internal_redirect(
+            &state.proxy_client,
+            &config,
+            &media_path,
+            user_agent,
+            &mut trace,
+        )
+        .await;
         let should_cache = should_cache_direct_link(&config, &redirect_url);
         if should_cache {
             trace.begin_step(proxy::STEP_CACHE, "set");
             let cache = state.cache.read().await.clone();
-            cache.set(cache_key, redirect_url.clone()).await;
+            let stored = cache.set_observed(cache_key, redirect_url.clone()).await;
+            trace.cache.stored = Some(stored);
             trace.complete_step("miss");
         }
-        trace.bypass_steps(&[proxy::STEP_OPENLIST, proxy::STEP_RAW_URL]);
+        trace.skip_step(
+            proxy::STEP_OPENLIST,
+            "direct URL selected; OpenList API not configured",
+        );
+        trace.skip_step(
+            proxy::STEP_RAW_URL,
+            "direct URL selected; no OpenList raw URL needed",
+        );
+        complete_cache_decision(&mut trace, &config, should_cache, &redirect_url);
         trace.append_cache_step(cache_miss_detail(&config, should_cache));
+        let response = playback_redirect_response(
+            &mut trace,
+            &redirect_url,
+            "direct media URL; redirect response only",
+        )?;
         trace.set_cache_hit(false);
         trace.push_step(
             proxy::STEP_REDIRECT,
@@ -2561,20 +2794,34 @@ async fn handle_video_stream(
             PLAYBACK_MODE_DIRECT_LINK,
         )
         .await;
-        return Ok(proxy::redirect_response(redirect_url));
+        return Ok(response);
     }
 
     let Some(openlist_path) = openlist::extract_openlist_path(&media_path) else {
         tracing::info!(
             item = item_id,
-            path = media_path,
+            path = diagnostics::sanitize_path(&media_path),
             "media path is not a direct URL or OpenList /d URL; proxying to Emby"
         );
-        trace.bypass_steps(&[proxy::STEP_OPENLIST, proxy::STEP_RAW_URL]);
+        for step in [
+            proxy::STEP_OPENLIST,
+            proxy::STEP_RAW_URL,
+            proxy::STEP_INTERNAL_REDIRECT,
+        ] {
+            trace.skip_step(step, "path requires Emby proxy, not direct URL resolution");
+        }
+        trace.cache.stored = Some(false);
+        trace.cache.reason = Some("path requires Emby proxy; no direct URL cached".to_string());
         trace.append_cache_step("miss");
         trace.set_cache_hit(false);
-        trace.push_step(proxy::STEP_REDIRECT, Instant::now(), "proxy");
-        trace.finish().await;
+        trace.skip_step(
+            proxy::STEP_REDIRECT,
+            "path is neither a direct URL nor OpenList /d path",
+        );
+        trace.result.reason = Some(
+            "path is neither a direct URL nor OpenList /d path; proxy response headers only"
+                .to_string(),
+        );
         let result = proxy_to_emby_recorded(
             state,
             &config,
@@ -2590,8 +2837,10 @@ async fn handle_video_stream(
                 playback_user,
                 playback_ip,
             }),
+            Some(&mut trace),
         )
         .await;
+        trace.finish().await;
         if let Ok(response) = &result
             && let Some(mode) = playback_mode_for_proxy_response(response)
         {
@@ -2612,39 +2861,53 @@ async fn handle_video_stream(
         proxy::STEP_OPENLIST,
         &diagnostics::sanitize_diagnostic_text(&format!("fs_get path={openlist_path}")),
     );
-    let raw_url = match openlist::fs_get(&state.client, &config, &openlist_path, user_agent).await {
+    let raw_url = match openlist::fs_get_observed(
+        &state.client,
+        &config,
+        &openlist_path,
+        user_agent,
+        &mut trace.observation,
+    )
+    .await
+    {
         Ok(fs) => {
             trace.complete_step(&diagnostics::sanitize_diagnostic_text(&format!(
                 "fs_get path={openlist_path}; matched"
             )));
             trace.begin_step(proxy::STEP_RAW_URL, "validate and resolve");
+            let missing_raw_url = fs.is_none();
             match openlist::ensure_raw_url(fs) {
                 Ok(raw) => {
+                    trace.complete_step(&diagnostics::sanitize_diagnostic_text(&format!(
+                        "resolved raw_url={raw}"
+                    )));
                     let raw = maybe_resolve_internal_redirect(
                         &state.proxy_client,
                         &config,
                         &raw,
                         user_agent,
+                        &mut trace,
                     )
                     .await;
-                    trace.complete_step(&diagnostics::sanitize_diagnostic_text(&format!(
-                        "resolved raw_url={raw}"
-                    )));
                     raw
                 }
                 Err(err) => {
-                    trace.fail_step(proxy::STEP_RAW_URL, Instant::now(), &err.safe_log_message());
+                    trace.observation.error_kind = Some(
+                        if missing_raw_url {
+                            "missing_raw_url"
+                        } else {
+                            "invalid_url"
+                        }
+                        .to_string(),
+                    );
+                    trace.fail_error(proxy::STEP_RAW_URL, &err);
                     trace.finish().await;
                     return Err(err);
                 }
             }
         }
         Err(err) => {
-            trace.fail_step(
-                proxy::STEP_OPENLIST,
-                Instant::now(),
-                &err.safe_log_message(),
-            );
+            trace.fail_error(proxy::STEP_OPENLIST, &err);
             trace.finish().await;
             return Err(err);
         }
@@ -2653,11 +2916,18 @@ async fn handle_video_stream(
     if should_cache {
         trace.begin_step(proxy::STEP_CACHE, "set");
         let cache = state.cache.read().await.clone();
-        cache.set(cache_key, raw_url.clone()).await;
+        let stored = cache.set_observed(cache_key, raw_url.clone()).await;
+        trace.cache.stored = Some(stored);
         trace.complete_step("miss");
     }
+    complete_cache_decision(&mut trace, &config, should_cache, &raw_url);
     trace.append_cache_step(cache_miss_detail(&config, should_cache));
     trace.set_cache_hit(false);
+    let response = playback_redirect_response(
+        &mut trace,
+        &raw_url,
+        "OpenList raw URL; redirect response only",
+    )?;
     trace.push_step(
         proxy::STEP_REDIRECT,
         Instant::now(),
@@ -2710,7 +2980,7 @@ async fn handle_video_stream(
         PLAYBACK_MODE_DIRECT_LINK,
     )
     .await;
-    Ok(proxy::redirect_response(raw_url))
+    Ok(response)
 }
 
 async fn record_playback_path(
@@ -2744,8 +3014,126 @@ fn query_param(query: &str, key: &str) -> Option<String> {
         .map(|(_, value)| value.into_owned())
 }
 
+fn non_empty_query_param(query: &str, key: &str) -> Option<String> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .find(|(name, value)| name.eq_ignore_ascii_case(key) && !value.trim().is_empty())
+        .map(|(_, value)| value.into_owned())
+}
+
 fn is_direct_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
+}
+
+fn attach_diagnosis_failure_log(
+    trace: &mut proxy::PlaybackDiagnosisTrace,
+    state: &AppState,
+    config: &Config,
+    timing: RequestTiming,
+) {
+    let writes = state.telemetry_writes.clone();
+    let activity = state.activity_log.clone();
+    let port = config.port;
+    trace.on_unlogged_failure(move |record| {
+        // Only fixed safe fields, never error text, request query, headers or upstream bodies.
+        let cancelled = record.result.outcome.as_deref() == Some("cancelled");
+        let outcome = if cancelled {
+            "请求取消"
+        } else {
+            "播放请求处理失败"
+        };
+        let detail = format!(
+            "request_id={} outcome={}",
+            record.request_id,
+            record.result.outcome.as_deref().unwrap_or("failed")
+        );
+        let server_name = record.context.server_name.as_deref().unwrap_or("");
+        writes.proxy_request_detail(ProxyRequestDetailWrite {
+            timestamp_ms: timing.started_at_ms,
+            server_id: record.server_id.clone(),
+            server_name: server_name.to_string(),
+            port,
+            method: record.context.method.clone().unwrap_or_default(),
+            path: record.context.request_path.clone().unwrap_or_default(),
+            path_type: "video_stream".to_string(),
+            // 0 is an internal log sentinel: cancellation observed, no HTTP response sent.
+            status_code: record.result.status_code.unwrap_or(0),
+            outcome: outcome.to_string(),
+            duration_ms: record.duration_ms.unwrap_or(0) as u128,
+            playback_user: record
+                .context
+                .user_name
+                .clone()
+                .unwrap_or_else(|| "--".to_string()),
+            playback_ip: record
+                .context
+                .source_ip
+                .clone()
+                .unwrap_or_else(|| "--".to_string()),
+            cache_hit: record.cache_hit,
+            blocked: false,
+            detail: detail.clone(),
+        });
+        activity.record(
+            ActivityKind::General,
+            if cancelled {
+                ActivityLevel::Warn
+            } else {
+                ActivityLevel::Error
+            },
+            Some(&record.server_id),
+            server_name,
+            outcome,
+            detail,
+        );
+    });
+}
+
+fn playback_diagnosis_context(
+    server_name: &str,
+    method: &Method,
+    uri: &Uri,
+    headers: &axum::http::HeaderMap,
+    source_ip: &str,
+) -> diagnostics::DiagnosisContext {
+    let query = uri.query().unwrap_or("");
+    diagnostics::DiagnosisContext {
+        server_name: Some(server_name.to_string()),
+        media_source_id: non_empty_query_param(query, "MediaSourceId"),
+        client_name: playback_context_value(query, headers, "Client", "X-Emby-Client"),
+        device_name: playback_device_name(query, headers),
+        device_id: playback_device_id(query, headers),
+        source_ip: Some(source_ip.to_string()),
+        method: Some(method.to_string()),
+        request_path: Some(uri.path().to_string()),
+        range: header_value(headers, "Range"),
+        ..Default::default()
+    }
+}
+
+fn complete_cache_decision(
+    trace: &mut proxy::PlaybackDiagnosisTrace,
+    config: &Config,
+    eligible: bool,
+    url: &str,
+) {
+    trace.cache.stored.get_or_insert(false);
+    trace.cache.target_host = diagnostics::target_host(url);
+    trace.cache.reason = Some(
+        if trace.cache.status.as_deref() == Some("disabled") {
+            "cache policy disabled"
+        } else if !eligible {
+            match config.cache_domain_filter_mode.as_str() {
+                "whitelist" => "target not accepted by domain whitelist",
+                "blacklist" => "target rejected by domain blacklist",
+                _ => "target URL is not cacheable",
+            }
+        } else if trace.cache.stored == Some(true) {
+            "cache miss; entry inserted"
+        } else {
+            "cache insertion disabled by effective bucket policy"
+        }
+        .to_string(),
+    );
 }
 
 fn cache_miss_detail(config: &Config, cache_eligible: bool) -> &'static str {
@@ -2756,6 +3144,24 @@ fn cache_miss_detail(config: &Config, cache_eligible: bool) -> &'static str {
     } else {
         "miss; not stored"
     }
+}
+
+fn playback_redirect_response(
+    trace: &mut proxy::PlaybackDiagnosisTrace,
+    location: &str,
+    reason: &str,
+) -> AppResult<Response> {
+    let response = proxy::redirect_response(location.to_string());
+    if response.status() != StatusCode::FOUND {
+        let error =
+            AppError::BadGateway("upstream redirect location could not be returned".to_string());
+        trace.begin_step(proxy::STEP_REDIRECT, "construct redirect response");
+        trace.observation.error_kind = Some("invalid_redirect_location".to_string());
+        trace.fail_error(proxy::STEP_REDIRECT, &error);
+        return Err(error);
+    }
+    trace.set_redirect(location, reason);
+    Ok(response)
 }
 
 fn redirect_diagnosis_detail(location: &str) -> String {
@@ -2778,7 +3184,7 @@ fn record_playback_redirect(
 ) {
     let (server_id, server_name) = config_server_label(config);
     let message = message.into();
-    let log_detail = redirect_url.to_string();
+    let log_detail = correlated_detail(redirect_url);
     state.activity_log.record_playback(PlaybackLogRecord {
         level: ActivityLevel::Success,
         server_id: Some(&server_id),
@@ -2930,9 +3336,7 @@ async fn user_name_by_user_id(
     query: &str,
     headers: &axum::http::HeaderMap,
 ) -> Option<String> {
-    let user_id = query_param(query, "UserId")
-        .or_else(|| header_value(headers, "X-Emby-User-Id"))
-        .or_else(|| emby_authorization_value(headers, "UserId"))?;
+    let user_id = playback_context_value(query, headers, "UserId", "X-Emby-User-Id")?;
     match emby::get_user_name_by_user_id(client, config, &user_id).await {
         Ok(Some(user_name)) => Some(user_name),
         Ok(None) => None,
@@ -2977,70 +3381,142 @@ async fn user_name_by_token(
     }
 }
 
+fn playback_context_value(
+    query: &str,
+    headers: &axum::http::HeaderMap,
+    key: &str,
+    header: &str,
+) -> Option<String> {
+    non_empty_query_param(query, key)
+        .or_else(|| non_empty_query_param(query, header))
+        .or_else(|| header_value(headers, header))
+        .or_else(|| emby_authorization_value(headers, key))
+}
+
 fn playback_device_id(query: &str, headers: &axum::http::HeaderMap) -> Option<String> {
-    query_param(query, "DeviceId")
-        .or_else(|| header_value(headers, "X-Emby-Device-Id"))
-        .or_else(|| emby_authorization_value(headers, "DeviceId"))
+    playback_context_value(query, headers, "DeviceId", "X-Emby-Device-Id")
+}
+
+fn playback_device_name(query: &str, headers: &axum::http::HeaderMap) -> Option<String> {
+    non_empty_query_param(query, "Device")
+        .or_else(|| non_empty_query_param(query, "DeviceName"))
+        .or_else(|| playback_context_value(query, headers, "DeviceName", "X-Emby-Device-Name"))
+        .or_else(|| emby_authorization_value(headers, "Device"))
 }
 
 fn playback_stream_query(query: &str, headers: &axum::http::HeaderMap) -> Option<String> {
+    let fields = [
+        (
+            "UserId",
+            playback_context_value(query, headers, "UserId", "X-Emby-User-Id"),
+        ),
+        ("DeviceId", playback_device_id(query, headers)),
+        (
+            "Client",
+            playback_context_value(query, headers, "Client", "X-Emby-Client"),
+        ),
+        ("Device", playback_device_name(query, headers)),
+    ];
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-        serializer.append_pair(&key, &value);
+        if !fields
+            .iter()
+            .any(|(name, _)| key.eq_ignore_ascii_case(name))
+            && !key.eq_ignore_ascii_case("DeviceName")
+        {
+            serializer.append_pair(&key, &value);
+        }
     }
-
-    if query_param(query, "UserId").is_none()
-        && let Some(user_id) = header_value(headers, "X-Emby-User-Id")
-            .or_else(|| emby_authorization_value(headers, "UserId"))
-    {
-        serializer.append_pair("UserId", &user_id);
+    for (key, value) in fields {
+        if let Some(value) = value {
+            serializer.append_pair(key, &value);
+        }
     }
-
-    if query_param(query, "DeviceId").is_none()
-        && let Some(device_id) = header_value(headers, "X-Emby-Device-Id")
-            .or_else(|| emby_authorization_value(headers, "DeviceId"))
-    {
-        serializer.append_pair("DeviceId", &device_id);
-    }
-
     let query = serializer.finish();
     (!query.is_empty()).then_some(query)
 }
 
 fn emby_token_from_authorization(headers: &axum::http::HeaderMap) -> Option<String> {
     let value = header_value(headers, "Authorization")?;
-    if let Some(token) = value.strip_prefix("Bearer ") {
+    if let Some((scheme, token)) = value.split_once(char::is_whitespace)
+        && scheme.eq_ignore_ascii_case("Bearer")
+    {
         return Some(token.trim().to_string()).filter(|token| !token.is_empty());
     }
-    value
-        .split(',')
-        .map(str::trim)
-        .find_map(|part| {
-            part.strip_prefix("Token=")
-                .or_else(|| part.strip_prefix("token="))
-                .map(|token| token.trim_matches('"').trim().to_string())
-        })
-        .filter(|token| !token.is_empty())
+    media_browser_auth_value(&value, "Token")
 }
 
 fn emby_authorization_value(headers: &axum::http::HeaderMap, key: &str) -> Option<String> {
-    ["X-Emby-Authorization", "X-MediaBrowser-Authorization"]
-        .into_iter()
-        .filter_map(|header| header_value(headers, header))
-        .find_map(|value| media_browser_auth_value(&value, key))
+    [
+        "X-Emby-Authorization",
+        "X-MediaBrowser-Authorization",
+        "Authorization",
+    ]
+    .into_iter()
+    .filter_map(|header| header_value(headers, header))
+    .find_map(|value| media_browser_auth_value(&value, key))
 }
 
 fn media_browser_auth_value(value: &str, key: &str) -> Option<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .find_map(|part| {
-            let (name, value) = part.split_once('=')?;
-            name.trim()
-                .eq_ignore_ascii_case(key)
-                .then(|| value.trim().trim_matches('"').to_string())
+    let value = value.trim();
+    let attributes = value
+        .split_once(char::is_whitespace)
+        .filter(|(scheme, _)| {
+            scheme.eq_ignore_ascii_case("MediaBrowser") || scheme.eq_ignore_ascii_case("Emby")
         })
-        .filter(|value| !value.is_empty())
+        .map(|(_, attributes)| attributes.trim_start())
+        .unwrap_or(value);
+    let mut quoted = false;
+    let mut escaped = false;
+    for part in attributes.split(|ch| {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' && quoted {
+            escaped = true;
+        } else if ch == '"' {
+            quoted = !quoted;
+        } else if ch == ',' && !quoted {
+            return true;
+        }
+        false
+    }) {
+        let Some((name, raw)) = part.split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case(key) {
+            continue;
+        }
+        let raw = raw.trim();
+        let value = if let Some(inner) = raw.strip_prefix('"') {
+            let mut chars = inner.chars();
+            let mut value = String::new();
+            loop {
+                match chars.next()? {
+                    '\\' => value.push(chars.next()?),
+                    '"' => {
+                        if !chars.as_str().trim().is_empty() {
+                            return None;
+                        }
+                        break;
+                    }
+                    ch => value.push(ch),
+                }
+            }
+            value
+        } else {
+            if !raw
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+            {
+                return None;
+            }
+            raw.to_string()
+        };
+        if !value.trim().is_empty() {
+            return Some(value);
+        }
+    }
+    None
 }
 
 fn header_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
@@ -3170,16 +3646,26 @@ fn apply_strm_url_mappings(config: &Config, media_path: &str) -> String {
 }
 
 fn apply_strm_url_mappings_with_details(config: &Config, media_path: &str) -> (String, String) {
+    let (mapped, details, _) = apply_strm_url_mappings_observed(config, media_path);
+    (mapped, details)
+}
+
+fn apply_strm_url_mappings_observed(
+    config: &Config,
+    media_path: &str,
+) -> (String, String, Vec<usize>) {
     if !config.strm_url_mapping_enabled {
         return (
             media_path.to_string(),
             diagnostics::sanitize_diagnostic_text(&format!("disabled; result={media_path}")),
+            Vec::new(),
         );
     }
 
     let mapped = url_mapping::apply_rules(media_path, &config.strm_url_mapping_rules);
     let mut current = media_path.to_string();
     let mut matched_rules = Vec::new();
+    let mut matched_rule_numbers = Vec::new();
     for (index, line) in config.strm_url_mappings.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -3192,6 +3678,7 @@ fn apply_strm_url_mappings_with_details(config: &Config, media_path: &str) -> (S
         };
         let next = url_mapping::apply_rules(&current, &rules);
         if next != current {
+            matched_rule_numbers.push(index + 1);
             matched_rules.push(format!(
                 "rule#{} {}",
                 index + 1,
@@ -3216,7 +3703,7 @@ fn apply_strm_url_mappings_with_details(config: &Config, media_path: &str) -> (S
             matched_rules.join(", ")
         ))
     };
-    (mapped, details)
+    (mapped, details, matched_rule_numbers)
 }
 
 async fn maybe_resolve_internal_redirect(
@@ -3224,20 +3711,31 @@ async fn maybe_resolve_internal_redirect(
     config: &Config,
     url: &str,
     user_agent: &str,
+    trace: &mut proxy::PlaybackDiagnosisTrace,
 ) -> String {
     if !config.enable_internal_redirect {
+        trace.skip_step(proxy::STEP_INTERNAL_REDIRECT, "internal redirect disabled");
+        trace.paths.resolved = Some(diagnostics::sanitize_path(url));
         return url.to_string();
     }
-
-    match internal_redirect::resolve_redirect_location(
+    trace.begin_step(
+        proxy::STEP_INTERNAL_REDIRECT,
+        "resolve Location from existing probe",
+    );
+    match internal_redirect::resolve_redirect_observed(
         client,
         url,
         config.internal_redirect_timeout_seconds,
         user_agent,
+        &mut trace.observation,
     )
     .await
     {
-        Ok(resolved) => {
+        Ok(resolution) => {
+            let resolved = resolution.url;
+            trace.timing.redirect_count = resolution.redirect_count;
+            trace.paths.resolved = Some(diagnostics::sanitize_path(&resolved));
+            trace.complete_step("internal redirect response headers received");
             tracing::info!(
                 from = sanitized_detail_for_log(url),
                 to = sanitized_detail_for_log(&resolved),
@@ -3246,6 +3744,8 @@ async fn maybe_resolve_internal_redirect(
             resolved
         }
         Err(err) => {
+            trace.complete_redirect_fallback(&err);
+            trace.paths.resolved = Some(diagnostics::sanitize_path(url));
             tracing::warn!(
                 url = sanitized_detail_for_log(url),
                 error = %safe_error_message(&err),
@@ -3300,6 +3800,8 @@ mod tests {
 
     include!("test-fixtures/review_authorization.rs");
     include!("test-fixtures/review_api_fixes.rs");
+    include!("test-fixtures/diagnostics_expansion.rs");
+    include!("test-fixtures/network_timing_api.rs");
 
     fn test_config(emby_host: &str, openlist_addr: &str, port: u16) -> Config {
         Config {
@@ -3497,8 +3999,20 @@ mod tests {
     }
 
     #[test]
-    fn media_browser_auth_value_extracts_token_fields() {
-        let value = r#"MediaBrowser Client="Emby Web", DeviceId="device-1", Token="token-1", UserId="user-1""#;
+    fn media_browser_auth_value_extracts_token_fields_after_scheme() {
+        let value = r#"MediaBrowser Client="Emby Web", Device="Chrome", DeviceName="Chromium", DeviceId="device-1", Token="token-1", UserId="user-1""#;
+        assert_eq!(
+            media_browser_auth_value(value, "Client").as_deref(),
+            Some("Emby Web")
+        );
+        assert_eq!(
+            media_browser_auth_value(value, "Device").as_deref(),
+            Some("Chrome")
+        );
+        assert_eq!(
+            media_browser_auth_value(value, "DeviceName").as_deref(),
+            Some("Chromium")
+        );
         assert_eq!(
             media_browser_auth_value(value, "deviceid").as_deref(),
             Some("device-1")
@@ -3511,6 +4025,267 @@ mod tests {
             media_browser_auth_value(value, "UserId").as_deref(),
             Some("user-1")
         );
+        assert_eq!(media_browser_auth_value("Bearer token-1", "Client"), None);
+    }
+
+    #[test]
+    fn media_browser_auth_value_preserves_quoted_device_names_and_emby_scheme() {
+        for scheme in ["MediaBrowser", "Emby", "eMbY", ""] {
+            let value = format!(
+                r#"{scheme} Client="Emby Web", DeviceName="Office, \"Chrome\" \\ Mac", DeviceId="browser-device", Token="test-token""#
+            );
+            assert_eq!(
+                media_browser_auth_value(&value, "Client").as_deref(),
+                Some("Emby Web")
+            );
+            assert_eq!(
+                media_browser_auth_value(&value, "DeviceName").as_deref(),
+                Some(r#"Office, "Chrome" \ Mac"#)
+            );
+            assert_eq!(
+                media_browser_auth_value(&value, "DeviceId").as_deref(),
+                Some("browser-device")
+            );
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(header::AUTHORIZATION, value.trim().parse().unwrap());
+            assert_eq!(
+                emby_token_from_authorization(&headers).as_deref(),
+                Some("test-token")
+            );
+        }
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "bEaReR test-token".parse().unwrap());
+        assert_eq!(
+            emby_token_from_authorization(&headers).as_deref(),
+            Some("test-token")
+        );
+        assert_eq!(
+            media_browser_auth_value(r#"Emby DeviceName="unterminated"#, "DeviceName"),
+            None
+        );
+    }
+
+    #[test]
+    fn media_browser_auth_value_accepts_unquoted_http_tokens() {
+        for scheme in ["MediaBrowser", "Emby", "eMbY", ""] {
+            for token in ["Chrome-Web", "Mac_1.2", "AZaz09!#$%&'*+-.^_`|~"] {
+                let authorization =
+                    format!("{scheme} Client={token}, Device={token}, Token={token}");
+                for key in ["Client", "Device", "Token"] {
+                    assert_eq!(
+                        media_browser_auth_value(&authorization, key).as_deref(),
+                        Some(token)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn playback_context_rejects_unquoted_credentials_without_leaking_into_stream_urls() {
+        let secret = "synthetic-unquoted-credential";
+        let original_query = "api_key=query-key&X-Emby-Token=query-token";
+        for key in ["Client", "Device", "DeviceName", "DeviceId", "UserId"] {
+            for malformed in [
+                format!("Chrome Token={secret}"),
+                format!("Chrome ApiKey={secret}"),
+                format!("Chrome\tToken={secret}"),
+                format!("Chrome;Token={secret}"),
+                format!("Chrome=Token={secret}"),
+                format!("Chrome/Token={secret}"),
+            ] {
+                for scheme in ["MediaBrowser", "Emby", ""] {
+                    for header in [
+                        "Authorization",
+                        "X-Emby-Authorization",
+                        "X-MediaBrowser-Authorization",
+                    ] {
+                        let authorization = format!("{scheme} {key}={malformed}");
+                        assert!(
+                            media_browser_auth_value(&authorization, key).is_none(),
+                            "malformed unquoted {key} must be rejected"
+                        );
+                        let mut headers = axum::http::HeaderMap::new();
+                        headers.insert(
+                            header.parse::<axum::http::HeaderName>().unwrap(),
+                            authorization.trim().parse().unwrap(),
+                        );
+                        let query = playback_stream_query(original_query, &headers).unwrap();
+                        let body = rewrite::patch_playback_info(
+                            json!({"MediaSources":[{"Id":"source", "IsRemote":true}]}),
+                            "/Items/item/PlaybackInfo",
+                            Some(&query),
+                        );
+                        let url = body["MediaSources"][0]["DirectStreamUrl"].as_str().unwrap();
+                        let stream_query = url.split_once('?').unwrap().1;
+                        assert!(
+                            url::form_urlencoded::parse(stream_query.as_bytes())
+                                .all(|(_, value)| !value.contains(secret)),
+                            "header credential must not enter any decoded stream parameter"
+                        );
+                        let context = playback_diagnosis_context(
+                            "Synthetic",
+                            &Method::GET,
+                            &url.parse().unwrap(),
+                            &headers,
+                            "127.0.0.1",
+                        );
+                        assert!(context.client_name.is_none());
+                        assert!(context.device_name.is_none());
+                        assert!(context.device_id.is_none());
+                        assert!(!serde_json::to_string(&context).unwrap().contains(secret));
+                        assert_eq!(query_param(stream_query, "UserId"), None);
+                        assert_eq!(
+                            query_param(stream_query, "api_key").as_deref(),
+                            Some("query-key")
+                        );
+                        assert_eq!(
+                            query_param(stream_query, "X-Emby-Token").as_deref(),
+                            Some("query-token")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn playback_context_rejects_malformed_quotes_without_copying_header_credentials() {
+        for key in ["Client", "Device", "DeviceName", "DeviceId", "UserId"] {
+            for raw in [
+                r#""Chrome, Token="synthetic-secret""#,
+                r#""Chrome" trailing, Token="synthetic-secret""#,
+                r#"Chrome", Token="synthetic-secret""#,
+                r#""Chrome\", Token=synthetic-secret"#,
+                r#""Chrome, ApiKey="synthetic-secret""#,
+            ] {
+                for header in [
+                    "Authorization",
+                    "X-Emby-Authorization",
+                    "X-MediaBrowser-Authorization",
+                ] {
+                    let authorization = format!("Emby {key}={raw}");
+                    assert_eq!(
+                        media_browser_auth_value(&authorization, key),
+                        None,
+                        "invalid {key} must be rejected"
+                    );
+                    let mut headers = axum::http::HeaderMap::new();
+                    headers.insert(
+                        header.parse::<axum::http::HeaderName>().unwrap(),
+                        authorization.parse().unwrap(),
+                    );
+                    let query = playback_stream_query("api_key=query-key", &headers).unwrap();
+                    let body = rewrite::patch_playback_info(
+                        json!({"MediaSources":[{"Id":"source", "IsRemote":true}]}),
+                        "/Items/item/PlaybackInfo",
+                        Some(&query),
+                    );
+                    let url = body["MediaSources"][0]["DirectStreamUrl"].as_str().unwrap();
+                    assert!(
+                        !url.contains("synthetic-secret"),
+                        "header credentials must not enter stream URL"
+                    );
+                    let context = playback_diagnosis_context(
+                        "Synthetic",
+                        &Method::GET,
+                        &url.parse().unwrap(),
+                        &headers,
+                        "127.0.0.1",
+                    );
+                    assert!(
+                        !serde_json::to_string(&context)
+                            .unwrap()
+                            .contains("synthetic-secret")
+                    );
+                    assert_eq!(query_param(&query, "api_key").as_deref(), Some("query-key"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn playback_context_preserves_emby_query_metadata_without_inventing_ua_identity() {
+        let query = "Client=&X-Emby-Client=Emby+Web&DeviceName=&X-Emby-Device-Name=Office%2C+Chrome&DeviceId=&X-Emby-Device-Id=browser-device&UserId=&X-Emby-User-Id=browser-user";
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::USER_AGENT,
+            "Mozilla/5.0 Chrome/156.0 Safari/537.36".parse().unwrap(),
+        );
+        let stream_query = playback_stream_query(query, &headers).unwrap();
+        let uri = format!("/videos/item/stream?{stream_query}")
+            .parse()
+            .unwrap();
+        let context =
+            playback_diagnosis_context("Synthetic", &Method::GET, &uri, &headers, "127.0.0.1");
+        assert_eq!(context.client_name.as_deref(), Some("Emby Web"));
+        assert_eq!(context.device_name.as_deref(), Some("Office, Chrome"));
+        assert_eq!(context.device_id.as_deref(), Some("browser-device"));
+        assert_eq!(
+            query_param(&stream_query, "UserId").as_deref(),
+            Some("browser-user")
+        );
+        assert_eq!(
+            playback_device_id("DeviceId=&deviceid=explicit-device", &headers).as_deref(),
+            Some("explicit-device")
+        );
+        let context = playback_diagnosis_context(
+            "Synthetic",
+            &Method::GET,
+            &"/videos/item/stream".parse().unwrap(),
+            &headers,
+            "127.0.0.1",
+        );
+        assert!(context.client_name.is_none());
+        assert!(context.device_name.is_none());
+        assert!(context.device_id.is_none());
+    }
+
+    #[test]
+    fn playback_context_reads_standard_authorization_and_ignores_empty_query_values() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, axum::http::HeaderValue::from_static(
+            r#"MediaBrowser Client="Emby Web", Device="Chrome", DeviceName="Chromium", DeviceId="device-1""#,
+        ));
+        let method = Method::GET;
+        let uri: Uri = "/videos/item/stream?Client=&DeviceName=&DeviceId="
+            .parse()
+            .unwrap();
+        let context = playback_diagnosis_context("Synthetic", &method, &uri, &headers, "127.0.0.1");
+        assert_eq!(context.client_name.as_deref(), Some("Emby Web"));
+        assert_eq!(context.device_name.as_deref(), Some("Chromium"));
+        assert_eq!(context.device_id.as_deref(), Some("device-1"));
+        assert_eq!(
+            playback_device_id("DeviceId=", &axum::http::HeaderMap::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn playback_stream_query_propagates_context_and_preserves_original_credentials() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, axum::http::HeaderValue::from_static(
+            r#"MediaBrowser Client="Emby Web", Device="Chrome", DeviceName="Chromium", DeviceId="device-1", UserId="user-1", Token="synthetic-token""#,
+        ));
+        let query = playback_stream_query(
+            "MediaSourceId=source-1&DeviceId=&X-Emby-Token=query-token&api_key=query-key",
+            &headers,
+        )
+        .unwrap();
+        assert_eq!(query_param(&query, "Client").as_deref(), Some("Emby Web"));
+        assert_eq!(query_param(&query, "Device").as_deref(), Some("Chromium"));
+        assert_eq!(query_param(&query, "DeviceId").as_deref(), Some("device-1"));
+        assert_eq!(query_param(&query, "UserId").as_deref(), Some("user-1"));
+        assert_eq!(
+            query_param(&query, "X-Emby-Token").as_deref(),
+            Some("query-token")
+        );
+        assert_eq!(query_param(&query, "api_key").as_deref(), Some("query-key"));
+        assert_eq!(
+            query_param(&query, "MediaSourceId").as_deref(),
+            Some("source-1")
+        );
+        assert!(!query.contains(&emby_authorization_value(&headers, "Token").unwrap()));
     }
 
     #[test]
@@ -3524,6 +4299,7 @@ mod tests {
         );
 
         let query = playback_stream_query("MediaSourceId=source-1", &headers).unwrap();
+        assert_eq!(query_param(&query, "Client").as_deref(), Some("Emby Web"));
         assert_eq!(query_param(&query, "UserId").as_deref(), Some("user-1"));
         assert_eq!(query_param(&query, "DeviceId").as_deref(), Some("device-1"));
     }
@@ -4113,8 +4889,12 @@ mod tests {
             .oneshot(
                 HttpRequest::builder()
                     .uri("/Items/item1/PlaybackInfo?DeviceId=d1")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Chrome Desktop", Device="Chrome", DeviceName="Chromium", DeviceId="d1", UserId="u1", Token="synthetic-browser-token""#,
+                    )
                     .body(Body::empty())
-                    .unwrap(),
+                    .unwrap()
             )
             .await
             .unwrap();
@@ -4128,8 +4908,412 @@ mod tests {
         assert!(source.get("TranscodingUrl").is_none());
         assert_eq!(
             source["DirectStreamUrl"].as_str(),
-            Some("/videos/item1/stream?DeviceId=d1&MediaSourceId=source1&Static=true&api_key=")
+            Some(
+                "/videos/item1/stream?UserId=u1&DeviceId=d1&Client=Chrome+Desktop&Device=Chromium&MediaSourceId=source1&Static=true&api_key="
+            )
         );
+        assert!(query_param(source["DirectStreamUrl"].as_str().unwrap(), "Token").is_none());
+    }
+
+    #[tokio::test]
+    async fn playback_info_stream_url_carries_browser_context_into_diagnosis() {
+        diagnostics::clean_diagnostics();
+        let observed_paths = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let server = spawn_mock_server({
+            let observed_paths = observed_paths.clone();
+            move |request| {
+                let observed_paths = observed_paths.clone();
+                async move {
+                    let path_query = request.uri().path_and_query().unwrap().as_str().to_string();
+                    observed_paths.lock().unwrap().push(path_query.clone());
+                    if request.uri().path() == "/Items/browser-item/PlaybackInfo" {
+                        return response_json(json!({"MediaSources":[{
+                            "Id":"source-browser", "Name":"STRM", "IsRemote":true,
+                            "IsInfiniteStream":false, "SupportsTranscoding":true
+                        }]}));
+                    }
+                    if request.uri().path() == "/Users/browser-user-456" {
+                        return response_json(json!({"Name":"Synthetic browser user"}));
+                    }
+                    if request.uri().path() == "/Items" {
+                        return response_json(
+                            json!({"Items":[{"Name":"Synthetic browser item","MediaSources":[{
+                                "Id":"source-browser", "Path":"https://unused.invalid/movie.mkv"
+                            }]}]}),
+                        );
+                    }
+                    response_text(StatusCode::NOT_FOUND, "not found")
+                }
+            }
+        })
+        .await;
+        let mut config = test_config(&server, "http://unused.invalid", 18096);
+        config.openlist_addr = None;
+        config.openlist_token = None;
+        let state = test_state(config, test_store());
+        let app = build_app(state.clone());
+        let authorization = r#"Emby UserId="browser-user-456", Client="Chrome Desktop", Device="Chrome", DeviceName="Chrome on macOS", DeviceId="browser-device-123", Token="synthetic-browser-token""#;
+        let playback_info = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/Items/browser-item/PlaybackInfo")
+                    .method(Method::POST)
+                    .header(header::AUTHORIZATION, authorization)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(playback_info.status(), StatusCode::OK);
+        let rewritten = read_json(playback_info).await;
+        let direct_url = rewritten["MediaSources"][0]["DirectStreamUrl"]
+            .as_str()
+            .unwrap();
+        assert!(direct_url.contains("Client=Chrome+Desktop"));
+        assert!(direct_url.contains("Device=Chrome+on+macOS"));
+        assert!(direct_url.contains("DeviceId=browser-device-123"));
+        assert!(direct_url.contains("UserId=browser-user-456"));
+        let header_token = media_browser_auth_value(authorization, "Token").unwrap();
+        assert!(!direct_url.contains(&header_token));
+
+        let stream = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(direct_url)
+                    .header(header::USER_AGENT, "Mozilla/5.0 Chrome/156.0 Safari/537.36")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stream.status(), StatusCode::FOUND);
+        let record = diagnostics::get_diagnosis_records()
+            .into_iter()
+            .find(|record| record.media_id == "browser-item")
+            .unwrap();
+        assert_eq!(
+            record.context.client_name.as_deref(),
+            Some("Chrome Desktop")
+        );
+        assert_eq!(
+            record.context.device_name.as_deref(),
+            Some("Chrome on macOS")
+        );
+        assert_eq!(
+            record.context.device_id.as_deref(),
+            Some("browser-device-123")
+        );
+        assert_eq!(
+            record.context.user_name.as_deref(),
+            Some("Synthetic browser user")
+        );
+        assert!(
+            !serde_json::to_string(&record)
+                .unwrap()
+                .contains(&header_token)
+        );
+        let paths = observed_paths.lock().unwrap();
+        let items_query = paths
+            .iter()
+            .find(|path| path.starts_with("/Items?"))
+            .unwrap();
+        assert!(items_query.contains("api_key=emby-key"));
+        assert!(!items_query.contains(&header_token));
+        drop(paths);
+        let cached = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(direct_url)
+                    .header(header::USER_AGENT, "Mozilla/5.0 Chrome/156.0 Safari/537.36")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cached.status(), StatusCode::FOUND);
+        let hit = diagnostics::get_diagnosis_records().pop().unwrap();
+        assert!(hit.cache_hit);
+        assert_eq!(hit.context.client_name, record.context.client_name);
+        assert_eq!(hit.context.device_name, record.context.device_name);
+        assert_eq!(hit.context.device_id, record.context.device_id);
+        assert_eq!(
+            observed_paths
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|path| path.starts_with("/Items?"))
+                .count(),
+            1
+        );
+        state.telemetry_writes.shutdown().unwrap();
+        diagnostics::clean_diagnostics();
+    }
+
+    fn assert_capture_correlated_logs(state: &AppState, request_id: &str) {
+        state.telemetry_writes.shutdown().unwrap();
+        let requests = state
+            .settings_store
+            .list_proxy_request_details(crate::db::ProxyRequestDetailFilter {
+                server_id: None,
+                path_type: Some("video_stream"),
+                keyword: Some(request_id),
+                since_ms: None,
+                until_ms: None,
+                limit: 100,
+            })
+            .unwrap();
+        let activities = state
+            .activity_log
+            .list_filtered(crate::activity_log::ActivityLogFilter {
+                server_id: None,
+                kind: None,
+                level: None,
+                keyword: Some(request_id),
+                since_ms: None,
+                until_ms: None,
+                limit: 100,
+            });
+        assert_eq!(requests.len(), 1, "exactly one correlated request log");
+        assert_eq!(activities.len(), 1, "exactly one correlated activity log");
+        assert!(requests[0].detail.contains(request_id));
+        assert!(activities[0].detail.contains(request_id));
+        assert!(!requests[0].detail.contains("token"));
+        assert!(!activities[0].detail.contains("token"));
+        if requests[0].outcome == "请求取消" {
+            assert_eq!(
+                requests[0].status_code, 0,
+                "no response, not an HTTP success"
+            );
+            assert_eq!(activities[0].level, "warn");
+            assert!(requests[0].detail.contains("outcome=cancelled"));
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_proxy_result_waits_for_real_headers_without_reading_media_stream() {
+        diagnostics::clean_diagnostics();
+        let emby = spawn_mock_server(|request| async move {
+            if request.uri().path() == "/Items" {
+                return response_json(
+                    json!({"Items": [{"Name": "Synthetic movie", "MediaSources": []}]}),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            response_text(StatusCode::PARTIAL_CONTENT, "synthetic media body")
+        })
+        .await;
+        let state = test_state(
+            test_config(&emby, "http://unused.example.test", 18096),
+            test_store(),
+        );
+        let app = build_app(state.clone());
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.oneshot(
+                HttpRequest::builder()
+                    .uri("/videos/capture-proxy/stream?UserName=SyntheticUser")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let record = diagnostics::get_diagnosis_records()
+            .into_iter()
+            .find(|r| r.media_id == "capture-proxy")
+            .unwrap();
+        assert_eq!(record.result.outcome.as_deref(), Some("proxy"));
+        assert_eq!(record.result.status_code, Some(206));
+        assert_eq!(record.result.upstream_status, Some(206));
+        assert!(
+            record
+                .result
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("source path not found")
+        );
+        let step = record
+            .steps
+            .iter()
+            .find(|s| s.name == proxy::STEP_PROXY)
+            .unwrap();
+        assert_eq!(step.upstream_status, Some(206));
+        assert!(step.response_headers_ms.unwrap() >= 10);
+        assert!(
+            step.response_body_ms.is_none(),
+            "media body must not be buffered or timed"
+        );
+        assert!(record.duration_ms.unwrap() >= 10);
+        drop(response);
+        state.telemetry_writes.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn capture_upstream_failure_records_actual_status_and_one_correlated_log_pair() {
+        diagnostics::clean_diagnostics();
+        let emby = spawn_mock_server(|request| async move {
+            if request.uri().path() == "/Items" {
+                return response_text(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "synthetic response body must not be logged",
+                );
+            }
+            response_text(StatusCode::NOT_FOUND, "not found")
+        })
+        .await;
+        let state = test_state(
+            test_config(&emby, "http://unused.example.test", 18096),
+            test_store(),
+        );
+        let response = build_app(state.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/videos/capture-failure/stream?UserName=SyntheticUser")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let record = diagnostics::get_diagnosis_records()
+            .into_iter()
+            .find(|r| r.media_id == "capture-failure")
+            .unwrap();
+        assert_eq!(record.result.outcome.as_deref(), Some("failed"));
+        assert_eq!(record.result.status_code, Some(502));
+        assert_eq!(record.result.upstream_status, Some(503));
+        assert_eq!(record.result.error_kind.as_deref(), Some("upstream_http"));
+        let step = record
+            .steps
+            .iter()
+            .find(|s| s.name == proxy::STEP_EMBY_PATH)
+            .unwrap();
+        assert_eq!(step.state.as_deref(), Some("failed"));
+        assert_eq!(step.upstream_status, Some(503));
+        assert!(step.response_headers_ms.is_some());
+        assert!(step.response_body_ms.is_none());
+        assert!(
+            !serde_json::to_string(&record)
+                .unwrap()
+                .contains("synthetic response body")
+        );
+        assert_capture_correlated_logs(&state, &record.request_id);
+    }
+
+    #[tokio::test]
+    async fn capture_context_result_cache_hit_keeps_unknown_names_and_real_ttl() {
+        diagnostics::clean_diagnostics();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = calls.clone();
+        let emby = spawn_mock_server(move |request| {
+            let calls = observed_calls.clone();
+            async move {
+                if request.uri().path() == "/Items" {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    return response_json(json!({"Items": [{
+                        "Name": "Synthetic episode", "SeriesName": "Synthetic series", "ParentIndexNumber": 2, "IndexNumber": 3,
+                        "MediaSources": [{"Id": "source1", "Path": "https://cdn.example.test/movie.mkv?opaque=synthetic-signature#fragment"}]
+                    }]}));
+                }
+                response_text(StatusCode::NOT_FOUND, "not found")
+            }
+        }).await;
+        let mut config = test_config(&emby, "http://unused.example.test", 18096);
+        config.openlist_addr = None;
+        config.openlist_token = None;
+        let state = test_state(config, test_store());
+        let app = build_app(state.clone());
+        let request = || {
+            HttpRequest::builder()
+            .uri("/videos/capture-context/stream?MediaSourceId=source1&UserName=SyntheticUser&DeviceId=device1&Client=SyntheticClient&Device=SyntheticDevice")
+            .header("Range", "bytes=0-1023").header(header::USER_AGENT, "SyntheticPlayer")
+            .body(Body::empty()).unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::FOUND
+        );
+        assert_eq!(
+            app.oneshot(request()).await.unwrap().status(),
+            StatusCode::FOUND
+        );
+        let records: Vec<_> = diagnostics::get_diagnosis_records()
+            .into_iter()
+            .filter(|r| r.media_id == "capture-context")
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "cache hit must not query Items"
+        );
+        let miss = &records[0];
+        assert_eq!(
+            miss.context.media_name.as_deref(),
+            Some("Synthetic episode")
+        );
+        assert_eq!(
+            miss.context.series_name.as_deref(),
+            Some("Synthetic series")
+        );
+        assert_eq!(miss.context.season_number, Some(2));
+        assert_eq!(miss.context.episode_number, Some(3));
+        assert_eq!(miss.context.user_name.as_deref(), Some("SyntheticUser"));
+        assert_eq!(miss.context.client_name.as_deref(), Some("SyntheticClient"));
+        assert_eq!(miss.context.device_name.as_deref(), Some("SyntheticDevice"));
+        assert_eq!(miss.context.device_id.as_deref(), Some("device1"));
+        assert_eq!(miss.context.media_source_id.as_deref(), Some("source1"));
+        assert_eq!(miss.context.method.as_deref(), Some("GET"));
+        assert_eq!(miss.context.range.as_deref(), Some("bytes=0-1023"));
+        assert_eq!(miss.result.outcome.as_deref(), Some("redirect"));
+        assert_eq!(miss.result.status_code, Some(302));
+        assert_eq!(miss.result.target_host.as_deref(), Some("cdn.example.test"));
+        assert_eq!(
+            miss.paths.final_url.as_deref(),
+            Some("https://cdn.example.test/movie.mkv")
+        );
+        assert_eq!(miss.cache.status.as_deref(), Some("miss"));
+        assert_eq!(miss.cache.stored, Some(true));
+        assert!(miss.cache.remaining_ttl_ms.is_none());
+        assert!(miss.timing.unaccounted_ms.unwrap() <= miss.duration_ms.unwrap());
+        let item_step = miss
+            .steps
+            .iter()
+            .find(|s| s.name == proxy::STEP_EMBY_PATH)
+            .unwrap();
+        assert_eq!(item_step.upstream_status, Some(200));
+        assert!(item_step.response_headers_ms.is_some() && item_step.response_body_ms.is_some());
+        let hit = &records[1];
+        assert_eq!(hit.cache.status.as_deref(), Some("hit"));
+        assert!(
+            hit.context.media_name.is_none(),
+            "no ID masquerading as a name"
+        );
+        assert!(hit.cache.remaining_ttl_ms.unwrap() <= hit.cache.ttl_seconds.unwrap() * 1000);
+        assert!(
+            hit.steps
+                .iter()
+                .filter(|s| matches!(
+                    s.name.as_str(),
+                    proxy::STEP_EMBY_PATH
+                        | proxy::STEP_MAPPING
+                        | proxy::STEP_OPENLIST
+                        | proxy::STEP_RAW_URL
+                ))
+                .all(|s| s.state.as_deref() == Some("skipped") && s.duration_ms == 0)
+        );
+        assert_ne!(miss.request_id, hit.request_id);
+        assert!(
+            !serde_json::to_string(&records)
+                .unwrap()
+                .contains("synthetic-signature")
+        );
+        assert_capture_correlated_logs(&state, &miss.request_id);
     }
 
     #[tokio::test]
@@ -4146,7 +5330,8 @@ mod tests {
         let openlist =
             spawn_mock_server(|_| async { response_text(StatusCode::NOT_FOUND, "not found") })
                 .await;
-        let app = test_app(&emby, &openlist, 18096);
+        let state = test_state(test_config(&emby, &openlist, 18096), test_store());
+        let app = build_app(state.clone());
         let task = tokio::spawn(
             app.oneshot(
                 HttpRequest::builder()
@@ -4165,7 +5350,25 @@ mod tests {
             .find(|record| record.media_id == "item-cancel")
             .expect("real handle_video_stream cancellation diagnosis");
         assert_eq!(record.failure_node.as_deref(), Some("Emby Path"));
-        assert!(record.steps[0].details.contains("cancelled"));
+        assert_eq!(record.result.outcome.as_deref(), Some("cancelled"));
+        assert!(record.result.status_code.is_none());
+        assert_eq!(
+            diagnostics::get_diagnosis_records()
+                .iter()
+                .filter(|r| r.request_id == record.request_id)
+                .count(),
+            1
+        );
+        assert_capture_correlated_logs(&state, &record.request_id);
+        assert!(
+            record
+                .steps
+                .iter()
+                .find(|step| step.name == proxy::STEP_EMBY_PATH)
+                .unwrap()
+                .details
+                .contains("cancelled")
+        );
         let json = serde_json::to_string(&record).unwrap();
         assert!(!json.contains("ua-secret"));
     }
@@ -4209,7 +5412,15 @@ mod tests {
             .find(|record| record.media_id == "item-openlist-cancel")
             .expect("real OpenList cancellation diagnosis");
         assert_eq!(record.failure_node.as_deref(), Some("OpenList"));
-        assert!(record.steps[2].details.contains("cancelled"));
+        assert!(
+            record
+                .steps
+                .iter()
+                .find(|step| step.name == proxy::STEP_OPENLIST)
+                .unwrap()
+                .details
+                .contains("cancelled")
+        );
         let json = serde_json::to_string(&record).unwrap();
         assert!(!json.contains("ua-secret"));
     }
@@ -4288,7 +5499,17 @@ mod tests {
                 .iter()
                 .map(|step| step.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Emby Path", "映射", "OpenList", "raw_url", "缓存", "302"]
+            vec![
+                "请求上下文",
+                "播放策略",
+                "Emby Path",
+                "映射",
+                "OpenList",
+                "raw_url",
+                "内部跳转",
+                "缓存",
+                "302"
+            ]
         );
         assert!(record.steps.iter().all(|step| step.duration_ms < 10_000));
     }
@@ -4356,22 +5577,51 @@ mod tests {
         assert_eq!(miss.failure_node, None);
         assert!(!miss.cache_hit);
         assert!(miss.sanitized_errors.is_empty());
-        assert_eq!(miss.steps.len(), 6);
-        assert!(miss.steps[0].details.contains("/d/movie/test.mkv"));
-        assert!(miss.steps[1].details.contains("matched rule#1"));
-        assert!(miss.steps[1].details.contains(&openlist));
-        assert!(miss.steps[2].details.contains("path=/movie/test.mkv"));
-        assert!(miss.steps[3].details.contains("cdn.example.test/movie.mkv"));
-        assert!(miss.steps[3].details.contains("quality=2160"));
-        assert_eq!(miss.steps[4].details, "miss; stored");
-        assert!(miss.steps[5].details.contains("redirect location="));
-        assert!(miss.steps[5].details.contains("quality=2160"));
+        assert_eq!(miss.steps.len(), 9);
+        let step = |name| miss.steps.iter().find(|step| step.name == name).unwrap();
+        assert!(
+            step(proxy::STEP_EMBY_PATH)
+                .details
+                .contains("/d/movie/test.mkv")
+        );
+        assert!(step(proxy::STEP_MAPPING).details.contains("matched rule#1"));
+        assert!(step(proxy::STEP_MAPPING).details.contains(&openlist));
+        assert!(
+            step(proxy::STEP_OPENLIST)
+                .details
+                .contains("path=/movie/test.mkv")
+        );
+        assert!(
+            step(proxy::STEP_RAW_URL)
+                .details
+                .contains("cdn.example.test/movie.mkv")
+        );
+        assert_eq!(step(proxy::STEP_CACHE).details, "miss; stored");
+        assert!(
+            step(proxy::STEP_REDIRECT)
+                .details
+                .contains("redirect location=")
+        );
 
         let hit = &records[1];
         assert!(hit.cache_hit);
         assert!(hit.sanitized_errors.is_empty());
-        assert_eq!(hit.steps[4].details, "hit");
-        assert!(hit.steps[5].details.contains("redirect location="));
+        assert_eq!(
+            hit.steps
+                .iter()
+                .find(|step| step.name == proxy::STEP_CACHE)
+                .unwrap()
+                .details,
+            "hit"
+        );
+        assert!(
+            hit.steps
+                .iter()
+                .find(|step| step.name == proxy::STEP_REDIRECT)
+                .unwrap()
+                .details
+                .contains("redirect location=")
+        );
 
         let json = serde_json::to_string(&records).unwrap();
         for secret in [
@@ -4664,6 +5914,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capture_internal_redirect_observes_one_hop_and_fallback_without_extra_requests() {
+        diagnostics::clean_diagnostics();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = calls.clone();
+        let media = spawn_mock_server(move |request| {
+            let calls = observed_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                if request.uri().path() == "/redirect" {
+                    return (
+                        StatusCode::FOUND,
+                        [(
+                            header::LOCATION,
+                            "/never-requested?signature=synthetic-signature",
+                        )],
+                    )
+                        .into_response();
+                }
+                response_text(StatusCode::SERVICE_UNAVAILABLE, "synthetic-private-body")
+            }
+        })
+        .await;
+        let mut config = test_config(
+            "http://unused.example.test",
+            "http://unused.example.test",
+            18096,
+        );
+        config.enable_internal_redirect = true;
+        let client = build_proxy_http_client().unwrap();
+        for (path, status, state, count) in [
+            ("redirect", 302, "recorded", Some(1)),
+            ("failure", 503, "failed", None),
+        ] {
+            let url = format!("{media}/{path}");
+            let mut trace = proxy::PlaybackDiagnosisTrace::new("s", path, "SyntheticPlayer");
+            let resolved = maybe_resolve_internal_redirect(
+                &client,
+                &config,
+                &url,
+                "SyntheticPlayer",
+                &mut trace,
+            )
+            .await;
+            trace.set_redirect(&resolved, "redirect response only");
+            trace.finish().await;
+            let record = diagnostics::get_diagnosis_records()
+                .into_iter()
+                .find(|r| r.media_id == path)
+                .unwrap();
+            assert_eq!(record.result.outcome.as_deref(), Some("redirect"));
+            assert_eq!(record.result.status_code, Some(302));
+            assert_eq!(record.timing.redirect_count, count);
+            let step = record
+                .steps
+                .iter()
+                .find(|s| s.name == proxy::STEP_INTERNAL_REDIRECT)
+                .unwrap();
+            assert_eq!(step.upstream_status, Some(status));
+            assert_eq!(step.state.as_deref(), Some(state));
+            assert!(step.response_headers_ms.is_some() && step.response_body_ms.is_none());
+            assert!(
+                !serde_json::to_string(&record)
+                    .unwrap()
+                    .contains("synthetic-signature")
+            );
+            if path == "failure" {
+                assert_eq!(resolved, url);
+                assert_eq!(step.error_kind.as_deref(), Some("upstream_http"));
+                assert!(step.reason.as_deref().unwrap().contains("original URL"));
+                assert!(
+                    record.failure_node.is_none(),
+                    "fallback did not fail the overall request"
+                );
+            }
+        }
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "only the original probes; never the redirect target"
+        );
+    }
+
+    #[tokio::test]
     async fn internal_redirect_uses_location_without_requesting_final_url() {
         let final_hits = Arc::new(AtomicUsize::new(0));
         let final_hits_for_server = final_hits.clone();
@@ -4880,6 +6213,14 @@ mod tests {
                 .find(|step| step.name == "OpenList")
                 .is_some_and(|step| step.details.contains("code 500"))
         );
+        assert_eq!(record.result.upstream_status, Some(200));
+        assert_eq!(record.result.error_kind.as_deref(), Some("upstream_api"));
+        let step = record
+            .steps
+            .iter()
+            .find(|s| s.name == proxy::STEP_OPENLIST)
+            .unwrap();
+        assert!(step.response_headers_ms.is_some() && step.response_body_ms.is_some());
     }
 
     #[tokio::test]
@@ -4919,6 +6260,17 @@ mod tests {
             .find(|record| record.media_id == "item1")
             .expect("HTTP OpenList failure diagnosis");
         assert_eq!(record.failure_node.as_deref(), Some("OpenList"));
+        assert_eq!(record.result.outcome.as_deref(), Some("failed"));
+        assert_eq!(record.result.upstream_status, Some(503));
+        assert_eq!(record.result.error_kind.as_deref(), Some("upstream_http"));
+        let step = record
+            .steps
+            .iter()
+            .find(|step| step.name == proxy::STEP_OPENLIST)
+            .unwrap();
+        assert_eq!(step.state.as_deref(), Some("failed"));
+        assert!(step.response_headers_ms.is_some());
+        assert!(step.response_body_ms.is_none());
         let json = serde_json::to_string(&record).unwrap();
         assert!(!json.contains("upstream-secret"));
         assert!(!json.contains("ua-secret"));
@@ -5104,8 +6456,15 @@ mod tests {
                 .is_some_and(|step| step.details.contains("redirect"))
         );
         assert!(records[1].cache_hit);
-        assert_eq!(records[1].steps[4].name, "缓存");
-        assert_eq!(records[1].steps[4].details, "hit");
+        assert_eq!(
+            records[1]
+                .steps
+                .iter()
+                .find(|step| step.name == proxy::STEP_CACHE)
+                .unwrap()
+                .details,
+            "hit"
+        );
     }
 
     #[tokio::test]

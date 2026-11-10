@@ -374,6 +374,7 @@ async function adminSecurityPage(admin, dialogs = {}) {
       () => props.open ? vue.h('dialog', [...(slots.default?.() ?? []), ...(slots.footer?.() ?? [])]) : null },
     '@/components/ui/UiSwitch.vue': { props: ['label'], setup: (props) => () => vue.h('button', props.label) },
     '@/components/ui/CheckboxField.vue': { render: () => null },
+    '@/components/ui/RefreshButton.vue': loadPageComponent('../components/ui/RefreshButton.vue', {}),
   }
   const module = { exports: {} }
   new Function('require', 'module', 'exports', compiled)((id) => mocks[id] ?? require(id), module, module.exports)
@@ -406,6 +407,11 @@ test('admin security page hides read-only writes, shows writer/super-admin contr
       assert.equal(page.html.includes(`>${label}</button>`), writable, label)
     }
     assert.equal(page.html.includes('>创建管理员</button>'), superAdmin)
+    const refreshButton = page.html.match(/<button\b[^>]*class="secondary refresh-button"[^>]*>/)?.[0]
+    assert.ok(refreshButton, 'real RefreshButton renders in every role state')
+    assert.match(refreshButton, /aria-label="刷新"/)
+    assert.match(refreshButton, /aria-busy="false"/)
+    assert.doesNotMatch(refreshButton, /\sdisabled(?:[\s=>])/)
     for (const label of ['fixture-token', 'fixture-device', '登录会话', 'API Token', '剩余恢复码']) {
       assert.ok(page.html.includes(label), label)
     }
@@ -535,9 +541,10 @@ test('viewer session handlers deny writes and recheck permission after dialogs/e
 })
 
 // Run actual panel lifecycle with delayed profile/options; no live network or storage.
-function panelHarness(context, initialPage, api) {
+function panelHarness(context, initialPage, api, options = {}) {
   const vue = require('vue')
-  const mounted = [], unmounted = []
+  const mounted = [], unmounted = [], intervals = new Map()
+  let nextInterval = 0
   const route = vue.reactive({ name: initialPage })
   const storage = () => {
     const values = new Map([['embypanel_token', 'fixture-token']])
@@ -545,7 +552,11 @@ function panelHarness(context, initialPage, api) {
   }
   for (const [key, value] of Object.entries({
     localStorage: storage(), sessionStorage: storage(),
-    window: { location: { hash: `#/${initialPage}` }, clearInterval: () => {}, setTimeout: () => 1, clearTimeout: () => {} },
+    window: {
+      location: { hash: `#/${initialPage}` },
+      setInterval: (fn, ms) => { const id = ++nextInterval; intervals.set(id, { fn, ms }); return id },
+      clearInterval: (id) => intervals.delete(id), setTimeout: () => 1, clearTimeout: () => {},
+    },
     document: { documentElement: { classList: { toggle: () => {} } } },
   })) {
     const previous = Object.getOwnPropertyDescriptor(globalThis, key)
@@ -555,19 +566,22 @@ function panelHarness(context, initialPage, api) {
   const { usePanelController } = load('composables/usePanelController.ts', {
     vue: { ...vue, onMounted: (fn) => mounted.push(fn), onBeforeUnmount: (fn) => unmounted.push(fn) },
     '@lucide/vue': {},
-    'vue-router': { useRoute: () => route, useRouter: () => ({ replace: async ({ name }) => { route.name = name } }) },
-    '@/lib/api-client': { createApiClient: () => api },
-    '@/composables/usePayloadEncryption': { usePayloadEncryption: () => ({ encryptPayload: async () => ({}), warmPublicKey: async () => {}, randomId: () => 'fixture-id' }) },
+    'vue-router': { useRoute: () => route, useRouter: () => ({
+      replace: async ({ name }) => { route.name = name },
+      push: async ({ name }) => { route.name = name },
+    }) },
+    '@/lib/api-client': options.realApiClient ? load('lib/api-client.ts') : { createApiClient: () => api },
+    '@/composables/usePayloadEncryption': { usePayloadEncryption: () => ({ encryptPayload: options.encryptPayload || (async () => ({})), warmPublicKey: async () => {}, randomId: () => 'fixture-id' }) },
     '@/composables/useActionDialog': { useActionDialog: () => ({ confirmAction: async () => true, promptAction: async () => null }) },
   })
   const scope = vue.effectScope()
   const panel = scope.run(() => usePanelController())
   context.after(() => { unmounted.forEach((fn) => fn()); scope.stop() })
-  return { panel, route, start: () => Promise.all(mounted.map((fn) => fn())) }
+  return { panel, route, intervals, start: () => Promise.all(mounted.map((fn) => fn())) }
 }
 
-test('direct history/security/sessions/library-tasks/cache-management entry awaits authorized options without settings.read or home', async (context) => {
-  for (const page of ['history', 'admin-security', 'sessions', 'library-tasks', 'cache-management']) {
+test('direct history/security/sessions/library-tasks/cache-management/logs entry awaits authorized options without settings.read or home', async (context) => {
+  for (const page of ['history', 'admin-security', 'sessions', 'library-tasks', 'cache-management', 'logs']) {
     const profile = deferred(), options = deferred(), reads = []
     const harness = panelHarness(context, page, async (url) => {
       reads.push(url)
@@ -1143,7 +1157,7 @@ test('refresh button renders shared labels and guards single-flight actions thro
   assert.equal(state.busy.value, false)
 })
 
-test('refresh button contracts stay unified across twelve pages and sixteen manual refresh controls', () => {
+test('refresh button contracts stay unified across twelve pages and seventeen manual refresh controls', () => {
   const { parse } = require('@vue/compiler-sfc')
   const contracts = {
     'AccountPage.vue': [{ action: 'refreshAuditLogs' }],
@@ -1157,7 +1171,10 @@ test('refresh button contracts stay unified across twelve pages and sixteen manu
     'DiagnosticsPage.vue': [{ action: '() => loadDiagnostics()', loading: 'loading', disabled: 'loading || cleaning' }],
     'HistoryPage.vue': [{ action: 'refreshPage', loading: 'loading || refreshing', disabled: 'loading || refreshing' }],
     'LibraryTasksPage.vue': [{ action: 'refreshPage', loading: 'loading || refreshing', disabled: 'loading || refreshing' }],
-    'LogsPage.vue': [{ action: 'refreshActivityLogs', loading: 'logsLoading', disabled: 'logsLoading' }],
+    'LogsPage.vue': [
+      { action: 'refreshActivityLogs', loading: 'logsLoading', disabled: 'logsLoading' },
+      { action: 'refreshLogConfig', loading: 'logConfigLoading', disabled: 'logConfigLoading || logConfigSaving' },
+    ],
     'OverviewPage.vue': [
       { action: 'refreshOperationalData' },
       { action: 'refreshRateLimitStatus' },
@@ -1197,7 +1214,7 @@ test('refresh button contracts stay unified across twelve pages and sixteen manu
     })
     count += buttons.length
   }
-  assert.equal(count, 16, 'all manual refresh controls are covered without inventing external loading flags')
+  assert.equal(count, 17, 'all manual refresh controls are covered without inventing external loading flags')
 })
 
 function chartHarness(context, input) {
@@ -1721,6 +1738,7 @@ test('library cards render validation status summaries and disable every path bu
 
 test('diagnostics summary keeps long step details out of the list and marks only actual failed or bypassed steps', async () => {
   const panel = {
+    locale: require('vue').ref('zh-CN'),
     t, api: async () => { assert.fail('SSR must not fetch page data') },
     showNotice: () => {}, clearNotice: () => {}, confirmAction: async () => false,
   }
@@ -1750,12 +1768,14 @@ test('diagnostics summary keeps long step details out of the list and marks only
   assert.match(articles[1], /失败节点: OpenList/)
   assert.ok(!articles[1].includes('https://fixture.invalid/failure-long-path/episode.mkv'))
   assert.ok(!articles[1].includes('302'))
-  assert.ok(!html.includes('总耗时'))
+  assert.match(html, /诊断总耗时: <strong>—<\/strong>/)
+  assert.doesNotMatch(html, /Invalid Date|NaN/)
   assert.ok(!html.includes('清空诊断记录'))
 })
 
 test('diagnostics distinguish cancellations from failed steps without inventing completed nodes', async () => {
   const panel = {
+    locale: require('vue').ref('zh-CN'),
     t, api: async () => { assert.fail('SSR must not fetch page data') },
     showNotice: () => {}, clearNotice: () => {}, confirmAction: async () => false,
   }
@@ -1777,6 +1797,7 @@ test('diagnostics distinguish cancellations from failed steps without inventing 
 test('diagnostics details preserve full text and close clears the selected record', async () => {
   const vue = require('vue')
   const panel = {
+    locale: vue.ref('zh-CN'),
     t, api: async () => { assert.fail('SSR must not fetch page data') },
     showNotice: () => {}, clearNotice: () => {}, confirmAction: async () => false,
   }
@@ -1802,6 +1823,95 @@ test('diagnostics details preserve full text and close clears the selected recor
   state.onDetailOpenChange(false)
   assert.equal(state.detailOpen.value, false)
   assert.equal(state.selectedRecord.value, null)
+})
+
+test('millisecond timestamp formatting supports precision and timezone without changing default callers', () => {
+  const { formatTimestampMs } = load('lib/panel-formatters.ts')
+  const timestamp = Date.UTC(2026, 0, 2, 3, 4, 5, 123)
+  const options = {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    fractionalSecondDigits: 3, hour12: false, timeZoneName: 'shortOffset', timeZone: 'UTC',
+  }
+  for (const locale of ['zh-CN', 'en-US']) {
+    assert.equal(formatTimestampMs(timestamp, locale), new Date(timestamp).toLocaleString(locale))
+    assert.equal(formatTimestampMs(timestamp, locale, options), new Date(timestamp).toLocaleString(locale, options))
+    assert.match(formatTimestampMs(timestamp, locale, options), /05\.123/)
+    assert.match(formatTimestampMs(timestamp, locale, options), /GMT/)
+    for (const missing of [undefined, null, 0, -1, NaN, Infinity, 1e20]) {
+      assert.equal(formatTimestampMs(missing, locale, options), '--')
+    }
+  }
+})
+
+test('diagnostics retain API timing and render precise local times, raw timestamps and measured totals in both locales', async () => {
+  const vue = require('vue')
+  const { useDiagnosticsController } = load('composables/useDiagnosticsController.ts')
+  const { translations } = load('lib/translations.ts')
+  const started = Date.UTC(2026, 0, 2, 3, 4, 5, 123)
+  const record = {
+    request_id: 'timed-record', server_id: 'server-a', media_id: 'media-1', ua: 'Fixture player',
+    started_at_ms: started, finished_at_ms: started + 50, duration_ms: 50,
+    cache_hit: false, failure_node: null, sanitized_errors: [],
+    steps: [
+      { name: 'Emby Path', started_at_ms: started + 4, finished_at_ms: started + 12, duration_ms: 8, details: 'resolved fixture path' },
+      { name: '缓存', started_at_ms: started + 1, finished_at_ms: started + 40, duration_ms: 2, details: 'miss' },
+    ],
+  }
+  const legacy = {
+    request_id: 'legacy-record', server_id: 'server-a', media_id: 'media-2', ua: 'Fixture player',
+    cache_hit: false, failure_node: null, sanitized_errors: [],
+    steps: [{ name: 'Emby Path', duration_ms: 99, details: 'legacy' }],
+  }
+  const zeroDuration = { ...record, request_id: 'zero-duration', duration_ms: 0, finished_at_ms: started, steps: [] }
+  const c = useDiagnosticsController({
+    api: async () => ({ records: [record, legacy, zeroDuration], can_global_cleanup: false }),
+    translate: t, showNotice: () => {}, clearNotice: () => {}, confirmAction: async () => false,
+  })
+  await c.loadDiagnostics()
+  assert.deepEqual(JSON.parse(JSON.stringify(c.diagnostics.value)), [record, legacy, zeroDuration])
+  c.dispose()
+
+  for (const locale of ['zh-CN', 'en-US']) {
+    const translate = (source) => locale === 'en-US' ? translations[source] || source : source
+    const panel = {
+      locale: vue.ref(locale), t: translate, api: async () => { assert.fail('SSR must not fetch page data') },
+      showNotice: () => {}, clearNotice: () => {}, confirmAction: async () => false,
+    }
+    let state
+    const html = await renderPage('DiagnosticsPage.vue', panel, (result) => {
+      state = result
+      state.diagnostics.value = c.diagnostics.value
+      state.openDetail(record)
+    }, {
+      '@/components/ui/SettingsDialogShell.vue': {
+        props: ['open'], setup: (props, { slots }) => () => props.open ? vue.h('dialog', slots.default?.()) : null,
+      },
+    })
+    const articles = [...html.matchAll(/<article\b[^>]*>([\s\S]*?)<\/article>/g)].map((match) => match[1])
+    assert.equal(articles.length, 3)
+    assert.ok(articles[0].includes(state.diagnosisTime(started)))
+    assert.match(articles[0], /50 ms/)
+    assert.match(articles[1], /<strong>--<\/strong>/)
+    assert.match(articles[1], /<strong>—<\/strong>/)
+    assert.match(articles[2], /<strong>0 ms<\/strong>/)
+    const dialog = html.match(/<dialog\b[^>]*>([\s\S]*?)<\/dialog>/)?.[1]
+    assert.ok(dialog.includes(state.diagnosisTime(started)))
+    assert.ok(dialog.includes(state.diagnosisTime(started + 50)))
+    assert.ok(dialog.includes(String(started)))
+    assert.ok(dialog.includes(String(started + 50)))
+    assert.ok(dialog.includes(translate('开始时间戳（毫秒）')))
+    assert.ok(dialog.includes(translate('结束时间戳（毫秒）')))
+    assert.ok(dialog.includes(translate('诊断总耗时')))
+    assert.ok(dialog.includes(translate('缓存节点可能合并多次操作；起止时间覆盖这些操作，耗时仅累计缓存操作本身。')))
+    const steps = [...dialog.matchAll(/<dl class="step-timing"[^>]*>([\s\S]*?)<\/dl>/g)].map((match) => match[1])
+    assert.equal(steps.length, 2)
+    assert.ok(steps[0].includes(state.diagnosisTime(started + 4)))
+    assert.ok(steps[0].includes(state.diagnosisTime(started + 12)))
+    assert.ok(steps[1].includes(state.diagnosisTime(started + 1)))
+    assert.ok(steps[1].includes(state.diagnosisTime(started + 40)))
+    assert.doesNotMatch(html, /Invalid Date|NaN/)
+  }
 })
 
 test('history SSR uses independent authorized options and session SSR hides viewer control buttons', async () => {
@@ -2353,4 +2463,855 @@ test('cache entries failure clears previously loaded entries and missing cleanup
   assert.deepEqual(c.entries.value, [])
   assert.equal(c.hasNextPage.value, false)
   assert.equal(c.canViewGlobalStats.value, true)
+})
+
+// Diagnostics extension: only synthetic display data; no live requests or stored records.
+function diagnosticsHarness(api, extra = {}) {
+  return load('composables/useDiagnosticsController.ts').useDiagnosticsController({
+    api, translate: t, showNotice: () => {}, clearNotice: () => {}, confirmAction: async () => false, ...extra,
+  })
+}
+
+function diagnosticFixture(extra = {}) {
+  return {
+    request_id: 'diag-synthetic-correlation', server_id: 's-fixture', media_id: 'm-fixture',
+    ua: 'synthetic-agent', cache_hit: false, failure_node: null, sanitized_errors: [], steps: [], ...extra,
+  }
+}
+
+test('diagnostics serialize all extended filters, local times and zero minimum while retaining manual pagination', async () => {
+  const requests = []
+  const c = diagnosticsHarness(async (url) => { requests.push(url); return { records: [], can_global_cleanup: false } })
+  const filters = {
+    outcome: 'proxy', user: ' fixture user ', keyword: ' safe keyword ',
+    since: '2026-01-02T03:04:05.123', until: '2026-01-03T04:05:06.456', min_duration_ms: 0,
+  }
+  for (const [key, value] of Object.entries(filters)) {
+    c.query.value.page = 7
+    c.query.value[key] = value
+    assert.equal(c.query.value.page, 1, `${key} resets the page`)
+  }
+  c.query.value.page = 3
+  c.query.value.limit = 100
+  c.query.value.page = 3
+  await c.applyFilters()
+  const params = new URL(requests.at(-1), 'http://fixture.invalid').searchParams
+  assert.equal(params.get('page'), '3')
+  assert.equal(params.get('limit'), '100')
+  assert.equal(params.get('outcome'), 'proxy')
+  assert.equal(params.get('user'), 'fixture user')
+  assert.equal(params.get('keyword'), 'safe keyword')
+  assert.equal(params.get('min_duration_ms'), '0')
+  assert.equal(params.get('since_ms'), String(new Date(filters.since).getTime()))
+  assert.equal(params.get('until_ms'), String(new Date(filters.until).getTime()))
+  assert.equal(params.has('since'), false)
+  await c.resetFilters()
+  const reset = new URL(requests.at(-1), 'http://fixture.invalid').searchParams
+  assert.deepEqual([...reset], [['limit', '50'], ['page', '1']])
+  for (const limit of [1000, 1.8, -1, NaN]) {
+    c.query.value.limit = limit
+    await c.loadDiagnostics()
+    assert.equal(c.query.value.limit, Number.isNaN(limit) ? 50 : Math.max(1, Math.min(100, Math.trunc(limit))))
+  }
+  c.dispose()
+})
+
+test('diagnostics reject invalid date ranges and minimum durations before issuing any request', async () => {
+  let requests = 0
+  const { translations } = load('lib/translations.ts')
+  const c = diagnosticsHarness(async () => { requests++; return {} }, { translate: (s) => translations[s] || s })
+  for (const [filters, expected] of [
+    [{ since: 'not a date' }, 'Invalid diagnostic filter time'],
+    [{ since: '2026-01-03T00:00', until: '2026-01-02T00:00' }, 'Diagnostic start time cannot be after end time'],
+    [{ min_duration_ms: -1 }, 'Minimum duration must be a nonnegative integer'],
+    [{ min_duration_ms: 0.5 }, 'Minimum duration must be a nonnegative integer'],
+  ]) {
+    Object.assign(c.query.value, { since: '', until: '', min_duration_ms: '', ...filters })
+    await c.loadDiagnostics()
+    assert.equal(c.error.value, expected)
+    assert.equal(c.loading.value, false)
+    assert.equal(c.total.value, null)
+    assert.equal(c.storage.value, null)
+  }
+  assert.equal(requests, 0)
+  c.dispose()
+})
+
+test('diagnostics respect authoritative totals, has_more and storage without fabricating metadata for legacy responses', async () => {
+  let response = {
+    records: [diagnosticFixture()], total: 123, has_more: false, can_global_cleanup: true,
+    storage: { persistent: false, retention_days: 7, max_records: 10000, memory_capacity: 1000 },
+  }
+  const c = diagnosticsHarness(async () => response)
+  c.query.value.limit = 1
+  await c.loadDiagnostics()
+  assert.equal(c.total.value, 123)
+  assert.equal(c.hasNextPage.value, false, 'not inferred from a full page when authoritative false is present')
+  assert.equal(c.storage.value.persistent, false)
+  assert.equal(c.canGlobalCleanup.value, true)
+  assert.equal(c.loadedPage.value, 1)
+  c.query.value.page = 9
+  assert.equal(c.loadedPage.value, 1, 'unsubmitted page input cannot relabel loaded exports')
+  response = { records: [diagnosticFixture()], can_global_cleanup: false }
+  await c.loadDiagnostics()
+  assert.equal(c.loadedPage.value, 9)
+  assert.equal(c.total.value, null)
+  assert.equal(c.storage.value, null)
+  assert.equal(c.hasNextPage.value, true, 'legacy full-page fallback only')
+  response = { records: [], total: -1, has_more: true, storage: { persistent: true }, can_global_cleanup: 'true' }
+  await c.loadDiagnostics()
+  assert.equal(c.total.value, null)
+  assert.equal(c.storage.value, null)
+  assert.equal(c.canGlobalCleanup.value, false)
+  assert.equal(c.hasNextPage.value, true)
+  response = []
+  await c.loadDiagnostics()
+  assert.deepEqual(c.diagnostics.value, [])
+  assert.equal(c.total.value, null)
+  assert.equal(c.storage.value, null)
+  c.dispose()
+})
+
+test('diagnostics cancel stale loads and dispose without stale records, metadata, errors or notices', async () => {
+  const requests = [], notices = []
+  const c = diagnosticsHarness((url, init) => {
+    const pending = deferred(); requests.push({ ...pending, signal: init.signal }); return pending.promise
+  }, { showNotice: (s) => notices.push(s) })
+  const stale = c.loadDiagnostics(), latest = c.loadDiagnostics()
+  assert.equal(requests[0].signal.aborted, true)
+  requests[0].reject(new Error('stale failure'))
+  await stale
+  assert.equal(c.loading.value, true)
+  assert.equal(c.error.value, '')
+  requests[1].resolve({ records: [diagnosticFixture()], total: 1, has_more: false, can_global_cleanup: true })
+  await latest
+  const late = c.loadDiagnostics()
+  c.dispose()
+  assert.equal(requests[2].signal.aborted, true)
+  requests[2].resolve({ records: [diagnosticFixture({ request_id: 'late' })], total: 900, can_global_cleanup: true })
+  await late
+  assert.equal(c.diagnostics.value[0].request_id, 'diag-synthetic-correlation')
+  assert.equal(c.total.value, 1)
+  assert.equal(c.canGlobalCleanup.value, false)
+  await c.loadDiagnostics()
+  assert.equal(requests.length, 3)
+  assert.deepEqual(notices, [])
+})
+
+test('diagnostics cleanup preserves success notice, rechecks capability, and cancels post-dispose continuation', async () => {
+  const notices = [], clears = [], calls = []
+  let confirm = true
+  const c = diagnosticsHarness(async (url, init) => {
+    calls.push({ url, init })
+    return url.endsWith('/clean') ? null : { records: [], total: 0, has_more: false, can_global_cleanup: true }
+  }, { confirmAction: async () => confirm, showNotice: (s) => notices.push(s), clearNotice: () => clears.push(true) })
+  await c.cleanDiagnostics()
+  assert.equal(calls.length, 0)
+  await c.loadDiagnostics()
+  confirm = false
+  await c.cleanDiagnostics()
+  assert.equal(calls.length, 1)
+  confirm = true
+  await c.cleanDiagnostics()
+  assert.equal(calls[1].init.method, 'POST')
+  assert.deepEqual(JSON.parse(calls[1].init.body), { confirm: 'yes' })
+  assert.deepEqual(notices, ['诊断记录已清空'])
+  assert.equal(clears.length, 1, 'clean refresh must preserve success notice')
+  c.dispose()
+
+  const confirmation = deferred(), cleanup = deferred()
+  const d = diagnosticsHarness(async (url) => url.endsWith('/clean') ? cleanup.promise : { records: [], can_global_cleanup: true }, {
+    confirmAction: () => confirmation.promise, showNotice: () => assert.fail('no post-dispose success notice'),
+  })
+  await d.loadDiagnostics()
+  const clean = d.cleanDiagnostics()
+  d.canGlobalCleanup.value = false
+  confirmation.resolve(true)
+  await clean
+  assert.equal(d.cleaning.value, false, 'capability rechecked after dialog')
+  d.canGlobalCleanup.value = true
+  const pending = d.cleanDiagnostics()
+  await tick()
+  d.dispose()
+  cleanup.resolve(null)
+  await pending
+})
+
+test('diagnostics share whitelist removes personal data, URLs, arbitrary free text and filter context', () => {
+  const { diagnosisShareRecord } = load('composables/useDiagnosticsController.ts')
+  const record = diagnosticFixture({
+    ua: 'private-user private-device 192.0.2.42', server_id: 'private-server', media_id: 'private-media',
+    context: { user_name: 'private-user', device_id: 'private-device', device_name: 'private-name', source_ip: '192.0.2.42', request_path: '/private-user/file' },
+    result: { outcome: 'redirect', status_code: 302, target_host: 'private-host.invalid', reason: 'private-user', error_kind: 'private-error' },
+    cache: { status: 'hit', stored: false, ttl_seconds: 100, remaining_ttl_ms: 0, reason: 'private-device', target_host: 'private-host.invalid' },
+    paths: { original: '/private-user', mapped: '/private-device', final_url: 'https://private-host.invalid/file' },
+    timing: { slowest_step: 'private-user', slowest_step_ms: 0, unaccounted_ms: 0, name_resolution_ms: 0, connection_setup_ms: 0 },
+    sanitized_errors: ['private-user 192.0.2.42'],
+    steps: [{ name: 'OpenList', state: 'recorded', details: 'private-user', reason: 'private-device', duration_ms: 0, response_headers_ms: 0 },
+      { name: 'private-step', state: 'private-state', details: 'private-detail', duration_ms: 3 }],
+  })
+  const safe = diagnosisShareRecord(record), json = JSON.stringify(safe)
+  assert.doesNotMatch(json, /private-|192\.0\.2\.42|https:|context|paths|sanitized_errors|server_id|media_id|error_kind|target_host/)
+  assert.equal(safe.request_id, record.request_id)
+  assert.ok(!('dns_ms' in safe.timing) && !('tcp_ms' in safe.timing) && !('tls_ms' in safe.timing))
+  assert.equal(diagnosisShareRecord({ ...record, request_id: 'arbitrary identifier' }).request_id, null)
+  assert.equal(safe.result.status_code, 302)
+  assert.equal(safe.cache.stored, false)
+  assert.equal(safe.cache.remaining_ttl_ms, 0)
+  assert.equal(safe.timing.name_resolution_ms, 0)
+  assert.equal(safe.steps[0].response_headers_ms, 0)
+  assert.equal(safe.steps[1].name, null)
+  assert.equal(safe.steps[1].state, null)
+  const observedNames = ['请求上下文', '播放策略', 'Emby Proxy']
+  assert.deepEqual(diagnosisShareRecord({ ...record, steps: observedNames.map((name) => ({ name, duration_ms: 0, details: '' })) }).steps.map((step) => step.name), observedNames)
+  assert.equal(record.context.user_name, 'private-user', 'sharing never mutates admin source data')
+})
+
+test('diagnostics network share fields accept only numeric metrics and fixed observation states without mutating details', () => {
+  const { diagnosisShareRecord } = load('composables/useDiagnosticsController.ts')
+  const metricKeys = ['name_resolution_ms', 'name_resolution_calls', 'connection_setup_ms', 'connection_attempts']
+  for (const value of [0, 7, null, undefined, -1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, 'private-value', {}]) {
+    const network = Object.fromEntries(metricKeys.map((key) => [key, value]))
+    network.connection_observation = 'private-observation'
+    network.host = 'private-host.invalid'
+    network.headers = { token: 'private-token' }
+    network.query = 'private-query'
+    const record = diagnosticFixture({ timing: network, context: { user_name: 'private-user' },
+      steps: [{ name: 'OpenList', state: 'recorded', duration_ms: 0, details: 'private-detail', ...network }] })
+    const safe = diagnosisShareRecord(record)
+    for (const target of [safe.timing, safe.steps[0]]) {
+      for (const key of metricKeys) assert.equal(target[key], value === 0 || value === 7 ? value : null, key)
+      assert.equal(target.connection_observation, null)
+    }
+    assert.doesNotMatch(JSON.stringify(safe), /private-|"headers"|"query"|"user_name"/)
+    assert.equal(record.timing.host, 'private-host.invalid')
+    assert.equal(record.steps[0].details, 'private-detail', 'authorized source text is not changed by export')
+  }
+  for (const observation of ['not_observed', 'observed', 'partial', null, undefined, 'unknown', 'private-host.invalid']) {
+    const network = { connection_observation: observation }
+    const safe = diagnosisShareRecord(diagnosticFixture({ timing: network,
+      steps: [{ name: 'OpenList', duration_ms: 0, details: '', ...network }] }))
+    const expected = ['not_observed', 'observed', 'partial'].includes(observation) ? observation : null
+    assert.equal(safe.timing.connection_observation, expected)
+    assert.equal(safe.steps[0].connection_observation, expected)
+  }
+  const legacy = diagnosisShareRecord(diagnosticFixture({ steps: [{ name: 'OpenList', duration_ms: 0, details: '' }] }))
+  for (const target of [legacy.timing, legacy.steps[0]]) {
+    for (const key of [...metricKeys, 'connection_observation']) assert.equal(target[key], null, `legacy ${key}`)
+  }
+})
+
+test('diagnostics network observations render independent totals, attempts, nulls and legacy unknowns in both locales', async (context) => {
+  const vue = require('vue'), { translations } = load('lib/translations.ts')
+  const labels = ['名称解析调用耗时', '名称解析调用次数', '连接建立尝试合计耗时', '连接建立尝试次数', '连接观测状态']
+  const help = [
+    '名称解析调用耗时是系统名称解析 API 的等待时间，包含排队和操作系统 resolver 等开销，不是线上 DNS 报文耗时。',
+    '连接建立尝试合计耗时可能包含代理、CONNECT 和 TLS，不是纯 TCP/TLS 耗时；受 hyper 连接池归因限制，观测到的 attempt 可能不能归因于当前 HTTP 响应，也不能证明该响应使用了该连接。',
+    '名称解析与连接建立尝试耗时可能重叠，不可相加，也不额外计入诊断总耗时或未归属耗时。未归属耗时是未被操作区间覆盖的诊断时间，不等于网络耗时。无 resolver 或连接事件不代表连接复用成功；0 是实际观测值，空值为未采集，缺失观测状态为未知。',
+  ]
+  const fixtures = [
+    [{ name_resolution_ms: 0, name_resolution_calls: 1, connection_setup_ms: 0, connection_attempts: 1, connection_observation: 'observed' },
+      ['0 ms', '1', '0 ms', '1', '已观测到连接尝试']],
+    [{ name_resolution_ms: 7, name_resolution_calls: 2, connection_setup_ms: 30, connection_attempts: 3, connection_observation: 'partial' },
+      ['7 ms', '2', '30 ms', '3', '连接尝试观测不完整']],
+    [{ name_resolution_ms: null, name_resolution_calls: 0, connection_setup_ms: null, connection_attempts: 0, connection_observation: 'not_observed' },
+      ['未采集', '0', '未采集', '0', '未观测到连接尝试']],
+    [{ name_resolution_ms: null, name_resolution_calls: null, connection_setup_ms: null, connection_attempts: null, connection_observation: null },
+      ['未采集', '未采集', '未采集', '未采集', '未知（旧数据或未提供）']],
+    [{}, ['未采集', '未采集', '未采集', '未采集', '未知（旧数据或未提供）']],
+  ]
+  context.mock.method(globalThis, 'fetch', () => assert.fail('Synthetic network observations must not make HTTP requests'))
+  for (const locale of ['zh-CN', 'en-US']) {
+    const translate = (key) => locale === 'en-US' ? translations[key] || key : key
+    for (const [index, [network, expected]] of fixtures.entries()) {
+      // Step data differs from aggregate data to catch accidental use of the other scope.
+      const [stepNetwork, stepExpected] = fixtures[(index + 1) % fixtures.length]
+      const record = diagnosticFixture({ duration_ms: 20, timing: { slowest_step_ms: 10, unaccounted_ms: 4, ...network },
+        context: { server_name: 'Synthetic server', media_name: 'Synthetic media', user_name: 'fixture-private-user' },
+        steps: [{ name: 'OpenList', duration_ms: 10, state: 'recorded', details: 'fixture-private-detail', ...stepNetwork }] })
+      const before = JSON.stringify(record)
+      const c = diagnosticsHarness(async () => ({ records: [record], can_global_cleanup: false }))
+      await c.loadDiagnostics()
+      assert.deepEqual(JSON.parse(JSON.stringify(c.diagnostics.value[0])), record, 'controller retains DTO observations as received')
+      let state
+      const html = await renderPage('DiagnosticsPage.vue', {
+        locale: vue.ref(locale), t: translate, api: async () => assert.fail('display only'),
+        showNotice: () => {}, clearNotice: () => {}, confirmAction: async () => false,
+      }, (s) => { state = s; s.diagnostics.value = c.diagnostics.value; s.openDetail(c.diagnostics.value[0]) }, {
+        '@/components/ui/SettingsDialogShell.vue': { props: ['open'], setup: (props, { slots }) => () => props.open ? vue.h('dialog', slots.default?.()) : null },
+      })
+      const dialogStart = html.indexOf('<dialog')
+      const dialogEnd = html.indexOf('</dialog>', dialogStart)
+      const dialog = dialogStart >= 0 && dialogEnd >= 0
+        ? html.slice(html.indexOf('>', dialogStart) + 1, dialogEnd)
+        : undefined
+      assert.ok(dialog, `${locale}: detail dialog`)
+      const summary = dialog.split('<ol class="detail-timeline">')[0]
+      const observationsStart = dialog.indexOf('<dl class="step-observations">')
+      const observationsEnd = dialog.indexOf('</dl>', observationsStart)
+      const observations = observationsStart >= 0 && observationsEnd >= 0
+        ? dialog.slice(dialog.indexOf('>', observationsStart) + 1, observationsEnd)
+        : undefined
+      assert.ok(observations, `${locale}: step observations`)
+      for (const [position, label] of labels.entries()) {
+        assert.ok(translations[label], `${label}: English label exists`)
+        const expectedRow = `<dt>${translate(label)}</dt><dd>${translate(expected[position])}</dd>`
+        assert.ok(summary.includes(expectedRow), `${locale}/${index}: aggregate ${expectedRow}`)
+        const stepRow = `<dt>${translate(label)}</dt><dd>${translate(stepExpected[position])}</dd>`
+        assert.ok(observations.includes(stepRow), `${locale}/${index}: step ${stepRow}`)
+      }
+      for (const key of help) {
+        assert.ok(translations[key], 'network measurement caveat has English translation')
+        assert.ok(summary.includes(translate(key)), `${locale}: measurement caveat remains adjacent to aggregate metrics`)
+      }
+      for (const label of ['DNS 耗时', 'TCP 耗时', 'TLS 耗时']) {
+        assert.ok(!summary.includes(`<dt>${translate(label)}</dt>`))
+        assert.ok(!observations.includes(`<dt>${translate(label)}</dt>`))
+      }
+      assert.ok(summary.includes(`<dt>${translate('未归属耗时')}</dt><dd>4 ms</dd>`), 'overlapping observations never change unaccounted time')
+      assert.ok(summary.includes(`<dt>${translate('诊断总耗时')}</dt><dd>20 ms</dd>`), 'overlapping observations never change trace duration')
+      assert.ok(summary.includes('Synthetic server') && summary.includes('Synthetic media') && summary.includes('fixture-private-user'))
+      assert.equal(state.connectionObservationLabel('unrecognized'), translate('未知（旧数据或未提供）'))
+      assert.equal(JSON.stringify(record), before, 'rendering does not mutate the source observations')
+      assert.doesNotMatch(html, /NaN|undefined|Invalid Date/)
+      c.dispose()
+    }
+  }
+})
+
+test('diagnostics modern summary and authorized details show real context, outcomes and unknown network timing in both locales', async () => {
+  const vue = require('vue'), { translations } = load('lib/translations.ts')
+  const record = diagnosticFixture({
+    started_at_ms: Date.UTC(2026, 0, 2), finished_at_ms: Date.UTC(2026, 0, 2) + 10, duration_ms: 10,
+    context: { server_name: 'Synthetic server label', media_name: 'Synthetic media label', series_name: 'Synthetic series', season_number: 0, episode_number: 1,
+      user_name: 'fixture-private-user', client_name: 'Synthetic client', device_name: 'fixture-private-name', device_id: 'fixture-private-device', source_ip: '192.0.2.42',
+      method: 'GET', request_path: '/fixture-private-user/path', range: 'bytes=0-' },
+    result: { outcome: 'redirect', status_code: 302, reason: 'Synthetic decision', upstream_status: 200 },
+    cache: { status: 'disabled', stored: false, remaining_ttl_ms: 0 },
+    paths: { original: '/fixture-private-user/input', mapped: '/safe/output', matched_rules: [0, 2], final_url: 'https://fixture.invalid/safe' },
+    timing: { unaccounted_ms: 0, slowest_step: 'OpenList', slowest_step_ms: 10, redirect_count: 0 },
+    steps: [{ name: 'OpenList', state: 'skipped', details: 'fixture-private-user fixture-private-device 192.0.2.42', reason: 'Synthetic skip reason', duration_ms: 0,
+      response_headers_ms: 0, response_body_ms: null, upstream_status: 200, error_kind: 'Synthetic error kind' }],
+  })
+  for (const locale of ['zh-CN', 'en-US']) {
+    const translate = (s) => locale === 'en-US' ? translations[s] || s : s
+    let state
+    const html = await renderPage('DiagnosticsPage.vue', {
+      locale: vue.ref(locale), t: translate, api: async () => assert.fail('display only'), copyText: async () => {},
+      showNotice: () => {}, clearNotice: () => {}, confirmAction: async () => false,
+    }, (s) => { state = s; s.diagnostics.value = [record]; s.openDetail(record) }, {
+      '@/components/ui/SettingsDialogShell.vue': { props: ['open'], setup: (props, { slots }) => () => props.open ? vue.h('dialog', slots.default?.()) : null },
+    })
+    const article = html.match(/<article\b[^>]*>([\s\S]*?)<\/article>/)[1]
+    assert.match(article, /Synthetic server label/)
+    assert.match(article, /Synthetic media label/)
+    assert.match(article, /fixture-private-user/)
+    assert.match(article, /Synthetic client/)
+    assert.ok(article.includes(translate('已返回跳转')))
+    assert.ok(article.includes(translate('缓存已禁用')))
+    assert.doesNotMatch(article, /Synthetic decision|Synthetic skip reason|fixture-private-device|192\.0\.2\.42/)
+    const dialog = html.match(/<dialog\b[^>]*>([\s\S]*?)<\/dialog>/)[1]
+    for (const value of ['fixture-private-user', 'fixture-private-device', 'fixture-private-name', '192.0.2.42']) {
+      assert.ok(dialog.includes(value), 'authorized details retain troubleshooting context')
+    }
+    for (const key of ['基本请求与用户', '处理结果与选择原因', '路径变换', '耗时分布', '未采集']) {
+      assert.ok(translations[key], `${key} has English mapping`)
+      assert.ok(dialog.includes(translate(key)), key)
+    }
+    assert.doesNotMatch(dialog, /DNS duration|TCP duration|TLS duration/)
+    assert.match(dialog, /0, 2/)
+    assert.match(dialog, /Synthetic decision/)
+    assert.match(dialog, /Synthetic skip reason/)
+    assert.match(dialog, /0 ms/)
+    assert.equal(state.stepState(record, record.steps[0]), 'skipped')
+    assert.equal(state.cacheLabel(diagnosticFixture()), translate('未采集'), 'legacy false does not prove a cache miss')
+    assert.equal(state.outcomeLabel(diagnosticFixture()), translate('未采集'), 'legacy success must not be invented')
+  }
+})
+
+test('diagnostics copy uses shared clipboard and current-page download revokes URLs even when click fails', async (context) => {
+  const vue = require('vue'), copies = []
+  const network = { name_resolution_ms: 0, name_resolution_calls: 1, connection_setup_ms: 12,
+    connection_attempts: 2, connection_observation: 'partial' }
+  const record = diagnosticFixture({ context: { user_name: 'fixture-private-user' }, timing: network,
+    steps: [{ name: 'OpenList', duration_ms: 20, details: 'fixture-private-details', ...network }] })
+  let state
+  await renderPage('DiagnosticsPage.vue', {
+    locale: vue.ref('zh-CN'), t, api: async () => assert.fail('no network'), copyText: async (text) => copies.push(text),
+    showNotice: () => {}, clearNotice: () => {}, confirmAction: async () => false,
+  }, (s) => { state = s; s.diagnostics.value = [record]; s.loadedPage.value = 2 })
+  await state.copyRecord(record)
+  const copied = JSON.parse(copies[0])
+  assert.equal(copied.request_id, record.request_id)
+  for (const [key, value] of Object.entries(network)) {
+    assert.equal(copied.timing[key], value, `copy timing ${key}`)
+    assert.equal(copied.steps[0][key], value, `copy step ${key}`)
+  }
+  assert.doesNotMatch(copies[0], /fixture-private-|context/)
+  state.query.value.page = 99
+  const payload = JSON.parse(state.sharePayload([record]))
+  assert.equal(payload.page, 2)
+  assert.equal(payload.scope, 'current_page')
+  assert.equal(payload.records.length, 1)
+  assert.equal(payload.redaction, 'share_allowlist_v1')
+  assert.deepEqual(payload.records[0], copied, 'page export and single-record copy use the same network allowlist')
+  const oldDocument = globalThis.document
+  context.after(() => { globalThis.document = oldDocument })
+  let blob, removed = 0, appended = 0, clicks = 0, shouldFail = false
+  const revoked = [], link = {
+    href: '', download: '', remove: () => removed++, click: () => { clicks++; if (shouldFail) throw new Error('synthetic click failure') },
+  }
+  globalThis.document = { createElement: (tag) => { assert.equal(tag, 'a'); return link }, body: { appendChild: () => appended++ } }
+  context.mock.method(URL, 'createObjectURL', (value) => { blob = value; return 'blob:fixture' })
+  context.mock.method(URL, 'revokeObjectURL', (url) => revoked.push(url))
+  state.exportCurrentPage()
+  assert.equal(link.download, 'embypanel-diagnostics-page-2.json')
+  assert.deepEqual(JSON.parse(await blob.text()), payload)
+  assert.deepEqual(revoked, ['blob:fixture'])
+  assert.equal(removed, 1)
+  assert.equal(appended, 1)
+  shouldFail = true
+  assert.throws(() => state.exportCurrentPage(), /synthetic click failure/)
+  assert.equal(removed, 2)
+  assert.equal(revoked.length, 2)
+  state.loading.value = true
+  state.exportCurrentPage()
+  assert.equal(clicks, 2, 'export blocked while replacing the page')
+})
+
+test('diagnostics new UI copy is translated, retains shared dialog/refresh, and mobile selects use 16px', () => {
+  const { translations } = load('lib/translations.ts')
+  const source = fs.readFileSync(path.resolve(__dirname, '../src/pages/DiagnosticsPage.vue'), 'utf8')
+  for (const [, key] of source.matchAll(/\bt\('([^']+)'\)/g)) {
+    assert.ok(translations[key], `${key} has English mapping`)
+  }
+  assert.match(source, /SettingsDialogShell/)
+  assert.match(source, /RefreshButton/)
+  assert.match(source, /copyText\(selectedRecord\.request_id\)/)
+  assert.match(source, /max-width: 700px[\s\S]*?\.diagnostics-filters input, \.diagnostics-filters select \{ font-size: 16px; \}/)
+  assert.doesNotMatch(source, /window\.confirm|window\.prompt|DialogRoot|navigator\.clipboard|fetch\(/)
+})
+
+test('diagnostics explicit states outrank legacy inference and modern result labels never claim playback success', async () => {
+  const vue = require('vue')
+  let state
+  await renderPage('DiagnosticsPage.vue', {
+    locale: vue.ref('zh-CN'), t, api: async () => assert.fail('display only'),
+    showNotice: () => {}, clearNotice: () => {}, confirmAction: async () => false,
+  }, (s) => { state = s })
+  for (const [outcome, label] of [['redirect', '已返回跳转'], ['proxy', '代理响应'], ['failed', '失败'], ['cancelled', '已取消'], ['blocked', '已拦截']]) {
+    const record = diagnosticFixture({ result: { outcome } })
+    assert.equal(state.outcomeLabel(record), label)
+    assert.equal(state.isCancelled(record), outcome === 'cancelled')
+    assert.equal(state.hasIssue(record), ['failed', 'cancelled', 'blocked'].includes(outcome))
+  }
+  const record = diagnosticFixture({ failure_node: 'OpenList', steps: [{ name: 'OpenList', details: 'cancelled: legacy text', duration_ms: 0 }] })
+  for (const explicit of ['recorded', 'failed', 'skipped', 'cancelled']) {
+    assert.equal(state.stepState(record, { ...record.steps[0], state: explicit }), explicit)
+  }
+  for (const [status, expected] of [['hit', '缓存命中'], ['miss', '未命中'], ['disabled', '缓存已禁用'], ['not_checked', '未检查']]) {
+    assert.equal(state.cacheLabel(diagnosticFixture({ cache: { status } })), expected)
+  }
+  assert.equal(state.cacheLabel(diagnosticFixture({ cache_hit: true })), '缓存命中')
+})
+
+test('diagnostics authorized text preserves identifiers and never rewrites numeric timing', async () => {
+  const vue = require('vue')
+  let state
+  await renderPage('DiagnosticsPage.vue', {
+    locale: vue.ref('zh-CN'), t, api: async () => assert.fail('display only'),
+    showNotice: () => {}, clearNotice: () => {}, confirmAction: async () => false,
+  }, (s) => { state = s; s.openDetail(diagnosticFixture({ context: { user_name: 'a.b[0]+', device_id: '0', source_ip: '192.0.2.42' } })) })
+  assert.equal(state.detailText('a.b[0]+ 192.0.2.42'), 'a.b[0]+ 192.0.2.42')
+  assert.equal(state.detailText('aXb'), 'aXb')
+  assert.equal(state.detailText(0), '0')
+  assert.equal(state.detailValue('连接建立尝试合计耗时', 0), '0 ms')
+  assert.equal(state.detailValue('未归属耗时', null), '未采集')
+})
+
+test('diagnostics disposal during an unresolved cleanup aborts the write and suppresses refresh and notice', async () => {
+  const cleanup = deferred(), requests = [], notices = []
+  const c = diagnosticsHarness(async (url, init) => {
+    requests.push({ url, init })
+    return url.endsWith('/clean') ? cleanup.promise : { records: [], can_global_cleanup: true }
+  }, { confirmAction: async () => true, showNotice: (s) => notices.push(s) })
+  await c.loadDiagnostics()
+  const clean = c.cleanDiagnostics()
+  await tick()
+  assert.equal(requests.length, 2)
+  assert.equal(requests[1].init.signal.aborted, false)
+  c.dispose()
+  assert.equal(requests[1].init.signal.aborted, true)
+  cleanup.resolve(null)
+  await clean
+  assert.equal(requests.length, 2, 'disposed cleanup must not refresh')
+  assert.deepEqual(notices, [])
+})
+
+
+test('diagnostics log links close details and preserve the selected request scope', async () => {
+  const vue = require('vue'), navigations = []
+  const record = diagnosticFixture({ request_id: 'diag-synthetic-123', server_id: 'server-a' })
+  let state
+  await renderPage('DiagnosticsPage.vue', {
+    locale: vue.ref('zh-CN'), t, api: async () => assert.fail('display only'),
+    showNotice: () => {}, clearNotice: () => {}, confirmAction: async () => false,
+    openDiagnosticLogs: (...args) => {
+      assert.equal(state.detailOpen.value, false)
+      assert.equal(state.selectedRecord.value, null)
+      navigations.push(args)
+    },
+  }, (s) => { state = s })
+  for (const view of ['proxy', 'playback', 'general']) {
+    state.openDetail(record)
+    state.viewLogs(view)
+  }
+  assert.deepEqual(navigations, [
+    ['diag-synthetic-123', 'server-a', 'proxy'],
+    ['diag-synthetic-123', 'server-a', 'playback'],
+    ['diag-synthetic-123', 'server-a', 'general'],
+  ])
+  state.viewLogs('proxy')
+  assert.equal(navigations.length, 3, 'closed dialog cannot navigate a stale record')
+})
+
+test('cancelled request logs with no HTTP response never display HTTP 0 or success', async (context) => {
+  const { requestOutcomeClass } = load('lib/panel-formatters.ts')
+  const row = { id: 1, server_id: 'server-a', server_name: 'Synthetic', status_code: 0,
+    event_type: 'request', method: 'GET', path_type: 'video_stream', path: '/videos/fixture/stream',
+    outcome: '请求取消', cache_hit: true, blocked: false, detail: 'request_id=diag-synthetic-123',
+    timestamp_ms: 1767323045123, duration_ms: 5 }
+  assert.equal(requestOutcomeClass(row), 'warn')
+  const harness = panelHarness(context, 'home', async () => ({}))
+  assert.equal(harness.panel.requestSeverity(row), 'warn')
+  assert.equal(harness.panel.requestSeverityLabel(row), '未返回响应')
+  const html = await renderPage('LogsPage.vue', {
+    t, filteredRequestDetailRows: [row], isRequestDetailLogView: true,
+    requestOutcomeClass, requestSeverity: harness.panel.requestSeverity,
+    requestSeverityLabel: harness.panel.requestSeverityLabel,
+    requestRowTitle: () => 'Synthetic request', requestPathTypeLabel: () => '视频流',
+    formatLogTime: () => 'Synthetic time', ipWithLocation: () => '—',
+    visibleActivityLogRows: [], logServers: [], logLevelOptions: [],
+    requestDetailDisplayMax: 100, requestDetailPersistDays: 7, requestDetailPersistMax: 10000,
+    visibleLogCount: 1, logConfig: { level: 'info', max_size_mb: 20, max_backups: 5, format: '' },
+  })
+  assert.match(html, /未返回响应/)
+  assert.doesNotMatch(html, /HTTP 0|level-pill success/)
+})
+
+
+test('diagnostics localized reasons, measured percentages and recovered step failures remain visible', async () => {
+  const vue = require('vue'), { translations } = load('lib/translations.ts')
+  for (const locale of ['zh-CN', 'en-US']) {
+    const translate = (key) => locale === 'en-US' ? translations[key] || key : key
+    let state
+    await renderPage('DiagnosticsPage.vue', {
+      locale: vue.ref(locale), t: translate, api: async () => assert.fail('display only'),
+      showNotice: () => {}, clearNotice: () => {}, confirmAction: async () => false,
+    }, (s) => { state = s })
+    for (const name of ['请求上下文', '播放策略', '内部跳转']) {
+      assert.ok(translations[name], 'every collected fixed node has an English mapping')
+    }
+    assert.equal(state.detailValue('最慢步骤', '缓存'), translate('缓存'))
+    assert.equal(state.detailValue('选择原因', 'cache policy disabled'), translate('缓存策略未启用'))
+    assert.equal(state.diagnosticMessage('timeout'), translate('请求超时'))
+    const recovered = diagnosticFixture({ result: { outcome: 'redirect', status_code: 302 },
+      steps: [{ name: '内部跳转', state: 'failed', duration_ms: 10, details: 'probe failed, original URL used' }] })
+    assert.equal(state.hasIssue(recovered), true, 'a recovered step failure still contributes to issue counts')
+    assert.equal(state.outcomeLabel(recovered), translate('已返回跳转'))
+    state.openDetail({ ...recovered, duration_ms: 20, timing: { slowest_step: '内部跳转', slowest_step_ms: 10 } })
+    assert.ok(state.detailSections.value.find((section) => section.title === '耗时分布').rows.some((row) => row[0] === '最慢步骤占比' && row[1] === '50.0%'))
+  }
+})
+
+// Actual panel navigation: the router mutates the reactive route, so the real page
+// watcher, activation, server-options request, log query and polling all execute.
+test('diagnostic navigation reaches ready logs for Viewer, Operator and monitoring-only profiles without settings/config reads', async (context) => {
+  for (const profile of [
+    { username: 'Viewer', can_manage_log_config: false },
+    { username: 'Operator', can_manage_log_config: false },
+    { username: 'monitoring.read only' },
+    { username: 'non-boolean legacy', can_manage_log_config: 'true' },
+  ]) {
+    const reads = []
+    const harness = panelHarness(context, 'diagnostics', async (url) => {
+      reads.push(url)
+      if (url === '/api/setup-status') return { initialized: true }
+      if (url === '/api/profile') return profile
+      if (url === '/api/servers/options') return { servers: [{ id: 'server-a', name: 'Authorized server' }], can_control_sessions: profile.username === 'Operator' }
+      if (url.startsWith('/api/monitoring/')) return []
+      if (url.startsWith('/api/settings')) assert.fail(`unexpected privileged read: ${url}`)
+      return {}
+    })
+    await harness.start()
+    assert.equal(harness.panel.pageReady.value, true)
+    for (const view of ['proxy', 'playback', 'general']) {
+      harness.panel.setPage('diagnostics')
+      await tick()
+      harness.panel.openDiagnosticLogs('diag-synthetic-123', 'server-a', view)
+      await tick()
+      assert.equal(harness.route.name, 'logs')
+      assert.equal(harness.panel.pageReady.value, true)
+      assert.equal(harness.panel.pageLoading.value, false)
+      assert.equal(harness.panel.error.value, '')
+      assert.equal(harness.panel.canManageLogConfig.value, false)
+      assert.deepEqual(harness.panel.logServers.value, [{ id: 'server-a', name: 'Authorized server' }])
+      const query = new URL(reads.filter((url) => url.startsWith('/api/monitoring/')).at(-1), 'http://fixture.invalid')
+      assert.equal(query.pathname, view === 'proxy' ? '/api/monitoring/request-details' : '/api/monitoring/logs')
+      assert.equal(query.searchParams.get('keyword'), 'diag-synthetic-123')
+      assert.equal(query.searchParams.get('server_id'), 'server-a')
+      assert.equal(query.searchParams.get(view === 'proxy' ? 'path_type' : 'kind'), view === 'proxy' ? 'video_stream' : view === 'playback' ? 'playback' : 'general')
+      assert.equal(harness.intervals.size, 1)
+      const interval = [...harness.intervals.values()][0]
+      assert.equal(interval.ms, 3000)
+      interval.fn()
+      await tick()
+      await harness.panel.saveLogConfig()
+      await harness.panel.refreshLogConfig()
+      const html = await renderPage('LogsPage.vue', harness.panel)
+      assert.ok(html.includes('Authorized server'))
+      assert.ok(!html.includes('日志文件配置'))
+      assert.ok(!html.includes('undefined'))
+    }
+    assert.equal(reads.some((url) => url.startsWith('/api/settings')), false)
+    assert.deepEqual(harness.panel.settings.servers, [])
+  }
+})
+
+const syntheticLogConfig = (level = 'info') => ({ debug_mode: false, level, max_size_mb: 5, max_backups: 10, format: 'synthetic-format' })
+function logsApi(profile, configRequest, requests = []) {
+  return async (url, init) => {
+    requests.push({ url, init })
+    if (url === '/api/setup-status') return { initialized: true }
+    if (url === '/api/profile') return typeof profile === 'function' ? profile(init) : profile
+    if (url === '/api/login') return { token: 'fixture-next-login-token' }
+    if (url === '/api/servers/options') return { servers: [{ id: 'server-a', name: 'Authorized server' }], can_control_sessions: false }
+    if (url === '/api/settings/log-config') return configRequest(init)
+    if (url.startsWith('/api/monitoring/')) return []
+    if (url === '/api/settings') assert.fail('logs must not depend on settings.read')
+    return {}
+  }
+}
+
+test('super-admin config is independent of log readiness, refreshes, saves encrypted payloads and preserves visible errors', async (context) => {
+  const pendingConfig = deferred(), requests = [], encrypted = []
+  let configRead = 0, failRead = false, failSave = false
+  const harness = panelHarness(context, 'logs', logsApi({ username: 'SuperAdmin', can_manage_log_config: true }, async (init) => {
+    if (init?.method === 'PUT') {
+      assert.deepEqual(JSON.parse(init.body), { encrypted: 'synthetic' })
+      if (failSave) throw new Error('synthetic save failure')
+      return syntheticLogConfig('debug')
+    }
+    configRead++
+    if (configRead === 1) return pendingConfig.promise
+    if (failRead) throw new Error('synthetic config unavailable')
+    return syntheticLogConfig('warning')
+  }, requests), { encryptPayload: async (name, value) => { encrypted.push({ name, value }); return { encrypted: 'synthetic' } } })
+  await harness.start()
+  assert.equal(harness.panel.pageReady.value, true, 'even a pending config must not block logs')
+  assert.equal(harness.panel.logConfigLoading.value, true)
+  pendingConfig.reject(new Error('synthetic config forbidden'))
+  await tick()
+  assert.equal(harness.panel.error.value, '')
+  assert.equal(harness.panel.logsError.value, '')
+  assert.equal(harness.panel.logConfigError.value, 'synthetic config forbidden')
+  let html = await renderPage('LogsPage.vue', harness.panel)
+  assert.ok(html.includes('日志文件配置') && html.includes('synthetic config forbidden'))
+  assert.match(html, /role="alert"/)
+  const before = requests.length
+  await harness.panel.saveLogConfig()
+  assert.equal(requests.length, before, 'unloaded config cannot be saved')
+  for (let i = 0; i < 2; i++) {
+    ;[...harness.intervals.values()][0].fn()
+    await tick()
+  }
+  assert.equal(configRead, 1, 'polling must not retry forbidden config reads')
+  await harness.panel.refreshLogConfig()
+  assert.equal(harness.panel.logConfig.level, 'warning')
+  assert.equal(harness.panel.logConfigError.value, '')
+  await harness.panel.saveLogConfig()
+  assert.equal(encrypted[0].name, 'log_config')
+  assert.equal(encrypted[0].value.level, 'warning')
+  assert.equal(harness.panel.logConfig.level, 'debug')
+  assert.equal(harness.panel.notice.value, '日志配置已保存')
+  failSave = true
+  await harness.panel.saveLogConfig()
+  assert.equal(harness.panel.logConfigError.value, 'synthetic save failure')
+  await harness.panel.refreshActivityLogs()
+  html = await renderPage('LogsPage.vue', harness.panel)
+  assert.ok(html.includes('synthetic save failure'), 'log refresh cannot clear config errors')
+  const saveButton = html.match(/<button\b[^>]*>[^<]*<!---->[^<]*保存日志配置[^<]*<\/button>/)?.[0]
+    || html.match(/<button\b[^>]*>\s*保存日志配置\s*<\/button>/)?.[0]
+  assert.ok(saveButton, 'loaded config keeps its save button after a failed write')
+  assert.doesNotMatch(saveButton, /\sdisabled(?:[\s=>])/, 'save errors remain retryable')
+  failSave = false
+  await harness.panel.saveLogConfig()
+  assert.equal(harness.panel.logConfigError.value, '')
+  assert.equal(harness.panel.pageReady.value, true)
+  failRead = true
+  await harness.panel.refreshLogConfig()
+  assert.equal(harness.panel.logConfigError.value, 'synthetic config unavailable')
+  assert.equal(harness.panel.logConfigLoading.value, false)
+  assert.equal(harness.panel.logConfigSaving.value, false)
+})
+
+test('config read generations ignore late success, error and finally while a replacement is pending', async (context) => {
+  const reads = []
+  const harness = panelHarness(context, 'logs', logsApi({ username: 'SuperAdmin', can_manage_log_config: true }, () => {
+    const response = deferred(); reads.push(response); return response.promise
+  }))
+  await harness.start()
+  const replacement = harness.panel.refreshLogConfig()
+  reads[0].reject(new Error('stale read failure'))
+  await tick()
+  assert.equal(harness.panel.logConfigLoading.value, true)
+  assert.equal(harness.panel.logConfigError.value, '')
+  reads[1].resolve(syntheticLogConfig('warning'))
+  await replacement
+  const stale = harness.panel.refreshLogConfig(), latest = harness.panel.refreshLogConfig()
+  reads[3].resolve(syntheticLogConfig('error'))
+  await latest
+  reads[2].resolve(syntheticLogConfig('debug'))
+  await stale
+  assert.equal(harness.panel.logConfig.level, 'error')
+  assert.equal(harness.panel.logConfigLoading.value, false)
+})
+
+test('new login clears stale true and ignores config read/write successes and failures from the prior identity', async (context) => {
+  for (const action of ['read', 'save', 'encryption']) {
+    for (const failed of [false, true]) {
+      const delayed = deferred(), encryption = deferred(), nextProfile = deferred(), requests = []
+      let nextIdentity = false, delayEncryption = false
+      const harness = panelHarness(context, 'logs', logsApi(() => nextIdentity ? nextProfile.promise : { username: 'SuperAdmin', can_manage_log_config: true },
+        (init) => (action === 'read' || init?.method === 'PUT') ? delayed.promise : syntheticLogConfig(), requests), {
+        encryptPayload: async (name) => name === 'log_config' && delayEncryption ? encryption.promise : {},
+      })
+      await harness.start()
+      let pending
+      if (action !== 'read') {
+        delayEncryption = action === 'encryption'
+        pending = harness.panel.saveLogConfig()
+        await tick()
+      }
+      nextIdentity = true
+      const login = harness.panel.login()
+      await tick()
+      assert.equal(harness.panel.profile.can_manage_log_config, false, 'pending profile never inherits true')
+      nextProfile.resolve({ username: 'legacy monitoring user' })
+      await login
+      assert.equal(harness.panel.pageReady.value, true)
+      assert.equal(harness.panel.canManageLogConfig.value, false)
+      const writes = requests.filter(({ init }) => init?.method === 'PUT').length
+      const snapshot = JSON.stringify([harness.panel.logConfig, harness.panel.logConfigError.value, harness.panel.logConfigLoading.value, harness.panel.logConfigSaving.value, harness.panel.notice.value])
+      if (action === 'encryption') encryption.resolve({ encrypted: 'late' })
+      else if (failed) delayed.reject(new Error('late prior identity failure'))
+      else delayed.resolve(syntheticLogConfig('critical'))
+      await pending
+      await tick()
+      assert.equal(JSON.stringify([harness.panel.logConfig, harness.panel.logConfigError.value, harness.panel.logConfigLoading.value, harness.panel.logConfigSaving.value, harness.panel.notice.value]), snapshot)
+      await harness.panel.saveLogConfig()
+      assert.equal(requests.filter(({ init }) => init?.method === 'PUT').length, writes)
+    }
+  }
+})
+
+test('profile from a previous login cannot restore log management or overwrite the new profile', async (context) => {
+  const oldProfile = deferred(), requests = []
+  let first = true
+  const harness = panelHarness(context, 'logs', logsApi(() => {
+    if (first) { first = false; return oldProfile.promise }
+    return { username: 'current monitoring user' }
+  }, () => assert.fail('stale profile must not enable config reads'), requests))
+  const boot = harness.start()
+  await tick()
+  await harness.panel.login()
+  oldProfile.resolve({ username: 'stale SuperAdmin', can_manage_log_config: true })
+  await boot
+  assert.equal(harness.panel.profile.username, 'current monitoring user')
+  assert.equal(harness.panel.canManageLogConfig.value, false)
+  assert.equal(harness.panel.pageReady.value, true)
+  assert.equal(requests.some(({ url }) => url === '/api/settings/log-config'), false)
+})
+
+test('profile update without optional capability fails closed and direct save sends no write', async (context) => {
+  const requests = []
+  const harness = panelHarness(context, 'logs', logsApi((init) => init?.method === 'PUT' ? { username: 'renamed' } : { username: 'SuperAdmin', can_manage_log_config: true }, () => syntheticLogConfig(), requests))
+  await harness.start()
+  harness.panel.profileForm.username = 'renamed'
+  await harness.panel.saveAccount()
+  assert.equal(harness.panel.profile.can_manage_log_config, false)
+  await harness.panel.saveLogConfig()
+  assert.equal(requests.some(({ url, init }) => url === '/api/settings/log-config' && init?.method === 'PUT'), false)
+})
+
+test('log config 401 still expires the session through the real API helper and clears management capability', async (context) => {
+  const calls = []
+  context.mock.method(globalThis, 'fetch', async (url) => {
+    calls.push(url)
+    if (url === '/api/settings/log-config') return new Response('synthetic expired', { status: 401 })
+    const response = url === '/api/setup-status' ? { initialized: true }
+      : url === '/api/profile' ? { username: 'SuperAdmin', can_manage_log_config: true }
+        : url === '/api/servers/options' ? { servers: [], can_control_sessions: false }
+          : url.startsWith('/api/monitoring/') ? [] : {}
+    return new Response(JSON.stringify(response))
+  })
+  const harness = panelHarness(context, 'logs', null, { realApiClient: true })
+  await harness.start()
+  await tick()
+  assert.equal(harness.panel.mode.value, 'login')
+  assert.equal(harness.panel.profile.can_manage_log_config, false)
+  assert.equal(harness.panel.canManageLogConfig.value, false)
+  assert.equal(harness.panel.error.value, '登录已过期，请重新登录')
+  assert.equal(harness.panel.pageReady.value, false)
+  assert.equal(harness.intervals.size, 0)
+  assert.ok(calls.includes('/api/settings/log-config'))
+})
+
+test('diagnostic cache-hit and legacy rows label IDs explicitly in both locales without upstream lookups', async (context) => {
+  const vue = require('vue'), { translations } = load('lib/translations.ts')
+  context.mock.method(globalThis, 'fetch', () => assert.fail('SSR must not query upstream names'))
+  for (const locale of ['zh-CN', 'en-US']) {
+    const translate = (key) => locale === 'en-US' ? translations[key] || key : key
+    const records = [
+      diagnosticFixture({ request_id: 'diag-named', cache_hit: true, context: { media_name: 'Synthetic named media' } }),
+      diagnosticFixture({ request_id: 'diag-hit-id', cache_hit: true, cache: { status: 'hit' }, context: { media_name: null } }),
+      diagnosticFixture({ request_id: 'diag-legacy-id', context: undefined }),
+      diagnosticFixture({ request_id: 'diag-no-media', media_id: '' }),
+    ]
+    const html = await renderPage('DiagnosticsPage.vue', {
+      locale: vue.ref(locale), t: translate, api: () => assert.fail('SSR must not query names'),
+      showNotice: () => {}, clearNotice: () => {}, confirmAction: async () => false,
+    }, (state) => { state.diagnostics.value = records })
+    const rows = [...html.matchAll(/<article\b[^>]*>([\s\S]*?)<\/article>/g)].map((match) => match[1])
+    assert.equal(rows.length, 4)
+    const media = rows.map((row) => row.match(/class="meta-media"[^>]*>([\s\S]*?)<\/code>/)?.[1])
+    assert.ok(media[0].includes(`${translate('媒体')}: <code>Synthetic named media`))
+    assert.ok(media[1].includes(`${translate('媒体 ID')}: <code>m-fixture`))
+    assert.ok(media[2].includes(`${translate('媒体 ID')}: <code>m-fixture`))
+    assert.ok(media[3].includes(`${translate('媒体 ID')}: <code>—`))
+    assert.ok(rows[1].includes(translate('缓存命中')))
+    assert.doesNotMatch(html, /undefined|NaN|Invalid Date/)
+  }
+})
+
+test('logout resets the profile capability and late config results cannot restore it', async (context) => {
+  const lateConfig = deferred()
+  context.mock.method(globalThis, 'fetch', async (url) => {
+    assert.equal(url, '/api/logout')
+    return new Response('{}')
+  })
+  const harness = panelHarness(context, 'logs', logsApi({ username: 'SuperAdmin', can_manage_log_config: true }, () => lateConfig.promise))
+  await harness.start()
+  assert.equal(harness.panel.canManageLogConfig.value, true)
+  await harness.panel.logout()
+  assert.equal(harness.panel.profile.can_manage_log_config, false)
+  assert.equal(harness.panel.profile.username, '')
+  assert.equal(harness.panel.mode.value, 'login')
+  lateConfig.resolve(syntheticLogConfig('critical'))
+  await tick()
+  assert.equal(harness.panel.canManageLogConfig.value, false)
+  assert.equal(harness.panel.logConfig.level, 'info')
+  assert.equal(harness.panel.logConfigError.value, '')
+  assert.equal(harness.panel.logConfigLoading.value, false)
+  assert.equal(harness.intervals.size, 0)
 })

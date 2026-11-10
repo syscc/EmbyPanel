@@ -20,6 +20,11 @@ const {
   logSince,
   logUntil,
   logConfig,
+  canManageLogConfig,
+  logConfigLoading,
+  logConfigSaving,
+  logConfigError,
+  refreshLogConfig,
   activityLogMaxLimit,
   requestDetailDisplayMax,
   requestDetailPersistDays,
@@ -127,7 +132,7 @@ const {
               :key="server.id"
               :value="server.id"
             >
-              {{ server.name }} · :{{ server.port }}
+              {{ server.name }}
             </option>
           </select>
         </label>
@@ -267,8 +272,11 @@ const {
               <span>{{ row.outcome }}</span>
               <span>{{ requestPathTypeLabel(row.path_type) }}</span>
               <span
+                v-if="row.status_code === 0 && row.event_type !== 'block' && row.event_type !== 'unblock'"
+              >{{ t('未返回响应') }}</span>
+              <span
                 v-if="
-                  row.event_type !== 'block' && row.event_type !== 'unblock'
+                  row.status_code !== 0 && row.event_type !== 'block' && row.event_type !== 'unblock'
                 "
                 >HTTP {{ row.status_code }}</span
               >
@@ -317,7 +325,7 @@ const {
       </div>
     </section>
 
-    <section class="panel">
+    <section v-if="canManageLogConfig" class="panel" :aria-busy="logConfigLoading || logConfigSaving">
       <div class="panel-head">
         <div>
           <div class="panel-title-line">
@@ -328,10 +336,20 @@ const {
             {{ t('日志写入 data/logs/embypanel.log，默认 INFO 级别。') }}
           </p>
         </div>
-        <button class="primary" @click="saveLogConfig">
-          <Check :size="15" />{{ t('保存日志配置') }}
-        </button>
+        <div class="panel-actions">
+          <RefreshButton
+            :label="t('刷新')"
+            :loading-label="t('刷新中')"
+            :action="refreshLogConfig"
+            :loading="logConfigLoading"
+            :disabled="logConfigLoading || logConfigSaving"
+          />
+          <button class="primary" :disabled="logConfigLoading || logConfigSaving" @click="saveLogConfig">
+            <Check :size="15" />{{ t('保存日志配置') }}
+          </button>
+        </div>
       </div>
+      <div v-if="logConfigError" class="notice error" role="alert">{{ logConfigError }}</div>
       <div class="grid log-config-grid">
         <label>
           <span>{{ t('日志级别') }}</span>

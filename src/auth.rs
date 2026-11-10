@@ -101,6 +101,7 @@ pub struct LogoutResponse {
 #[derive(Debug, Serialize)]
 pub struct ProfileResponse {
     pub username: String,
+    pub can_manage_log_config: bool,
 }
 
 pub async fn setup_status(State(state): State<AppState>) -> AppResult<Json<SetupStatus>> {
@@ -312,12 +313,15 @@ pub async fn get_profile(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<ProfileResponse>> {
-    let admin_user_id = require_auth_user_id(&state, &headers).await?;
+    let ctx = require_auth_context(&state, &headers).await?;
     let username = state
         .settings_store
-        .admin_username_by_id(admin_user_id)?
+        .admin_username_by_id(ctx.user_id)?
         .ok_or_else(|| AppError::Unauthorized("invalid or expired session".to_string()))?;
-    Ok(Json(ProfileResponse { username }))
+    Ok(Json(ProfileResponse {
+        username,
+        can_manage_log_config: ctx.kind == AuthKind::Session && is_super_admin(&ctx),
+    }))
 }
 
 pub async fn update_profile(
@@ -339,7 +343,10 @@ pub async fn update_profile(
             .settings_store
             .admin_username_by_id(admin_user_id)?
             .ok_or_else(|| AppError::Unauthorized("invalid or expired session".to_string()))?;
-        return Ok(Json(ProfileResponse { username }));
+        return Ok(Json(ProfileResponse {
+            username,
+            can_manage_log_config: is_super_admin(&ctx),
+        }));
     }
     state
         .settings_store
@@ -352,6 +359,7 @@ pub async fn update_profile(
     )?;
     Ok(Json(ProfileResponse {
         username: username.to_string(),
+        can_manage_log_config: is_super_admin(&ctx),
     }))
 }
 
@@ -1815,6 +1823,57 @@ mod tests {
         store
             .create_session(admin_id, &hash_token(plain_token), now_ts() + 3600)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn profile_log_config_capability_matches_super_admin_session_boundary() {
+        let fixture = TestAuthFixture::new_super_admin();
+        let store = fixture.store();
+        create_live_session(store, fixture.admin_id, "synthetic-profile-super");
+        for role in ["viewer", "operator"] {
+            let id = store
+                .create_admin_with_roles(
+                    role,
+                    "synthetic-hash",
+                    None,
+                    &[role],
+                    Some(fixture.admin_id),
+                )
+                .unwrap();
+            create_live_session(store, id, role);
+        }
+        create_test_api_token(
+            store,
+            fixture.admin_id,
+            "profile-token",
+            "synthetic",
+            "synthetic-profile-token",
+            &[],
+            None,
+        );
+        for (credential, allowed) in [
+            ("synthetic-profile-super", true),
+            ("viewer", false),
+            ("operator", false),
+            ("synthetic-profile-token", false),
+        ] {
+            let Json(profile) = get_profile(
+                State(fixture.app_state().clone()),
+                bearer_headers(credential),
+            )
+            .await
+            .unwrap();
+            assert_eq!(profile.can_manage_log_config, allowed);
+            let config = crate::settings_api::get_log_config(
+                State(fixture.app_state().clone()),
+                bearer_headers(credential),
+            )
+            .await;
+            assert_eq!(config.is_ok(), allowed);
+            if !allowed {
+                assert!(matches!(config, Err(AppError::Forbidden(_))));
+            }
+        }
     }
 
     async fn assert_session_auth_ok(state: &AppState, admin_id: i64, plain_token: &str) {

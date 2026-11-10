@@ -222,6 +222,10 @@ export function usePanelController() {
   let settingsLoaded = false
   let clientControlLoaded = false
   let logConfigLoaded = false
+  let logConfigGeneration = 0
+  const logConfigLoading = ref(false)
+  const logConfigSaving = ref(false)
+  const logConfigError = ref('')
   let settingsRequest: Promise<void> | undefined
   let clientControlRequest: Promise<void> | undefined
   let logConfigRequest: Promise<void> | undefined
@@ -240,7 +244,9 @@ export function usePanelController() {
 
   const profile = reactive<Profile>({
     username: '',
+    can_manage_log_config: false,
   })
+  const canManageLogConfig = computed(() => Boolean(token.value) && mode.value === 'app' && profile.can_manage_log_config === true)
 
   const profileForm = reactive({
     username: '',
@@ -380,14 +386,7 @@ export function usePanelController() {
       ? 'One mapping per line: source => target\nhttps://source.example.com => http://media-gateway.local:5244\nRegex: regex:https://(source|mirror)\\.example\\.test => http://media-gateway.local:5244'
       : '每行一个映射：原地址 => 新地址\nhttps://source.example.com => http://media-gateway.local:5244\n高级正则：regex:https://(source|mirror)\\.example\\.test => http://media-gateway.local:5244',
   )
-  const logServers = computed(() =>
-    settings.servers.map((server) => ({
-      id: server.id,
-      name: server.name || `${t('端口')} ${server.port}`,
-      port: server.port,
-      enabled: server.enabled,
-    })),
-  )
+  const logServers = computed(() => serverOptions.value)
   const playbackLogRows = computed(() => activityLogs.value.filter((entry) => entry.kind === 'playback'))
   const generalLogRows = computed(() =>
     activityLogs.value.filter((entry) => entry.kind === 'general'),
@@ -584,6 +583,20 @@ export function usePanelController() {
     })
   }
 
+  function openDiagnosticLogs(requestId: string, serverId: string, view: 'proxy' | 'playback' | 'general') {
+    if (!token.value || mode.value !== 'app') return
+    if (!/^diag-[a-zA-Z0-9-]{1,120}$/.test(requestId) || !serverId || serverId.length > 128) return
+    selectedLogView.value = view
+    selectedLogServer.value = serverId
+    selectedLogLevel.value = 'all'
+    selectedRequestPathType.value = view === 'proxy' ? 'video_stream' : 'all'
+    logKeywordFilter.value = requestId
+    logSince.value = ''
+    logUntil.value = ''
+    resetLogLimits()
+    setPage('logs')
+  }
+
   function resetLogLimits() {
     playbackLogLimit.value = playbackLogInitialLimit
     generalLogLimit.value = generalLogInitialLimit
@@ -751,7 +764,11 @@ export function usePanelController() {
     invalidateServerOptions()
     settingsLoaded = false
     clientControlLoaded = false
+    logConfigGeneration += 1
     logConfigLoaded = false
+    logConfigLoading.value = false
+    logConfigSaving.value = false
+    logConfigError.value = ''
     settingsRequest = undefined
     clientControlRequest = undefined
     logConfigRequest = undefined
@@ -762,8 +779,17 @@ export function usePanelController() {
   async function loadAppData() {
     error.value = ''
     resetResourceCache()
-    const profileResponse = await api<Profile>('/api/profile')
-    Object.assign(profile, profileResponse)
+    applyProfile({ username: '' })
+    const requestSession = dataSession
+    let profileResponse: Profile
+    try {
+      profileResponse = await api<Profile>('/api/profile')
+    } catch (err) {
+      if (requestSession !== dataSession || !token.value) return
+      throw err
+    }
+    if (requestSession !== dataSession || !token.value) return
+    applyProfile(profileResponse)
     credentials.username = profileResponse.username
     profileForm.username = ''
     mode.value = 'app'
@@ -771,12 +797,17 @@ export function usePanelController() {
     await activatePage(page.value)
   }
 
+  function applyProfile(response: Profile) {
+    profile.username = response.username
+    profile.can_manage_log_config = response.can_manage_log_config === true
+  }
+
   function applySettingsResponse(response: Settings, refreshOptions = true) {
     Object.assign(settings, response)
     normalizeSettingsServers()
     if (!refreshOptions) return
     invalidateServerOptions()
-    if (mode.value === 'app' && ['history', 'admin-security', 'sessions', 'library-tasks', 'cache-management'].includes(page.value)) {
+    if (mode.value === 'app' && ['history', 'admin-security', 'sessions', 'library-tasks', 'cache-management', 'logs'].includes(page.value)) {
       const generation = serverOptionsGeneration
       const requestSession = dataSession
       void ensureServerOptions().catch((err) => {
@@ -885,20 +916,9 @@ export function usePanelController() {
   }
 
   async function ensureLogConfig() {
-    if (logConfigLoaded) return
+    if (!canManageLogConfig.value || logConfigLoaded) return
     if (logConfigRequest) return logConfigRequest
-    const request = (async () => {
-      await refreshLogConfig()
-      if (!logConfigLoaded && token.value) {
-        throw new Error(logsError.value || t('页面加载失败，请刷新后重试'))
-      }
-    })()
-    logConfigRequest = request
-    try {
-      await request
-    } finally {
-      if (logConfigRequest === request) logConfigRequest = undefined
-    }
+    return refreshLogConfig()
   }
 
   async function loadPageData(nextPage: Page, activation?: number) {
@@ -927,9 +947,8 @@ export function usePanelController() {
         await ensureClientControl()
         break
       case 'logs':
-        await ensureSettings()
-        await Promise.all([ensureLogConfig(), refreshActivityLogs()])
-        break
+        void ensureLogConfig()
+        return (await Promise.all([refreshServerOptions(activation, nextPage), refreshActivityLogs()]))[0]
       case 'account':
         await refreshAuditLogs()
         break
@@ -1009,15 +1028,30 @@ export function usePanelController() {
   }
 
   async function refreshLogConfig() {
+    if (!canManageLogConfig.value || logConfigSaving.value) return
     const requestSession = dataSession
-    logsError.value = ''
+    const generation = ++logConfigGeneration
+    const isCurrent = () => requestSession === dataSession && generation === logConfigGeneration && canManageLogConfig.value
+    logConfigLoading.value = true
+    logConfigLoaded = false
+    logConfigError.value = ''
+    const request = (async () => {
+      try {
+        const response = await api<SystemLogConfig>('/api/settings/log-config')
+        if (!isCurrent()) return
+        Object.assign(logConfig, response)
+        logConfigLoaded = true
+      } catch (err) {
+        if (isCurrent()) logConfigError.value = err instanceof Error ? err.message : String(err)
+      } finally {
+        if (isCurrent()) logConfigLoading.value = false
+      }
+    })()
+    logConfigRequest = request
     try {
-      const response = await api<SystemLogConfig>('/api/settings/log-config')
-      if (requestSession !== dataSession || !token.value) return
-      Object.assign(logConfig, response)
-      logConfigLoaded = true
-    } catch (err) {
-      logsError.value = err instanceof Error ? err.message : String(err)
+      await request
+    } finally {
+      if (logConfigRequest === request) logConfigRequest = undefined
     }
   }
 
@@ -1121,21 +1155,32 @@ export function usePanelController() {
   }
 
   async function saveLogConfig() {
+    if (!canManageLogConfig.value || logConfigLoading.value || logConfigSaving.value) return
     if (!logConfigLoaded) {
-      logsError.value = t('页面加载失败，请刷新后重试')
+      logConfigError.value = t('页面加载失败，请刷新后重试')
       return
     }
-    logsError.value = ''
+    const requestSession = dataSession
+    const generation = ++logConfigGeneration
+    const isCurrent = () => requestSession === dataSession && generation === logConfigGeneration && canManageLogConfig.value
+    logConfigSaving.value = true
+    logConfigError.value = ''
     clearNotice()
     try {
-      Object.assign(logConfig, await api<SystemLogConfig>('/api/settings/log-config', {
+      const encrypted = await encryptPayload('log_config', { ...logConfig })
+      if (!isCurrent()) return
+      const response = await api<SystemLogConfig>('/api/settings/log-config', {
         method: 'PUT',
-        body: JSON.stringify(await encryptPayload('log_config', { ...logConfig })),
-      }))
+        body: JSON.stringify(encrypted),
+      })
+      if (!isCurrent()) return
+      Object.assign(logConfig, response)
       logConfigLoaded = true
       showNotice(t('日志配置已保存'))
     } catch (err) {
-      logsError.value = err instanceof Error ? err.message : String(err)
+      if (isCurrent()) logConfigError.value = err instanceof Error ? err.message : String(err)
+    } finally {
+      if (isCurrent()) logConfigSaving.value = false
     }
   }
 
@@ -1570,7 +1615,7 @@ export function usePanelController() {
           body: JSON.stringify(encryptedProfile),
         })
         if (!operationIsCurrent()) return
-        Object.assign(profile, response)
+        applyProfile(response)
         credentials.username = response.username
         profileForm.username = ''
       }
@@ -1913,6 +1958,7 @@ export function usePanelController() {
       pageReady.value = false
       stopPagePolling()
       resetResourceCache()
+      applyProfile({ username: '' })
       mode.value = 'login'
     } catch {
       if (token.value === logoutToken) {
@@ -2133,6 +2179,7 @@ export function usePanelController() {
     if (row.event_type === 'block') return 'blocked'
     if (row.event_type === 'unblock') return 'success'
     if (row.blocked) return 'blocked'
+    if (row.status_code === 0) return 'warn'
     if (row.cache_hit) return 'cache'
     if (row.status_code >= 500) return 'error'
     if (row.status_code >= 400) return 'warn'
@@ -2148,6 +2195,7 @@ export function usePanelController() {
   function requestSeverityLabel(row: ProxyRequestDetail) {
     if (row.event_type === 'block') return t('封禁动作')
     if (row.event_type === 'unblock') return t('解除封禁动作')
+    if (row.status_code === 0) return t('未返回响应')
     const severity = requestSeverity(row)
     if (severity === 'blocked') return t('已拦截')
     if (severity === 'cache') return t('缓存')
@@ -2185,7 +2233,7 @@ export function usePanelController() {
           refreshRateLimitStatus(),
         ])
       } else if (activePage === 'logs') {
-        await Promise.all([ensureLogConfig(), refreshActivityLogs()])
+        await refreshActivityLogs()
       }
     } catch (err) {
       if (page.value === activePage && mode.value === 'app') {
@@ -2216,6 +2264,7 @@ export function usePanelController() {
     pageReady.value = false
     stopPagePolling()
     resetResourceCache()
+    applyProfile({ username: '' })
     mode.value = 'login'
     error.value = t('登录已过期，请重新登录')
   }
@@ -2303,6 +2352,7 @@ export function usePanelController() {
     error.value = ''
     playbackError.value = ''
     logsError.value = ''
+    logConfigError.value = ''
     updateCheckError.value = ''
     overviewError.value = ''
     healthError.value = ''
@@ -2375,6 +2425,7 @@ export function usePanelController() {
     selectSecondFactorMode,
     refreshUpdateCheck,
     setPage,
+    openDiagnosticLogs,
     retryPage,
     logout,
     api,
@@ -2439,6 +2490,11 @@ export function usePanelController() {
     logSince,
     logUntil,
     logConfig,
+    canManageLogConfig,
+    logConfigLoading,
+    logConfigSaving,
+    logConfigError,
+    refreshLogConfig,
     activityLogMaxLimit,
     requestDetailDisplayMax,
     requestDetailPersistDays,

@@ -67,7 +67,8 @@
 - 用户策略表单复用 `frontend/src/components/UserPolicyFields.vue`；策略默认值、用户摘要转换、深拷贝、提交归一化和模板合并统一使用 `frontend/src/lib/user-policy.ts` 的 `defaultPolicyDraft`、`policyFromUser`、`copyPolicy`、`policyPayload`、`applyTemplateTo`。新增策略字段时必须同步类型、这些 helper、表单和后端契约，禁止在页面中再写一套策略转换逻辑。
 - 用户与模板 CRUD 优先扩展 `frontend/src/composables/useUsersController.ts`；备份导入导出优先扩展 `frontend/src/composables/useBackupController.ts`。页面只负责交互编排，不重复实现同一套 API、加密、loading 和错误状态。
 - 只需要服务器 ID/名称的页面复用 `usePanelController.ts` 的 `ensureServerOptions` 和 `serverOptions`，通过 `/api/servers/options` 获取授权选项；不要为了填充筛选器依赖全局配置读取权限。播放控制按钮同时遵循响应中的 `can_control_sessions`，后端继续强制校验 `sessions.control`。
-- 时间、容量、播放进度、URL 和请求状态格式化复用 `frontend/src/lib/panel-formatters.ts`。通用 class 合并使用 `frontend/src/lib/utils.ts` 的 `cn`。禁止各页面复制格式化函数导致显示规则分叉。
+- 时间、容量、播放进度、URL 和请求状态格式化复用 `frontend/src/lib/panel-formatters.ts`；`formatTimestampMs` 的可选第三参数为 `Intl.DateTimeFormatOptions`，诊断时间使用毫秒精度和时区，其他调用保持默认格式。通用 class 合并使用 `frontend/src/lib/utils.ts` 的 `cn`。禁止各页面复制格式化函数导致显示规则分叉。
+- 链路诊断前端统一扩展 `useDiagnosticsController.ts` 与 `DiagnosticsPage.vue`；单条分享和当前页导出使用安全字段白名单，移除用户、IP、设备标识与自由文本路径。关联日志跳转复用 `usePanelController.ts` 的 `openDiagnosticLogs`，带入关联 ID 和服务器，不复制日志查询或放宽授权。日志页服务器选项复用 `serverOptions`；日志配置依 `/api/profile` 的 `can_manage_log_config` 能力独立加载，缺失字段按无权限处理，不阻塞日志读取，后端继续要求超级管理员会话。
 - 所有用户可见文案通过现有 `t()` 和 `frontend/src/lib/translations.ts` 管理；新增中文键时同时补英文映射。禁止在同一功能中混用硬编码文案和翻译键。
 
 ### 全站字体规范
@@ -83,6 +84,8 @@
 - 鉴权与授权统一使用 `src/auth.rs` 的 `require_auth_context`、`require_permission`、`require_server_filter` 和 `require_server_access`，禁止 handler 自行解析 Bearer token、查询 session 或实现权限判断；认证失败返回 401，授权失败返回 403。全局设置写入、备份导入导出、Key 查看要求 `require_super_admin_session`；常规配置读取依 `settings.read` 和服务器授权过滤。
 - 会话读取使用 `monitoring.read`，停止播放和发送消息使用 `sessions.control`。API Token 签发使用 `SettingsStore::create_admin_api_token_from_session`，在同一事务中验证来源会话和当前权限，禁止管理接口调用无来源校验的测试/内部签发入口。
 - 高频代理/播放统计写入统一经过 `TelemetryWriteQueue`，禁止在 handler 请求路径中同步写入。
+- 链路诊断的上下文、结果、缓存、路径与耗时由 `PlaybackDiagnosisTrace` 采集，通过 `src/diagnostics.rs` 的 DTO 与脱敏边界输出。`started_at_ms` / `finished_at_ms` 为 Unix 毫秒时间戳，基于起点时钟与单调时钟偏移；记录 `duration_ms` 为整段诊断耗时，未归入步骤的时间按真实操作区间并集计算。缓存步骤耗时为多次缓存操作累计，不可由步骤时长累加伪造总耗时；旧数据和未采集的网络分段保留空值。持久化统一经过 `TelemetryWriteQueue::diagnosis_record` 和 `SettingsStore`，保留 7 天或最近 10000 条；授权筛选先于分页与计数，清空须排除旧队列写入复活。结果 302 不表示播放成功。详情见 `docs/diagnostics.md`。
+- 名称解析与连接建立观测复用 `src/diagnostics.rs::network` 的逐次请求作用域、系统 GAI resolver 适配与 reqwest 连接器薄层。用户解析及播放策略等多请求步骤通过 `observe_operation` 汇总内部各次 `observe_send` 的网络数值，步骤 observation 只接收这一次汇总，不重复合并局部副本；不传播可选子查询的状态码和错误。播放诊断与 PlaybackInfo 流地址生成复用 `src/main.rs` 的 `playback_context_value`、`playback_device_name` 和 `playback_device_id`，读取明确的 `Client`、`Device`/`DeviceName`、`DeviceId`、`UserId` 及对应 `X-Emby-*` 查询参数、请求头；`Authorization` 与 Emby 专用授权头兼容 `MediaBrowser`/`Emby` 前缀。生成流地址只从请求头补充这些上下文字段，不复制 Token/API Key，保留原查询鉴权参数的现有传递行为。只保存已完成事件的数值汇总和固定状态；连接池后台事件必须显式继承原发送作用域，发送快照关闭后不得晚到污染。两项可能重叠，不计入诊断总耗时；不推断响应使用了新连接，不从总耗时倒推未提供的网络分段。前端类型、详情、分享白名单与 `docs/diagnostics.md` 同步扩展。
 - 加密请求统一使用 `src/crypto_api.rs` 的 `EncryptedRequest` 和 `CryptoKeys::decrypt_named`。禁止新增自定义 RSA/AES 解密、字段扫描或 Base64URL 解码实现。
 - 错误统一返回 `src/error.rs` 的 `AppResult`/`AppError`；写日志和审计前使用 `AppError::safe_log_message` 或 `safe_error_message`。禁止把 reqwest 原始错误、凭证、token、API Key、密码或完整敏感请求写进响应和日志。
 - JSON 配置持久化统一使用 `src/db.rs` 的 `SettingsStore::load_setting_json` / `save_setting_json`，管理员操作审计使用 `record_audit` 或 `record_audit_best_effort`。禁止业务模块自行打开 SQLite 连接、创建新的 settings 表或复制审计插入 SQL。

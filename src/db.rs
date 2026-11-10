@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     config::Config,
+    diagnostics::{DiagnosisRecord, sanitize_diagnosis_record},
     error::{AppError, AppResult},
     ip_location::IpLocation,
 };
@@ -27,6 +28,9 @@ const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAINTENANCE_INTERVAL_SECONDS: i64 = 60 * 60;
 const TELEMETRY_WRITE_QUEUE_CAPACITY: usize = 2048;
 const TELEMETRY_WRITE_BATCH_SIZE: usize = 64;
+pub const DIAGNOSTICS_RETENTION_DAYS: i64 = 7;
+pub const DIAGNOSTICS_PERSIST_MAX_RECORDS: usize = 10000;
+const DIAGNOSTICS_MIGRATION_VERSION: &str = "diagnosis_records_v1";
 const SCHEDULED_TASK_FAILURE_HISTORY_MIGRATION_VERSION: &str = "scheduled_task_failure_history_v1";
 const PROXY_ANALYTICS_SAMPLES_MIGRATION_VERSION: &str = "proxy_analytics_samples_v1";
 const PROXY_ANALYTICS_RETENTION_DAYS: i64 = 7;
@@ -39,6 +43,11 @@ const TASK_FAILURE_HISTORY_DAY_MS: i64 = 24 * 60 * 60 * 1000;
 const TASK_FAILURE_ERROR_REDACTED: &str = "task failure details omitted for safety";
 const TOTP_PERIOD_SECONDS: i64 = 30;
 const TOTP_DIGITS: i64 = 6;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BEFORE_DIAGNOSIS_DECODE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
 
 fn validate_totp_parameters(algo: &str, digits: i64, period_seconds: i64) -> AppResult<()> {
     if !matches!(algo.to_ascii_uppercase().as_str(), "SHA1" | "SHA256") {
@@ -119,6 +128,7 @@ struct TelemetryWriteQueueInner {
 
 enum TelemetryMessage {
     Write(TelemetryWrite),
+    ClearDiagnosisRecords(SyncSender<AppResult<()>>),
     Shutdown,
 }
 
@@ -131,6 +141,7 @@ enum TelemetryWrite {
     },
     ProxyRequestDetail(ProxyRequestDetailWrite),
     PlaybackAnalyticsSamples(Vec<PlaybackAnalyticsSampleWrite>),
+    DiagnosisRecord(DiagnosisRecord),
 }
 
 pub struct PlaybackAnalyticsSampleWrite {
@@ -209,6 +220,38 @@ impl TelemetryWriteQueue {
         self.enqueue(TelemetryWrite::PlaybackAnalyticsSamples(samples));
     }
 
+    /// Non-blocking like other telemetry writes; sanitize before entering the queue.
+    pub fn diagnosis_record(&self, record: DiagnosisRecord) {
+        self.enqueue(TelemetryWrite::DiagnosisRecord(sanitize_diagnosis_record(
+            record,
+        )));
+    }
+
+    /// FIFO barrier: process earlier writes, clear persistence, then acknowledge.
+    /// This management operation may block; async handlers must use spawn_blocking.
+    pub fn clear_diagnosis_records(&self) -> AppResult<()> {
+        let writer = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| AppError::Internal("telemetry writer lock is poisoned".to_string()))?;
+        if writer.is_none() || self.inner.closing.load(Ordering::Acquire) {
+            return Err(AppError::Internal(
+                "telemetry writer is unavailable".to_string(),
+            ));
+        }
+        let (reply, result) = sync_channel(1);
+        // Serialize control-message submission against shutdown, not normal producers.
+        self.inner
+            .sender
+            .send(TelemetryMessage::ClearDiagnosisRecords(reply))
+            .map_err(|_| AppError::Internal("telemetry writer is unavailable".to_string()))?;
+        drop(writer);
+        result.recv().map_err(|_| {
+            AppError::Internal("diagnostics cleanup was not acknowledged".to_string())
+        })?
+    }
+
     fn enqueue(&self, write: TelemetryWrite) {
         if self.inner.closing.load(Ordering::Acquire) {
             self.record_drop("writer shutting down");
@@ -259,18 +302,23 @@ impl TelemetryWriteQueue {
 }
 
 fn telemetry_writer_loop(settings_store: SettingsStore, receiver: Receiver<TelemetryMessage>) {
-    while let Ok(message) = receiver.recv() {
-        let TelemetryMessage::Write(first) = message else {
-            break;
+    let mut pending = None;
+    while let Some(message) = pending.take().or_else(|| receiver.recv().ok()) {
+        let first = match message {
+            TelemetryMessage::Write(write) => write,
+            TelemetryMessage::ClearDiagnosisRecords(reply) => {
+                let _ = reply.send(settings_store.clear_persisted_diagnosis_records());
+                continue;
+            }
+            TelemetryMessage::Shutdown => break,
         };
         let mut batch = Vec::with_capacity(TELEMETRY_WRITE_BATCH_SIZE);
         batch.push(first);
-        let mut shutdown = false;
         while batch.len() < TELEMETRY_WRITE_BATCH_SIZE {
             match receiver.try_recv() {
                 Ok(TelemetryMessage::Write(write)) => batch.push(write),
-                Ok(TelemetryMessage::Shutdown) => {
-                    shutdown = true;
+                Ok(control) => {
+                    pending = Some(control);
                     break;
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
@@ -282,9 +330,6 @@ fn telemetry_writer_loop(settings_store: SettingsStore, receiver: Receiver<Telem
                 error = %err.safe_log_message(),
                 "failed to write telemetry batch"
             );
-        }
-        if shutdown {
-            break;
         }
     }
 }
@@ -2847,6 +2892,27 @@ impl SettingsStore {
                     Self::insert_playback_analytics_samples(&transaction, samples)? > 0;
             }
         }
+        let mut wrote_diagnoses = false;
+        for write in writes {
+            let TelemetryWrite::DiagnosisRecord(record) = write else {
+                continue;
+            };
+            // Re-sanitize at the persistence boundary as well as the queue edge.
+            let record = sanitize_diagnosis_record(record.clone());
+            transaction.execute(
+                "INSERT INTO diagnosis_records (request_id, server_id, started_at_ms, stored_at_ms, record_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(request_id) DO UPDATE SET server_id = excluded.server_id,
+                     started_at_ms = excluded.started_at_ms, stored_at_ms = excluded.stored_at_ms,
+                     record_json = excluded.record_json",
+                params![record.request_id, record.server_id, record.started_at_ms,
+                    updated_at_ms, serde_json::to_string(&record)?],
+            )?;
+            wrote_diagnoses = true;
+        }
+        if wrote_diagnoses {
+            Self::prune_diagnosis_records(&transaction)?;
+        }
         transaction.commit()?;
 
         if wrote_playback {
@@ -2875,6 +2941,72 @@ impl SettingsStore {
                 Ok(())
             })?;
         }
+        Ok(())
+    }
+
+    fn prune_diagnosis_records(conn: &Connection) -> AppResult<()> {
+        conn.execute(
+            "DELETE FROM diagnosis_records WHERE COALESCE(started_at_ms, stored_at_ms) < ?1",
+            params![diagnostics_cutoff_ms()],
+        )?;
+        conn.execute(
+            "DELETE FROM diagnosis_records WHERE request_id NOT IN (
+                 SELECT request_id FROM diagnosis_records
+                 ORDER BY COALESCE(started_at_ms, stored_at_ms) DESC, request_id DESC LIMIT ?1)",
+            params![DIAGNOSTICS_PERSIST_MAX_RECORDS as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Scope in SQL before applying the retention bound or decoding records.
+    pub fn list_diagnosis_records_scoped(
+        &self,
+        allowed_server_ids: Option<&std::collections::HashSet<String>>,
+    ) -> AppResult<Vec<DiagnosisRecord>> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::prune_diagnosis_records(&tx)?;
+        let rows = {
+            let mut stmt = tx.prepare(
+                "SELECT server_id, record_json FROM diagnosis_records
+                 WHERE (?1 IS NULL OR server_id IN (SELECT value FROM json_each(?1)))
+                 ORDER BY started_at_ms DESC, request_id DESC LIMIT ?2",
+            )?;
+            stmt.query_map(
+                params![
+                    allowed_server_ids.map(serde_json::to_string).transpose()?,
+                    DIAGNOSTICS_PERSIST_MAX_RECORDS as i64
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        // Release the write lock before decoding and sanitizing the bounded snapshot.
+        tx.commit()?;
+        #[cfg(test)]
+        TEST_BEFORE_DIAGNOSIS_DECODE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        let mut records = Vec::with_capacity(rows.len());
+        for (server_id, json) in rows {
+            let record = sanitize_diagnosis_record(serde_json::from_str(&json)?);
+            if record.server_id != server_id {
+                return Err(AppError::Internal(
+                    "invalid stored diagnostics scope".to_string(),
+                ));
+            }
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    fn clear_persisted_diagnosis_records(&self) -> AppResult<()> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM diagnosis_records", [])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -3439,6 +3571,7 @@ impl SettingsStore {
         migrate_admin_security_v1(conn)?;
         migrate_scheduled_task_failure_history_v1(conn)?;
         migrate_proxy_analytics_samples_v1(conn)?;
+        migrate_diagnosis_records_v1(conn)?;
         Ok(())
     }
 
@@ -3734,6 +3867,29 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, ddl_type: &str) -
         &format!("ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"),
         [],
     )?;
+    Ok(())
+}
+
+pub(crate) fn diagnostics_cutoff_ms() -> i64 {
+    SettingsStore::sqlite_i64(now_ms()).saturating_sub(DIAGNOSTICS_RETENTION_DAYS * 86_400_000)
+}
+
+fn migrate_diagnosis_records_v1(conn: &mut Connection) -> AppResult<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS diagnosis_records (
+             request_id TEXT PRIMARY KEY,
+             server_id TEXT NOT NULL,
+             started_at_ms INTEGER,
+             stored_at_ms INTEGER NOT NULL,
+             record_json TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_diagnosis_records_server_time
+             ON diagnosis_records(server_id, started_at_ms DESC, request_id DESC);",
+    )?;
+    record_migration(&tx, DIAGNOSTICS_MIGRATION_VERSION, now_seconds())?;
+    SettingsStore::prune_diagnosis_records(&tx)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -4450,6 +4606,371 @@ mod tests {
         let mut keeper = store.connection().unwrap();
         store.migrate(&mut keeper).unwrap();
         (store, keeper)
+    }
+
+    fn diagnosis_sample(id: &str, server: &str) -> crate::diagnostics::DiagnosisRecord {
+        crate::diagnostics::DiagnosisRecord {
+            request_id: id.into(),
+            server_id: server.into(),
+            media_id: "synthetic-media".into(),
+            started_at_ms: Some(now_ms() as i64),
+            duration_ms: Some(12),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn diagnosis_storage_migration_roundtrip_scope_and_legacy_times() {
+        let path = test_database_path("diagnosis-roundtrip");
+        let store = SettingsStore::open_for_test(path.clone()).unwrap();
+        let mut legacy = diagnosis_sample("legacy", "srv-a");
+        legacy.started_at_ms = None;
+        legacy.duration_ms = None;
+        store
+            .write_telemetry_batch(&[
+                TelemetryWrite::DiagnosisRecord(legacy),
+                TelemetryWrite::DiagnosisRecord(diagnosis_sample("other", "srv-b")),
+            ])
+            .unwrap();
+        let mut conn = store.connection().unwrap();
+        store.migrate(&mut conn).unwrap();
+        let migrations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+                [super::DIAGNOSTICS_MIGRATION_VERSION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrations, 1);
+        drop(conn);
+        drop(store);
+        let store = SettingsStore::open_for_test(path.clone()).unwrap();
+        assert_eq!(store.list_diagnosis_records_scoped(None).unwrap().len(), 2);
+        let allowed = ["srv-a".to_string()].into_iter().collect();
+        let records = store.list_diagnosis_records_scoped(Some(&allowed)).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].request_id, "legacy");
+        assert_eq!(records[0].started_at_ms, None);
+        assert_eq!(records[0].finished_at_ms, None);
+        assert_eq!(records[0].duration_ms, None);
+        assert!(
+            store
+                .list_diagnosis_records_scoped(Some(&Default::default()))
+                .unwrap()
+                .is_empty()
+        );
+        drop(store);
+        remove_test_database(&path);
+    }
+
+    #[test]
+    fn diagnosis_storage_sanitizes_upserts_and_scopes_before_decoding() {
+        let (store, keeper) = memory_security_store("diagnosis-scope");
+        let mut record = diagnosis_sample("same", "srv-a");
+        record.ua = "synthetic token=not-a-real-credential".into();
+        record.finished_at_ms = record.started_at_ms.map(|time| time + 12);
+        store
+            .write_telemetry_batch(&[TelemetryWrite::DiagnosisRecord(record.clone())])
+            .unwrap();
+        let json: String = keeper
+            .query_row("SELECT record_json FROM diagnosis_records", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!json.contains("not-a-real-credential"));
+        record.duration_ms = Some(14);
+        store
+            .write_telemetry_batch(&[TelemetryWrite::DiagnosisRecord(record)])
+            .unwrap();
+        keeper.execute(
+            "INSERT INTO diagnosis_records VALUES ('inaccessible', 'srv-b', NULL, ?1, 'not json')",
+            [now_ms() as i64],
+        ).unwrap();
+        let allowed = ["srv-a".to_string()].into_iter().collect();
+        let records = store.list_diagnosis_records_scoped(Some(&allowed)).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].duration_ms, Some(14));
+        assert!(records[0].finished_at_ms.is_some());
+        assert!(store.list_diagnosis_records_scoped(None).is_err());
+    }
+
+    #[test]
+    fn diagnosis_storage_releases_write_transaction_before_decoding() {
+        let path = test_database_path("diagnosis-decode-unlocked");
+        let store = SettingsStore::open_for_test(path.clone()).unwrap();
+        store
+            .write_telemetry_batch(&[TelemetryWrite::DiagnosisRecord(diagnosis_sample(
+                "before-decode",
+                "srv-a",
+            ))])
+            .unwrap();
+        let (reached, ready) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let reader = {
+            let store = store.clone();
+            thread::spawn(move || {
+                super::TEST_BEFORE_DIAGNOSIS_DECODE.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        reached.send(()).unwrap();
+                        released.recv().unwrap();
+                    }));
+                });
+                let allowed = ["srv-a".to_string()].into_iter().collect();
+                store.list_diagnosis_records_scoped(Some(&allowed))
+            })
+        };
+        ready.recv().unwrap();
+        // The reader is paused before decoding; no retries or timing thresholds.
+        let write_result = (|| -> super::AppResult<()> {
+            let mut writer = Connection::open(&path)?;
+            writer.busy_timeout(std::time::Duration::ZERO)?;
+            let tx = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let record = diagnosis_sample("during-decode", "srv-a");
+            tx.execute(
+                "INSERT INTO diagnosis_records VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    record.request_id,
+                    record.server_id,
+                    record.started_at_ms,
+                    now_ms() as i64,
+                    serde_json::to_string(&record)?
+                ],
+            )?;
+            tx.commit()?;
+            let count: i64 = writer.query_row(
+                "SELECT COUNT(*) FROM diagnosis_records WHERE request_id = 'during-decode'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 1);
+            Ok(())
+        })();
+        // Always resume and join the reader, including when the writer finds a lock.
+        release.send(()).unwrap();
+        let records = reader.join().unwrap().unwrap();
+        drop(store);
+        remove_test_database(&path);
+        write_result.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].request_id, "before-decode");
+    }
+
+    #[test]
+    fn diagnosis_storage_rejects_mismatched_json_scope() {
+        let (store, keeper) = memory_security_store("diagnosis-scope-mismatch");
+        let record = diagnosis_sample("mismatched", "srv-b");
+        keeper
+            .execute(
+                "INSERT INTO diagnosis_records VALUES ('mismatched', 'srv-a', ?1, ?1, ?2)",
+                params![now_ms() as i64, serde_json::to_string(&record).unwrap()],
+            )
+            .unwrap();
+        let allowed = ["srv-a".to_string()].into_iter().collect();
+        for scope in [None, Some(&allowed)] {
+            assert!(matches!(
+                store.list_diagnosis_records_scoped(scope),
+                Err(AppError::Internal(message)) if message == "invalid stored diagnostics scope"
+            ));
+        }
+        let denied = ["srv-b".to_string()].into_iter().collect();
+        assert!(
+            store
+                .list_diagnosis_records_scoped(Some(&denied))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn diagnosis_storage_preserves_order_and_sanitizes_on_read() {
+        let (store, keeper) = memory_security_store("diagnosis-read-order");
+        let time = now_ms() as i64;
+        for (id, started_at_ms) in [
+            ("legacy", None),
+            ("older", Some(time - 1)),
+            ("newer-a", Some(time)),
+            ("newer-z", Some(time)),
+        ] {
+            let mut record = diagnosis_sample(id, "srv-a");
+            record.started_at_ms = started_at_ms;
+            record.ua = "synthetic token=diagnosis-read-secret".into();
+            keeper
+                .execute(
+                    "INSERT INTO diagnosis_records VALUES (?1, 'srv-a', ?2, ?3, ?4)",
+                    params![
+                        id,
+                        started_at_ms,
+                        time,
+                        serde_json::to_string(&record).unwrap()
+                    ],
+                )
+                .unwrap();
+        }
+        let allowed = ["srv-a".to_string()].into_iter().collect();
+        let records = store.list_diagnosis_records_scoped(Some(&allowed)).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.request_id.as_str())
+                .collect::<Vec<_>>(),
+            ["newer-z", "newer-a", "older", "legacy"]
+        );
+        for record in &records {
+            assert!(!record.ua.contains("diagnosis-read-secret"));
+            assert!(record.ua.contains(crate::diagnostics::REDACTED_PLACEHOLDER));
+        }
+        assert_eq!(records[3].started_at_ms, None);
+        assert_eq!(records[3].finished_at_ms, None);
+    }
+
+    #[test]
+    fn diagnosis_storage_prunes_age_and_count_in_write_transaction_and_read() {
+        let (store, mut keeper) = memory_security_store("diagnosis-retention");
+        let time = now_ms() as i64;
+        let tx = keeper.transaction().unwrap();
+        let json = serde_json::to_string(&diagnosis_sample("synthetic", "srv")).unwrap();
+        for index in 0..super::DIAGNOSTICS_PERSIST_MAX_RECORDS + 3 {
+            let id = format!("synthetic-{index:05}");
+            let mut record: crate::diagnostics::DiagnosisRecord =
+                serde_json::from_str(&json).unwrap();
+            record.request_id = id.clone();
+            record.started_at_ms = Some(time - index as i64);
+            tx.execute(
+                "INSERT INTO diagnosis_records VALUES (?1, 'srv', ?2, ?3, ?4)",
+                params![
+                    id,
+                    record.started_at_ms,
+                    time,
+                    serde_json::to_string(&record).unwrap()
+                ],
+            )
+            .unwrap();
+        }
+        tx.execute(
+            "INSERT INTO diagnosis_records VALUES ('old-legacy', 'srv', NULL, ?1, ?2)",
+            params![super::diagnostics_cutoff_ms() - 1, json],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let mut expired = diagnosis_sample("old-timed", "srv");
+        expired.started_at_ms = Some(super::diagnostics_cutoff_ms() - 1);
+        store
+            .write_telemetry_batch(&[TelemetryWrite::DiagnosisRecord(expired)])
+            .unwrap();
+        let count: usize = keeper
+            .query_row("SELECT COUNT(*) FROM diagnosis_records", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, super::DIAGNOSTICS_PERSIST_MAX_RECORDS);
+        let oldest: String = keeper
+            .query_row(
+                "SELECT request_id FROM diagnosis_records ORDER BY started_at_ms LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(oldest, "synthetic-09999");
+        keeper.execute("UPDATE diagnosis_records SET started_at_ms = ?1 WHERE request_id = 'synthetic-00000'",
+            [super::diagnostics_cutoff_ms() - 1]).unwrap();
+        assert_eq!(
+            store.list_diagnosis_records_scoped(None).unwrap().len(),
+            super::DIAGNOSTICS_PERSIST_MAX_RECORDS - 1
+        );
+        let count: usize = keeper
+            .query_row("SELECT COUNT(*) FROM diagnosis_records", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, super::DIAGNOSTICS_PERSIST_MAX_RECORDS - 1);
+    }
+
+    #[test]
+    fn diagnosis_queue_sanitizes_before_enqueue_and_drops_when_full() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let queue = TelemetryWriteQueue {
+            inner: Arc::new(super::TelemetryWriteQueueInner {
+                sender,
+                dropped: AtomicU64::new(0),
+                closing: std::sync::atomic::AtomicBool::new(false),
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                writer: std::sync::Mutex::new(None),
+            }),
+        };
+        let mut record = diagnosis_sample("one", "srv");
+        record.ua = "synthetic token=queue-only-value".into();
+        queue.diagnosis_record(record);
+        queue.diagnosis_record(diagnosis_sample("two", "srv"));
+        assert_eq!(queue.inner.dropped.load(Ordering::Relaxed), 1);
+        match receiver.recv().unwrap() {
+            super::TelemetryMessage::Write(TelemetryWrite::DiagnosisRecord(record)) => {
+                assert!(record.ua.contains(crate::diagnostics::REDACTED_PLACEHOLDER));
+            }
+            _ => panic!("expected sanitized diagnosis message"),
+        }
+    }
+
+    #[test]
+    fn diagnosis_queue_clear_is_fifo_barrier_and_writer_remains_available() {
+        let path = test_database_path("diagnosis-clear-barrier");
+        let store = SettingsStore::open_for_test(path.clone()).unwrap();
+        let queue = TelemetryWriteQueue::start(store.clone()).unwrap();
+        let mut blocker = store.connection().unwrap();
+        let tx = blocker
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let started = std::time::Instant::now();
+        // More than one batch: queued writes must not reappear after cleanup.
+        for index in 0..150 {
+            queue.diagnosis_record(diagnosis_sample(&format!("before-{index}"), "srv"));
+        }
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        tx.commit().unwrap();
+        queue.clear_diagnosis_records().unwrap();
+        assert!(
+            store
+                .list_diagnosis_records_scoped(None)
+                .unwrap()
+                .is_empty()
+        );
+        queue.diagnosis_record(diagnosis_sample("after", "srv"));
+        queue.request_stat(
+            "srv".into(),
+            "Synthetic".into(),
+            8096,
+            RequestStatKind::Redirect,
+        );
+        queue.shutdown().unwrap();
+        let records = store.list_diagnosis_records_scoped(None).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].request_id, "after");
+        let redirects: i64 = blocker
+            .query_row(
+                "SELECT redirects FROM request_stats_daily WHERE server_id = 'srv'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(redirects, 1);
+        assert!(queue.clear_diagnosis_records().is_err());
+        drop(blocker);
+        drop(store);
+        remove_test_database(&path);
+    }
+
+    #[test]
+    fn diagnosis_queue_clear_propagates_database_failure_without_stopping_writer() {
+        let path = test_database_path("diagnosis-clear-error");
+        let store = SettingsStore::open_for_test(path.clone()).unwrap();
+        let queue = TelemetryWriteQueue::start(store.clone()).unwrap();
+        let mut conn = store.connection().unwrap();
+        conn.execute("DROP TABLE diagnosis_records", []).unwrap();
+        assert!(queue.clear_diagnosis_records().is_err());
+        assert!(store.list_diagnosis_records_scoped(None).is_err());
+        store.migrate(&mut conn).unwrap();
+        queue.clear_diagnosis_records().unwrap();
+        queue.diagnosis_record(diagnosis_sample("after-error", "srv"));
+        queue.shutdown().unwrap();
+        assert_eq!(store.list_diagnosis_records_scoped(None).unwrap().len(), 1);
+        drop(conn);
+        drop(store);
+        remove_test_database(&path);
     }
 
     #[test]

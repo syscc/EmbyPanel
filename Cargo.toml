@@ -1,6 +1,6 @@
 [package]
 name = "emby302gateway-rs"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 license = "MIT"
 
@@ -17,6 +17,8 @@ moka = { version = "0.12", features = ["future"] }
 rand = "0.9"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+hyper-util = { version = "=0.1.20", default-features = false, features = ["client-legacy"] }
+tower = { version = "0.5", features = ["util"] }
 rsa = { version = "0.9", features = ["sha2"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

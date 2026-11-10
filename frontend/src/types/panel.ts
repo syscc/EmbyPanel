@@ -77,6 +77,7 @@ export type AppInfo = {
 
 export type Profile = {
   username: string
+  can_manage_log_config?: boolean
 }
 
 export type PlaybackSession = {

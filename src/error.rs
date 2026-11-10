@@ -55,7 +55,25 @@ impl AppError {
         }
     }
 
-    fn status(&self) -> StatusCode {
+    /// Stable diagnostic categories, never derived from raw error text.
+    pub(crate) fn diagnostic_kind(&self) -> &'static str {
+        match self {
+            Self::Http(error) => reqwest_error_kind(error),
+            Self::Url(_) => "invalid_url",
+            Self::Json(_) => "decode",
+            Self::Io(_) => "io",
+            Self::Database(_) => "database",
+            Self::Unauthorized(_) => "unauthorized",
+            Self::Forbidden(_) => "forbidden",
+            Self::Validation(_) | Self::PayloadTooLarge(_) => "validation",
+            Self::RateLimited(_) => "rate_limited",
+            Self::BadGateway(_) => "upstream",
+            Self::Config(_) => "config",
+            Self::Internal(_) => "internal",
+        }
+    }
+
+    pub(crate) fn status(&self) -> StatusCode {
         match self {
             Self::Config(_)
             | Self::Internal(_)
@@ -98,6 +116,26 @@ impl IntoResponse for AppError {
             _ => tracing::error!(error = %self.safe_log_message(), "request failed"),
         }
         (self.status(), self.client_message()).into_response()
+    }
+}
+
+pub(crate) fn reqwest_error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.status().is_some() {
+        "upstream_http"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_redirect() {
+        "redirect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "transport"
     }
 }
 

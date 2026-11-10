@@ -22,14 +22,31 @@ async fn send_response(
     request: reqwest::RequestBuilder,
     operation: &str,
 ) -> AppResult<reqwest::Response> {
-    // Map transport errors through the safe reqwest redactor so api_key-bearing
-    // request URLs from emby_api_url never land in AppError Display/logs.
-    request.send().await.map_err(|err| {
-        AppError::BadGateway(format!(
-            "{operation} failed: {}",
-            crate::error::safe_reqwest_error_message(&err)
-        ))
-    })
+    send_response_observed(request, operation, &mut Default::default()).await
+}
+
+async fn send_response_observed(
+    request: reqwest::RequestBuilder,
+    operation: &str,
+    observation: &mut crate::diagnostics::UpstreamObservation,
+) -> AppResult<reqwest::Response> {
+    let started = std::time::Instant::now();
+    let result =
+        crate::diagnostics::network::observe_send(observation, async { request.send().await })
+            .await;
+    result
+        .map(|response| {
+            observation.response_headers_ms = Some(started.elapsed().as_millis() as u64);
+            observation.status = Some(response.status().as_u16());
+            response
+        })
+        .map_err(|err| {
+            observation.error_kind = Some(crate::error::reqwest_error_kind(&err).to_string());
+            AppError::BadGateway(format!(
+                "{operation} failed: {}",
+                crate::error::safe_reqwest_error_message(&err)
+            ))
+        })
 }
 
 fn upstream_status_error(operation: &str, status: reqwest::StatusCode) -> AppError {
@@ -41,8 +58,17 @@ async fn send_checked(
     request: reqwest::RequestBuilder,
     operation: &str,
 ) -> AppResult<reqwest::Response> {
-    let response = send_response(request, operation).await?;
+    send_checked_observed(request, operation, &mut Default::default()).await
+}
+
+async fn send_checked_observed(
+    request: reqwest::RequestBuilder,
+    operation: &str,
+    observation: &mut crate::diagnostics::UpstreamObservation,
+) -> AppResult<reqwest::Response> {
+    let response = send_response_observed(request, operation, observation).await?;
     if !response.status().is_success() {
+        observation.error_kind = Some("upstream_http".to_string());
         return Err(upstream_status_error(operation, response.status()));
     }
     Ok(response)
@@ -58,6 +84,14 @@ struct ItemsResponse {
 struct EmbyItem {
     #[serde(rename = "MediaSources", default)]
     media_sources: Vec<MediaSource>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "SeriesName")]
+    series_name: Option<String>,
+    #[serde(rename = "ParentIndexNumber")]
+    season_number: Option<i32>,
+    #[serde(rename = "IndexNumber")]
+    episode_number: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,19 +109,59 @@ pub async fn get_media_path(
     media_source_id: Option<&str>,
     user_agent: &str,
 ) -> AppResult<Option<String>> {
+    Ok(get_media_path_observed(
+        client,
+        config,
+        item_id,
+        media_source_id,
+        user_agent,
+        &mut Default::default(),
+    )
+    .await?
+    .path)
+}
+
+/// Media labels come from the same Items request; callers must not fetch on cache hits.
+#[derive(Debug, Default)]
+pub(crate) struct MediaPathResolution {
+    pub path: Option<String>,
+    pub media_name: Option<String>,
+    pub series_name: Option<String>,
+    pub season_number: Option<i32>,
+    pub episode_number: Option<i32>,
+    pub media_source_id: Option<String>,
+}
+
+pub(crate) async fn get_media_path_observed(
+    client: &reqwest::Client,
+    config: &Config,
+    item_id: &str,
+    media_source_id: Option<&str>,
+    user_agent: &str,
+    observation: &mut crate::diagnostics::UpstreamObservation,
+) -> AppResult<MediaPathResolution> {
     let mut url = emby_api_url(config, "/Items")?;
     url.query_pairs_mut()
         .append_pair("Ids", item_id)
-        .append_pair("Fields", "Path,MediaSources");
+        .append_pair(
+            "Fields",
+            "Path,MediaSources,SeriesName,ParentIndexNumber,IndexNumber",
+        );
 
     let mut request = client.get(url);
     if !user_agent.trim().is_empty() {
         request = request.header(reqwest::header::USER_AGENT, user_agent);
     }
-    let response = send_checked(request, "Emby item query").await?;
-
-    let data = response.json::<ItemsResponse>().await?;
+    let response = send_checked_observed(request, "Emby item query", observation).await?;
+    let started = std::time::Instant::now();
+    let data = response.json::<ItemsResponse>().await;
+    observation.response_body_ms = Some(started.elapsed().as_millis() as u64);
+    let data = data.map_err(|err| {
+        observation.error_kind = Some(crate::error::reqwest_error_kind(&err).to_string());
+        AppError::from(err)
+    })?;
     let Some(item) = data.items.first() else {
+        observation.error_kind = Some("not_found".to_string());
         return Err(AppError::BadGateway("Emby item not found".to_string()));
     };
 
@@ -99,7 +173,14 @@ pub async fn get_media_path(
         item.media_sources.first()
     };
 
-    Ok(source.and_then(|source| source.path.clone()))
+    Ok(MediaPathResolution {
+        path: source.and_then(|source| source.path.clone()),
+        media_source_id: source.and_then(|source| source.id.clone()),
+        media_name: item.name.clone(),
+        series_name: item.series_name.clone(),
+        season_number: item.season_number,
+        episode_number: item.episode_number,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -306,14 +387,12 @@ pub async fn reset_user_password(
     let mut url = config.emby_url(&format!("/Users/{user_id}/Password"))?;
     url.query_pairs_mut()
         .append_pair("api_key", &config.emby_api_key);
-    let response = client
-        .post(url.clone())
-        .json(&serde_json::json!({
+    let response =
+        crate::diagnostics::network::send(client.post(url.clone()).json(&serde_json::json!({
             "CurrentPw": "",
             "NewPw": "",
             "ResetPassword": true,
-        }))
-        .send()
+        })))
         .await?;
     if !response.status().is_success() {
         let status = response.status();
@@ -330,15 +409,12 @@ pub async fn reset_user_password(
         )));
     }
 
-    let response = client
-        .post(url)
-        .json(&serde_json::json!({
-            "CurrentPw": "",
-            "NewPw": new_password,
-            "ResetPassword": false,
-        }))
-        .send()
-        .await?;
+    let response = crate::diagnostics::network::send(client.post(url).json(&serde_json::json!({
+        "CurrentPw": "",
+        "NewPw": new_password,
+        "ResetPassword": false,
+    })))
+    .await?;
     if !response.status().is_success() {
         return Err(AppError::BadGateway(format!(
             "Emby password was cleared, but setting the replacement password failed with status {}; the user remains disabled",
@@ -687,7 +763,8 @@ pub async fn get_user_name_by_token(
     }
 
     let url = config.emby_url("/Users/Me")?;
-    let response = client.get(url).header("X-Emby-Token", token).send().await?;
+    let response =
+        crate::diagnostics::network::send(client.get(url).header("X-Emby-Token", token)).await?;
     if !response.status().is_success() {
         return Ok(None);
     }

@@ -34,8 +34,19 @@ pub async fn fs_get(
     path: &str,
     user_agent: &str,
 ) -> AppResult<Option<String>> {
+    fs_get_observed(client, config, path, user_agent, &mut Default::default()).await
+}
+
+pub(crate) async fn fs_get_observed(
+    client: &reqwest::Client,
+    config: &Config,
+    path: &str,
+    user_agent: &str,
+    observation: &mut crate::diagnostics::UpstreamObservation,
+) -> AppResult<Option<String>> {
     let url = config.openlist_url("/api/fs/get")?;
-    let response = client
+    let started = std::time::Instant::now();
+    let request = client
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .header(reqwest::header::USER_AGENT, user_agent)
@@ -43,11 +54,18 @@ pub async fn fs_get(
             reqwest::header::AUTHORIZATION,
             config.openlist_token.as_deref().unwrap_or_default(),
         )
-        .json(&FsGetRequest { path })
-        .send()
-        .await?;
-
+        .json(&FsGetRequest { path });
+    let response =
+        crate::diagnostics::network::observe_send(observation, async { request.send().await })
+            .await;
+    let response = response.map_err(|err| {
+        observation.error_kind = Some(crate::error::reqwest_error_kind(&err).to_string());
+        AppError::from(err)
+    })?;
+    observation.response_headers_ms = Some(started.elapsed().as_millis() as u64);
+    observation.status = Some(response.status().as_u16());
     if !response.status().is_success() {
+        observation.error_kind = Some("upstream_http".to_string());
         let status = response.status();
         // Do not log the requested path or response body: either can contain
         // credentials when an upstream is misconfigured.
@@ -57,8 +75,15 @@ pub async fn fs_get(
         )));
     }
 
-    let data = response.json::<FsGetResponse>().await?;
+    let started = std::time::Instant::now();
+    let data = response.json::<FsGetResponse>().await;
+    observation.response_body_ms = Some(started.elapsed().as_millis() as u64);
+    let data = data.map_err(|err| {
+        observation.error_kind = Some(crate::error::reqwest_error_kind(&err).to_string());
+        AppError::from(err)
+    })?;
     if data.code != Some(200) {
+        observation.error_kind = Some("upstream_api".to_string());
         let code = data.code.unwrap_or_default();
         tracing::error!(code, "OpenList API returned failure");
         return Err(AppError::BadGateway(format!(
@@ -71,22 +96,23 @@ pub async fn fs_get(
 
 pub async fn validate_connection(client: &reqwest::Client, config: &Config) -> AppResult<()> {
     let url = config.openlist_url("/api/fs/list")?;
-    let response = client
-        .post(url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header(
-            reqwest::header::AUTHORIZATION,
-            config.openlist_token.as_deref().unwrap_or_default(),
-        )
-        .json(&serde_json::json!({
-            "path": "/",
-            "password": "",
-            "refresh": false,
-            "page": 1,
-            "per_page": 1,
-        }))
-        .send()
-        .await?;
+    let response = crate::diagnostics::network::send(
+        client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(
+                reqwest::header::AUTHORIZATION,
+                config.openlist_token.as_deref().unwrap_or_default(),
+            )
+            .json(&serde_json::json!({
+                "path": "/",
+                "password": "",
+                "refresh": false,
+                "page": 1,
+                "per_page": 1,
+            })),
+    )
+    .await?;
 
     if !response.status().is_success() {
         return Err(AppError::BadGateway(format!(

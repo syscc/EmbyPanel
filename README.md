@@ -2,7 +2,7 @@
 
 EmbyPanel 是一个 Rust + Vue 实现的 Emby STRM 直链反代面板。后端同时提供管理 UI、API 和 Emby 反代服务：管理面板默认监听 `8090`，反代端口在面板中按服务器单独配置。面板会自动维护 IP 归属数据库，并在实时播放、封禁记录、播放日志和反代请求明细中显示 IP 的国家、省市、区县和运营商信息。
 
-302 直链反代实现原理见 [docs/302-redirect.md](docs/302-redirect.md)。
+302 直链反代实现原理见 [docs/302-redirect.md](docs/302-redirect.md)；链路诊断字段、保存策略与分享边界见 [docs/diagnostics.md](docs/diagnostics.md)。
 
 ## 功能
 
@@ -31,6 +31,7 @@ EmbyPanel 是一个 Rust + Vue 实现的 Emby STRM 直链反代面板。后端�
 │   └── config.toml.example        # 配置模板；运行数据库和日志不提交
 ├── docs/
 │   ├── 302-redirect.md            # 302 直链反代实现原理
+│   ├── diagnostics.md             # 链路诊断字段、保存策略与分享边界
 │   └── changelog.md               # 版本更新日志
 ├── frontend/
 │   ├── src/                       # Vue 面板源码

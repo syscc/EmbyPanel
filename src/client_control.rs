@@ -1027,10 +1027,13 @@ async fn send_webhook(
     if let Some(secret) = secret.map(str::trim).filter(|value| !value.is_empty()) {
         request = request.header("X-Webhook-Secret", secret);
     }
-    tokio::time::timeout(std::time::Duration::from_secs(5), request.send())
-        .await
-        .map_err(|_| AppError::BadGateway("webhook request timed out".to_string()))??
-        .error_for_status()?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::diagnostics::network::send(request),
+    )
+    .await
+    .map_err(|_| AppError::BadGateway("webhook request timed out".to_string()))??
+    .error_for_status()?;
     Ok(())
 }
 

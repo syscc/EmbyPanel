@@ -5,7 +5,7 @@ use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Hard cap for management list/search responses.
 pub const MAX_ENTRY_LIST: usize = 500;
@@ -129,9 +129,23 @@ impl DirectLinkCachePolicy {
 }
 
 #[derive(Clone)]
+struct DirectLinkEntry {
+    value: String,
+    created: Instant,
+}
+
+/// A single lookup observation; `remaining_ttl_ms` never resets on access.
+pub(crate) struct DirectLinkLookup {
+    pub value: Option<String>,
+    pub enabled: bool,
+    pub ttl_seconds: u64,
+    pub remaining_ttl_ms: Option<u64>,
+}
+
+#[derive(Clone)]
 struct CacheBucket {
     policy: DirectLinkCachePolicy,
-    inner: Cache<String, String>,
+    inner: Cache<String, DirectLinkEntry>,
 }
 
 impl CacheBucket {
@@ -395,29 +409,61 @@ impl DirectLinkCache {
     }
 
     pub async fn set(&self, key: String, value: String) {
+        self.set_observed(key, value).await;
+    }
+
+    /// Returns whether insertion was enabled; does not promise retention after eviction.
+    pub(crate) async fn set_observed(&self, key: String, value: String) -> bool {
         let parsed = Self::parse_key(&key);
         let bucket =
             self.get_cache_for_server(parsed.as_ref().map(|value| value.server_id.as_str()));
         if bucket.is_enabled() {
-            bucket.inner.insert(key, value).await;
+            bucket
+                .inner
+                .insert(
+                    key,
+                    DirectLinkEntry {
+                        value,
+                        created: Instant::now(),
+                    },
+                )
+                .await;
+            true
+        } else {
+            false
         }
     }
 
     pub async fn get(&self, key: &str) -> Option<String> {
+        self.get_observed(key).await.value
+    }
+
+    /// Same lookup/statistics/scope as `get`, with metadata from that exact entry.
+    pub(crate) async fn get_observed(&self, key: &str) -> DirectLinkLookup {
         let parsed = Self::parse_key(key);
         let bucket =
             self.get_cache_for_server(parsed.as_ref().map(|value| value.server_id.as_str()));
-        let value = if bucket.is_enabled() {
+        let entry = if bucket.is_enabled() {
             bucket.inner.get(key).await
         } else {
             None
         };
-        if value.is_some() {
+        if entry.is_some() {
             self.hit_count.fetch_add(1, Ordering::Relaxed);
         } else {
             self.miss_count.fetch_add(1, Ordering::Relaxed);
         }
-        value
+        let remaining_ttl_ms = entry.as_ref().map(|entry| {
+            Duration::from_secs(bucket.policy.ttl_seconds)
+                .saturating_sub(entry.created.elapsed())
+                .as_millis() as u64
+        });
+        DirectLinkLookup {
+            value: entry.map(|entry| entry.value),
+            enabled: bucket.is_enabled(),
+            ttl_seconds: bucket.policy.ttl_seconds,
+            remaining_ttl_ms,
+        }
     }
 
     /// Backward-compatible raw-key search used by internal callers and tests.
@@ -772,6 +818,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observed_lookup_preserves_ttl_statistics_and_disabled_buckets() {
+        let cache = DirectLinkCache::new_with_server_policies(
+            policy(true, 1, 10),
+            [("disabled".to_string(), policy(false, 90, 10))],
+        );
+        let cache_key = DirectLinkCache::key("enabled", "movie", "source", "UA");
+        assert!(
+            cache
+                .set_observed(cache_key.clone(), "synthetic-url".to_string())
+                .await
+        );
+        let first = cache.get_observed(&cache_key).await;
+        assert_eq!(first.value.as_deref(), Some("synthetic-url"));
+        assert_eq!(first.ttl_seconds, 1);
+        tokio::time::sleep(TokioDuration::from_millis(25)).await;
+        let second = cache.get_observed(&cache_key).await;
+        assert!(second.remaining_ttl_ms.unwrap() < first.remaining_ttl_ms.unwrap());
+        assert!(cache.get(&cache_key).await.is_some());
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.hits, 3);
+        assert_eq!(stats.misses, 0);
+        assert_eq!(stats.capacity, 1);
+        let disabled_key = DirectLinkCache::key("disabled", "movie", "source", "UA");
+        assert!(
+            !cache
+                .set_observed(disabled_key.clone(), "ignored".to_string())
+                .await
+        );
+        let disabled = cache.get_observed(&disabled_key).await;
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.ttl_seconds, 90);
+        assert!(disabled.value.is_none() && disabled.remaining_ttl_ms.is_none());
+        tokio::time::sleep(TokioDuration::from_millis(1050)).await;
+        let expired = cache.get_observed(&cache_key).await;
+        assert!(expired.enabled);
+        assert!(expired.value.is_none() && expired.remaining_ttl_ms.is_none());
+        assert_eq!(cache.get_stats().await.misses, 2);
+    }
+
+    #[tokio::test]
     async fn ttl_expire_cleanup() {
         let cache = DirectLinkCache::new(true, 1, 100);
         let cache_key = key("server1", "media1", "default", "ua");
@@ -1024,14 +1110,26 @@ mod tests {
         cache
             .default_bucket
             .inner
-            .insert(duplicate_key.clone(), "url-default".to_string())
+            .insert(
+                duplicate_key.clone(),
+                DirectLinkEntry {
+                    value: "url-default".to_string(),
+                    created: Instant::now(),
+                },
+            )
             .await;
         cache
             .server_buckets
             .get("server-a")
             .unwrap()
             .inner
-            .insert(duplicate_key, "url-server".to_string())
+            .insert(
+                duplicate_key,
+                DirectLinkEntry {
+                    value: "url-server".to_string(),
+                    created: Instant::now(),
+                },
+            )
             .await;
         for bucket in cache.all_buckets() {
             bucket.inner.run_pending_tasks().await;
@@ -1204,7 +1302,13 @@ mod tests {
                     cache
                         .default_bucket
                         .inner
-                        .insert(raw_key, "duplicate-url".to_string())
+                        .insert(
+                            raw_key,
+                            DirectLinkEntry {
+                                value: "duplicate-url".to_string(),
+                                created: Instant::now(),
+                            },
+                        )
                         .await;
                 }
             }

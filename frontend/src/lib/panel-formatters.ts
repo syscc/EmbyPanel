@@ -50,14 +50,20 @@ export function formatLogTime(value: number, locale: Locale) {
   return new Date(value).toLocaleString(locale)
 }
 
-export function formatTimestampMs(value: number | null | undefined, locale: Locale) {
-  if (!value || !Number.isFinite(value)) return '--'
-  return new Date(value).toLocaleString(locale)
+export function formatTimestampMs(
+  value: number | null | undefined,
+  locale: Locale,
+  options?: Intl.DateTimeFormatOptions,
+) {
+  if (!value || !Number.isFinite(value) || value < 0) return '--'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? '--' : date.toLocaleString(locale, options)
 }
 
 export function requestOutcomeClass(row: ProxyRequestDetail) {
   if (row.event_type === 'unblock') return 'ok'
   if (row.blocked) return 'blocked'
+  if (row.status_code === 0) return 'warn'
   if (row.cache_hit) return 'cache'
   if (row.status_code >= 500) return 'error'
   if (row.status_code >= 400) return 'warn'
