@@ -5,6 +5,22 @@ export function isHttpUrl(value: string) {
   return trimmed.startsWith('http://') || trimmed.startsWith('https://')
 }
 
+export function formatLogDetail(value: string) {
+  const detail = value.replace(/^request_id=diag-[a-zA-Z0-9-]{1,120}(?:\s+|$)/, '')
+  const trimmed = detail.trim()
+  if (!/^https?:\/\/\S+$/i.test(trimmed)) return detail
+
+  try {
+    new URL(trimmed)
+    return trimmed
+      .split(/[?#]/, 1)[0]!
+      .replace(/^(https?:\/\/)[^/]*@/i, '$1')
+      .replace(/^https?:/i, (scheme) => scheme.toLowerCase())
+  } catch {
+    return detail
+  }
+}
+
 export function emptyToNull(value: string | null) {
   const trimmed = value?.trim() ?? ''
   return trimmed || null

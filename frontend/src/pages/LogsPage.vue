@@ -6,8 +6,10 @@ import {
   Settings2,
   SlidersHorizontal,
 } from '@lucide/vue'
+import { computed } from 'vue'
 import RefreshButton from '@/components/ui/RefreshButton.vue'
 import { usePanelContext } from '@/composables/panel-context'
+import { formatLogDetail } from '@/lib/panel-formatters'
 
 const {
   logsLoading,
@@ -57,6 +59,13 @@ const {
   requestPathTypeLabel,
   saveLogConfig,
 } = usePanelContext()
+
+const displayActivityLogRows = computed(() =>
+  visibleActivityLogRows.value.map((entry) => ({
+    ...entry,
+    displayDetail: formatLogDetail(entry.detail),
+  })),
+)
 </script>
 
 <template>
@@ -210,7 +219,7 @@ const {
       >
         <template v-if="!isRequestDetailLogView">
           <article
-            v-for="entry in visibleActivityLogRows"
+            v-for="entry in displayActivityLogRows"
             :key="`activity-${entry.id}`"
             :class="['log-entry', entry.kind, entry.level]"
           >
@@ -231,14 +240,14 @@ const {
               </div>
               <p :class="{ 'log-detail': entry.kind === 'playback' }">
                 <a
-                  v-if="entry.detail && isHttpUrl(entry.detail)"
+                  v-if="entry.displayDetail && isHttpUrl(entry.displayDetail)"
                   class="copy-link"
                   href="#"
                   :title="t('点击复制链接')"
-                  @click.prevent="copyText(entry.detail)"
-                  >{{ entry.detail }}</a
+                  @click.prevent="copyText(entry.displayDetail)"
+                  >{{ entry.displayDetail }}</a
                 >
-                <template v-else>{{ entry.detail || t('暂无详情') }}</template>
+                <template v-else>{{ entry.displayDetail || t('暂无详情') }}</template>
               </p>
             </div>
           </article>
