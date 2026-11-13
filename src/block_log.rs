@@ -400,7 +400,7 @@ fn matches_filter(
     }
     if let Some(keyword) = keyword {
         let haystack = format!(
-            "{} {} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {} {}",
             entry.event_type,
             entry.server_name,
             entry.method,
@@ -409,7 +409,9 @@ fn matches_filter(
             entry.outcome,
             entry.playback_user,
             entry.playback_ip,
-            entry.detail
+            entry.detail,
+            // The UI shows the decoded detail, so a search has to match it too.
+            crate::diagnostics::decode_log_detail_url(&entry.detail),
         )
         .to_ascii_lowercase();
         if !haystack.contains(keyword) {
@@ -479,6 +481,54 @@ fn backup_path(path: &Path, index: u64) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_log_keyword_matches_the_decoded_detail() {
+        let path = std::env::temp_dir().join(format!(
+            "embypanel-block-keyword-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = BlockLogStore {
+            path: path.clone(),
+            lock: Mutex::new(()),
+        };
+        store.record(BlockLogInsert {
+            event_type: "request",
+            timestamp_ms: 1,
+            server_id: "a",
+            server_name: "Server",
+            port: 8096,
+            method: "GET",
+            path: "/videos/1/stream",
+            path_type: "video_stream",
+            status_code: 302,
+            outcome: "redirect",
+            duration_ms: 1,
+            playback_user: "user",
+            playback_ip: "127.0.0.1",
+            ip_location_text: "",
+            cache_hit: false,
+            detail: "request_id=diag-0123456789abcdef0123456789abcdef https://cdn.example.com/%E9%87%8D%E5%99%A8.S01E21.mkv",
+        });
+
+        let filter = |keyword: &'static str| BlockLogFilter {
+            keyword: Some(keyword),
+            limit: 10,
+            ..Default::default()
+        };
+        // The decoded form is what the UI shows.
+        assert_eq!(store.list(filter("重器")).unwrap().len(), 1);
+        // The stored percent-encoded form keeps matching as before.
+        assert_eq!(store.list(filter("%E9%87%8D")).unwrap().len(), 1);
+        // Unrelated keywords do not match.
+        assert_eq!(store.list(filter("不存在")).unwrap().len(), 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn scoped_block_logs_filter_before_limit_across_rotated_files() {

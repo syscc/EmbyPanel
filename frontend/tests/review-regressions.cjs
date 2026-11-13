@@ -2991,6 +2991,7 @@ test('cancelled request logs with no HTTP response never display HTTP 0 or succe
     requestSeverityLabel: harness.panel.requestSeverityLabel,
     requestRowTitle: () => 'Synthetic request', requestPathTypeLabel: () => '视频流',
     formatLogTime: () => 'Synthetic time', ipWithLocation: () => '—',
+    isHttpUrl: (value) => /^https?:\/\//.test(value || ''), copyText: () => {},
     visibleActivityLogRows: [], logServers: [], logLevelOptions: [],
     requestDetailDisplayMax: 100, requestDetailPersistDays: 7, requestDetailPersistMax: 10000,
     visibleLogCount: 1, logConfig: { level: 'info', max_size_mb: 20, max_backups: 5, format: '' },
@@ -3314,4 +3315,111 @@ test('logout resets the profile capability and late config results cannot restor
   assert.equal(harness.panel.logConfigError.value, '')
   assert.equal(harness.panel.logConfigLoading.value, false)
   assert.equal(harness.intervals.size, 0)
+})
+
+test('log detail decodes percent-encoded file names while keeping the URL safe to display', () => {
+  const { formatLogDetail } = load('lib/panel-formatters.ts')
+
+  const encoded = 'https://cdnfhnfile.115cdn.net/6a85c50005280c9e3783957009a8f86d1975a5d4/%E9%87%8D%E5%99%A8.S01E21.1080p.WEB-DL.H264.DDP%205.1-Pure%40HDSWEB.mkv'
+  assert.equal(
+    formatLogDetail(encoded),
+    'https://cdnfhnfile.115cdn.net/6a85c50005280c9e3783957009a8f86d1975a5d4/重器.S01E21.1080p.WEB-DL.H264.DDP 5.1-Pure@HDSWEB.mkv',
+  )
+
+  // Query, fragment and credentials stay stripped after decoding.
+  assert.equal(
+    formatLogDetail('https://user:pass@example.com/a%20b/file%23name.mkv?token=secret#frag'),
+    'https://example.com/a b/file%23name.mkv',
+  )
+
+  // A segment that would decode into a path separator or a query/fragment
+  // marker stays encoded so the displayed URL keeps pointing at the same file.
+  assert.equal(
+    formatLogDetail('https://example.com/dir/a%2Fb.mkv'),
+    'https://example.com/dir/a%2Fb.mkv',
+  )
+
+  // Malformed escapes must not throw and must not corrupt the display value.
+  assert.equal(formatLogDetail('https://example.com/100%25/ok.mkv'), 'https://example.com/100%/ok.mkv')
+  assert.equal(formatLogDetail('https://example.com/bad%ZZ.mkv'), 'https://example.com/bad%ZZ.mkv')
+  assert.equal(formatLogDetail('https://example.com/trunc%E9%87.mkv'), 'https://example.com/trunc%E9%87.mkv')
+
+  // Control characters would break the CSV layout, so they stay encoded.
+  assert.equal(
+    formatLogDetail('https://example.com/a%0Ab.mkv'),
+    'https://example.com/a%0Ab.mkv',
+  )
+
+  // A malformed escape keeps the whole segment encoded, including the valid
+  // escapes next to it, so the backend and the frontend agree.
+  assert.equal(
+    formatLogDetail('https://example.com/a%ZZb%20c.mkv'),
+    'https://example.com/a%ZZb%20c.mkv',
+  )
+
+  // A credential separator stays encoded so the storage-time redaction cannot
+  // be bypassed by decoding.
+  assert.equal(
+    formatLogDetail('https://example.com/x/api_key%3DSECRET.mkv'),
+    'https://example.com/x/api_key%3DSECRET.mkv',
+  )
+
+  // The origin is never percent-decoded.
+  assert.equal(formatLogDetail('https://%65xample.com/a.mkv'), 'https://%65xample.com/a.mkv')
+
+  // Non-URL details are untouched.
+  assert.equal(formatLogDetail('重器 S01E21 直接播放'), '重器 S01E21 直接播放')
+  assert.equal(formatLogDetail('request_id=diag-abc123 重器 S01E21'), '重器 S01E21')
+
+  // The scheme is lower-cased like before.
+  assert.equal(formatLogDetail('HTTPS://Example.com/A.mkv'), 'https://Example.com/A.mkv')
+})
+
+test('log detail copy value keeps the raw percent-encoded URL so it stays valid', () => {
+  const { copyableLogDetail } = load('lib/panel-formatters.ts')
+
+  // The copy value is built from the raw detail: it is trimmed but never
+  // decoded, so segments the decode rules keep encoded are not re-encoded.
+  assert.equal(
+    copyableLogDetail('request_id=diag-0123456789abcdef0123456789abcdef https://cdn.example.com/%E9%87%8D%E5%99%A8.S01E21%20DDP.mkv?token=secret'),
+    'https://cdn.example.com/%E9%87%8D%E5%99%A8.S01E21%20DDP.mkv',
+  )
+  assert.equal(
+    copyableLogDetail('https://h/Movie%3D1080p.mkv'),
+    'https://h/Movie%3D1080p.mkv',
+  )
+  assert.equal(
+    copyableLogDetail('https://user:secret@h/a.mkv#frag'),
+    'https://h/a.mkv',
+  )
+  assert.equal(copyableLogDetail('重器 S01E21 直接播放'), '重器 S01E21 直接播放')
+  assert.equal(copyableLogDetail(''), '')
+})
+
+test('the request detail view renders the decoded detail as a copyable link', async () => {
+  const row = {
+    id: 1, server_id: 'server-a', server_name: 'Synthetic', status_code: 302,
+    event_type: 'request', method: 'GET', path_type: 'video_stream', path: '/videos/fixture/stream',
+    outcome: '已重定向', cache_hit: false, blocked: false,
+    detail: 'request_id=diag-0123456789abcdef0123456789abcdef https://cdn.example.com/%E9%87%8D%E5%99%A8.S01E21%20DDP.mkv?token=secret',
+    timestamp_ms: 1767323045123, duration_ms: 5,
+  }
+  const html = await renderPage('LogsPage.vue', {
+    t, filteredRequestDetailRows: [row], isRequestDetailLogView: true,
+    requestOutcomeClass: () => 'ok', requestSeverity: () => 'info',
+    requestSeverityLabel: () => '已重定向',
+    requestRowTitle: () => 'Synthetic request', requestPathTypeLabel: () => '视频流',
+    formatLogTime: () => 'Synthetic time', ipWithLocation: () => '—',
+    isHttpUrl: (value) => /^https?:\/\//.test(value || ''), copyText: () => {},
+    visibleActivityLogRows: [], logServers: [], logLevelOptions: [],
+    requestDetailDisplayMax: 100, requestDetailPersistDays: 7, requestDetailPersistMax: 10000,
+    visibleLogCount: 1, logConfig: { level: 'info', max_size_mb: 20, max_backups: 5, format: '' },
+  })
+  // The decoded file name is visible and the raw escapes are gone.
+  assert.match(html, /重器\.S01E21 DDP\.mkv/)
+  assert.doesNotMatch(html, /%E9%87%8D%E5%99%A8/)
+  assert.doesNotMatch(html, /request_id=diag-/)
+  assert.doesNotMatch(html, /token=secret/)
+  // It is rendered as the same copyable link the playback log view uses.
+  assert.match(html, /copy-link/)
 })

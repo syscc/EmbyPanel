@@ -6,10 +6,10 @@ import {
   Settings2,
   SlidersHorizontal,
 } from '@lucide/vue'
-import { computed } from 'vue'
+import { computed, unref } from 'vue'
 import RefreshButton from '@/components/ui/RefreshButton.vue'
 import { usePanelContext } from '@/composables/panel-context'
-import { formatLogDetail } from '@/lib/panel-formatters'
+import { copyableLogDetail, formatLogDetail } from '@/lib/panel-formatters'
 
 const {
   logsLoading,
@@ -61,9 +61,20 @@ const {
 } = usePanelContext()
 
 const displayActivityLogRows = computed(() =>
-  visibleActivityLogRows.value.map((entry) => ({
+  unref(visibleActivityLogRows).map((entry) => ({
     ...entry,
     displayDetail: formatLogDetail(entry.detail),
+    copyDetail: copyableLogDetail(entry.detail),
+  })),
+)
+
+// The request-detail and block views read their detail from the proxy detail
+// store, so the same formatting keeps every log view consistent.
+const displayRequestDetailRows = computed(() =>
+  unref(filteredRequestDetailRows).map((row) => ({
+    ...row,
+    displayDetail: formatLogDetail(row.detail),
+    copyDetail: copyableLogDetail(row.detail),
   })),
 )
 </script>
@@ -244,7 +255,7 @@ const displayActivityLogRows = computed(() =>
                   class="copy-link"
                   href="#"
                   :title="t('点击复制链接')"
-                  @click.prevent="copyText(entry.displayDetail)"
+                  @click.prevent="copyText(entry.copyDetail)"
                   >{{ entry.displayDetail }}</a
                 >
                 <template v-else>{{ entry.displayDetail || t('暂无详情') }}</template>
@@ -254,7 +265,7 @@ const displayActivityLogRows = computed(() =>
         </template>
         <template v-else>
           <article
-            v-for="row in filteredRequestDetailRows"
+            v-for="row in displayRequestDetailRows"
             :key="`proxy-${row.id}`"
             :class="['request-detail-row', requestOutcomeClass(row)]"
           >
@@ -274,7 +285,17 @@ const displayActivityLogRows = computed(() =>
               </div>
               <div class="request-path">
                 <strong>{{ requestRowTitle(row) }}</strong>
-                <span>{{ row.detail }}</span>
+                <a
+                  v-if="row.displayDetail && isHttpUrl(row.displayDetail)"
+                  class="copy-link"
+                  href="#"
+                  :title="t('点击复制链接')"
+                  @click.prevent="copyText(row.copyDetail)"
+                  >{{ row.displayDetail }}</a
+                >
+                <template v-else
+                  ><span>{{ row.displayDetail || t('暂无详情') }}</span></template
+                >
               </div>
             </div>
             <div class="request-state">

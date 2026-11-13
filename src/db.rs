@@ -3281,33 +3281,28 @@ impl SettingsStore {
             conditions.push("timestamp_ms <= ?");
             values.push(Box::new(until_ms as i64));
         }
-        if let Some(keyword) = filter
+        let keyword = filter
             .keyword
             .map(str::trim)
             .filter(|value| !value.is_empty())
-        {
-            let keyword = format!("%{}%", keyword.to_ascii_lowercase());
-            conditions.push(
-                r#"(lower(server_name) LIKE ?
-                    OR lower(method) LIKE ?
-                    OR lower(path) LIKE ?
-                    OR lower(path_type) LIKE ?
-                    OR lower(outcome) LIKE ?
-                    OR lower(playback_user) LIKE ?
-                    OR lower(playback_ip) LIKE ?
-                    OR lower(detail) LIKE ?)"#,
-            );
-            for _ in 0..8 {
-                values.push(Box::new(keyword.clone()));
-            }
-        }
+            .map(|value| value.to_ascii_lowercase());
+        // The keyword is matched in Rust because the detail column also has to
+        // match its decoded form, which SQLite cannot do. Filtering it in SQL
+        // would drop the rows that only match after decoding.
 
         let where_clause = if conditions.is_empty() {
             String::new()
         } else {
             format!("WHERE {}", conditions.join(" AND "))
         };
-        let limit = filter.limit.clamp(1, 500) as i64;
+        let requested_limit = filter.limit.clamp(1, 500);
+        // Widen the candidate window when a keyword is present so rows whose
+        // decoded detail matches are not cut off before the Rust filter runs.
+        let limit = if keyword.is_some() {
+            requested_limit.saturating_mul(4).min(2_000)
+        } else {
+            requested_limit
+        } as i64;
         values.push(Box::new(limit));
         let params = values
             .iter()
@@ -3346,7 +3341,27 @@ impl SettingsStore {
                 detail: row.get(15)?,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let mut results = rows.collect::<Result<Vec<_>, _>>()?;
+        if let Some(keyword) = keyword.as_ref() {
+            results.retain(|entry| {
+                let haystack = format!(
+                    "{} {} {} {} {} {} {} {} {}",
+                    entry.server_name,
+                    entry.method,
+                    entry.path,
+                    entry.path_type,
+                    entry.outcome,
+                    entry.playback_user,
+                    entry.playback_ip,
+                    entry.detail,
+                    crate::diagnostics::decode_log_detail_url(&entry.detail),
+                )
+                .to_ascii_lowercase();
+                haystack.contains(keyword)
+            });
+            results.truncate(requested_limit);
+        }
+        Ok(results)
     }
 
     pub fn list_blocked_proxy_request_details(
@@ -5721,6 +5736,74 @@ mod tests {
         assert_eq!(details.len(), 1);
         assert_eq!(details[0].path, "/videos/1/stream");
         assert!(details[0].cache_hit);
+
+        drop(store);
+        remove_test_database(&path);
+    }
+
+    #[test]
+    fn proxy_request_detail_keyword_matches_the_decoded_detail() {
+        let path = test_database_path("proxy-detail-keyword");
+        let store = SettingsStore::open_for_test(path.clone()).unwrap();
+        let writes = vec![TelemetryWrite::ProxyRequestDetail(ProxyRequestDetailWrite {
+                timestamp_ms: now_ms(),
+                server_id: "server-a".to_string(),
+                server_name: "Server A".to_string(),
+                port: 8096,
+                method: "GET".to_string(),
+                path: "/videos/1/stream".to_string(),
+                path_type: "video_stream".to_string(),
+                status_code: 302,
+                outcome: "redirect".to_string(),
+                duration_ms: 12,
+                playback_user: "alice".to_string(),
+                playback_ip: "192.0.2.10".to_string(),
+                cache_hit: false,
+                blocked: false,
+                detail: "request_id=diag-0123456789abcdef0123456789abcdef https://cdn.example.com/%E9%87%8D%E5%99%A8.S01E21.mkv".to_string(),
+            })];
+        store.write_telemetry_batch(&writes).unwrap();
+
+        // The decoded form is what the UI shows.
+        let detail_filter = |keyword: &'static str| ProxyRequestDetailFilter {
+            server_id: None,
+            path_type: None,
+            keyword: Some(keyword),
+            since_ms: None,
+            until_ms: None,
+            limit: 10,
+        };
+        assert_eq!(
+            store
+                .list_proxy_request_details(detail_filter("重器"))
+                .unwrap()
+                .len(),
+            1
+        );
+        // The stored percent-encoded form keeps matching as before.
+        assert_eq!(
+            store
+                .list_proxy_request_details(detail_filter("%E9%87%8D"))
+                .unwrap()
+                .len(),
+            1
+        );
+        // Unrelated keywords do not match.
+        assert_eq!(
+            store
+                .list_proxy_request_details(detail_filter("不存在"))
+                .unwrap()
+                .len(),
+            0
+        );
+        // A keyword that only exists in another column still matches.
+        assert_eq!(
+            store
+                .list_proxy_request_details(detail_filter("alice"))
+                .unwrap()
+                .len(),
+            1
+        );
 
         drop(store);
         remove_test_database(&path);

@@ -1599,6 +1599,119 @@ pub fn sanitize_diagnosis_step(mut step: DiagnosisStep) -> DiagnosisStep {
 /// - Redact Bearer/Basic schemes and JSON string values for sensitive keys.
 /// - Preserve non-sensitive media identifiers and surrounding context.
 /// - Enforce max detail length.
+/// Percent-decodes the path of a pure http(s) URL so encoded file names read as
+/// plain text. The correlation marker the frontend strips is kept as-is.
+/// Mixed text, other schemes, malformed escapes and segments that would decode
+/// into a path separator, a query marker or a credential separator stay encoded.
+pub(crate) fn decode_log_detail_url(detail: &str) -> String {
+    let (prefix, rest) = split_correlation_prefix(detail);
+    let decoded = decode_url_path(rest);
+    format!("{prefix}{decoded}")
+}
+
+/// Splits the leading `request_id=diag-<id> ` marker so the remainder can be
+/// treated as a URL on its own. The marker itself is returned unchanged.
+fn split_correlation_prefix(detail: &str) -> (&str, &str) {
+    let Some(rest) = detail.strip_prefix("request_id=diag-") else {
+        return ("", detail);
+    };
+    let id_len = rest
+        .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-'))
+        .unwrap_or(rest.len());
+    if id_len == 0 || id_len > 120 {
+        return ("", detail);
+    }
+    let after_id = &rest[id_len..];
+    let remainder = after_id.trim_start();
+    if remainder.len() == after_id.len() {
+        // The marker is not followed by whitespace, so it is not a marker.
+        return ("", detail);
+    }
+    let prefix_len = detail.len() - remainder.len();
+    (&detail[..prefix_len], remainder)
+}
+
+fn decode_url_path(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() || trimmed.split_whitespace().count() != 1 {
+        return url.to_string();
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    if !(lowered.starts_with("http://") || lowered.starts_with("https://")) {
+        return url.to_string();
+    }
+    let Some(scheme_end) = trimmed.find("://") else {
+        return url.to_string();
+    };
+    let Some(path_start) = trimmed[scheme_end + 3..]
+        .find('/')
+        .map(|offset| scheme_end + 3 + offset)
+    else {
+        return url.to_string();
+    };
+
+    let origin = &trimmed[..path_start];
+    let rest = &trimmed[path_start..];
+    let (path, suffix) = match rest.find(['?', '#']) {
+        Some(index) => (&rest[..index], &rest[index..]),
+        None => (rest, ""),
+    };
+    if !path.contains('%') {
+        return url.to_string();
+    }
+
+    let decoded = path
+        .split('/')
+        .map(decode_percent_segment)
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("{origin}{decoded}{suffix}")
+}
+
+fn decode_percent_segment(segment: &str) -> String {
+    if !segment.contains('%') {
+        return segment.to_string();
+    }
+    if has_invalid_percent_escape(segment) {
+        return segment.to_string();
+    }
+    match urlencoding::decode(segment) {
+        Ok(decoded)
+            if !decoded.contains(['/', '?', '#', '=', ':'])
+                && !contains_control_chars(&decoded) =>
+        {
+            decoded.into_owned()
+        }
+        _ => segment.to_string(),
+    }
+}
+
+/// Detects a `%` that is not followed by two hex digits. Such a segment stays
+/// encoded so it matches the frontend rule.
+fn has_invalid_percent_escape(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'%' {
+            continue;
+        }
+        let valid = bytes
+            .get(index + 1)
+            .zip(bytes.get(index + 2))
+            .map(|(high, low)| high.is_ascii_hexdigit() && low.is_ascii_hexdigit())
+            .unwrap_or(false);
+        if !valid {
+            return true;
+        }
+    }
+    false
+}
+
+/// Control characters would break the single-line CSV layout, so a segment that
+/// decodes into one stays percent-encoded.
+fn contains_control_chars(value: &str) -> bool {
+    value.chars().any(char::is_control)
+}
+
 pub fn sanitize_diagnostic_text(input: &str) -> String {
     let stripped: String = input.chars().filter(|ch| !ch.is_control()).collect();
     if stripped.is_empty() {

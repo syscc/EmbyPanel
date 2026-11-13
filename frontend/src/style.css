@@ -638,16 +638,7 @@ label > span {
 }
 
 .playing-panel {
-  grid-column: 1 / -1;
   min-width: 0;
-}
-
-.operations-panel {
-  grid-column: 1 / -1;
-}
-
-.rate-limit-overview {
-  grid-column: 1 / -1;
 }
 
 .connectivity-list {
@@ -692,7 +683,7 @@ label > span {
   min-width: 0;
   max-width: 100%;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 480px), 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr));
   gap: 12px;
   max-height: 410px;
   overflow-y: auto;
@@ -705,13 +696,13 @@ label > span {
 
 .play-card {
   display: grid;
-  grid-template-columns: 152px minmax(0, 1fr);
-  gap: 14px;
+  grid-template-columns: 104px minmax(0, 1fr);
+  gap: 12px;
   align-items: start;
   border: 1px solid var(--border-soft);
   border-radius: 8px;
   background: var(--subtle-bg);
-  padding: 12px;
+  padding: 10px;
   box-shadow: inset 0 1px 0 var(--glass-highlight);
 }
 
@@ -1955,7 +1946,8 @@ button.settings-card-main {
 }
 
 .request-path strong,
-.request-path span {
+.request-path span,
+.request-path a.copy-link {
   min-width: 0;
   overflow-wrap: anywhere;
 }
@@ -1966,10 +1958,20 @@ button.settings-card-main {
   font-size: 13px;
 }
 
-.request-path span {
+.request-path span,
+.request-path a.copy-link {
   color: var(--muted);
   font-size: 12px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* The request path keeps the whole URL visible so the decoded file name at the
+   end of it stays readable instead of being clipped away. */
+.request-path a.copy-link {
+  display: block;
+  -webkit-line-clamp: unset;
+  line-clamp: unset;
+  overflow: visible;
 }
 
 .request-state {
@@ -2685,10 +2687,6 @@ textarea:focus {
 
   .stat-grid.three {
     grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-
-  .playback-strip {
-    grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr));
   }
 
   .settings-card-grid {
@@ -3892,6 +3890,197 @@ label > span {
 .rate-limit-overview,
 .playing-panel {
   border-top: 1px solid var(--glass-border);
+}
+
+/* Home overview module layout and the dashboard settings dialog. */
+.overview-module {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.overview-module.is-wide {
+  grid-column: 1 / -1;
+}
+
+.overview-module > .panel {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Teleport target for page-level actions rendered inside the top bar. */
+.page-action-slot {
+  display: contents;
+}
+
+/* Matches the other top-bar actions so the button follows the active theme. */
+.overview-layout-fab {
+  position: relative;
+  flex: 0 0 auto;
+  display: inline-grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  padding: 0;
+  border: 1px solid var(--border-soft);
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--panel-bg) 72%, transparent);
+  color: var(--text-soft);
+  box-shadow: none;
+  cursor: pointer;
+}
+
+.overview-layout-fab:hover {
+  border-color: var(--border-strong);
+  background: color-mix(in srgb, var(--panel-bg) 86%, transparent);
+  color: var(--text);
+}
+
+.overview-layout-fab-label {
+  position: absolute;
+  right: calc(100% + 10px);
+  top: 50%;
+  transform: translateY(-50%) translateX(6px);
+  padding: 6px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--panel-bg);
+  color: var(--text);
+  box-shadow: 0 10px 26px var(--shadow-soft);
+  font-size: var(--font-size-control);
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.16s ease, transform 0.16s ease;
+}
+
+.overview-layout-fab:hover .overview-layout-fab-label,
+.overview-layout-fab:focus-visible .overview-layout-fab-label {
+  opacity: 1;
+  transform: translateY(-50%) translateX(0);
+}
+
+/* Dashboard layout dialog. */
+.overview-layout-dialog-content {
+  width: min(520px, calc(100vw - 32px));
+}
+
+.overview-layout-list {
+  display: grid;
+  gap: 8px;
+  padding: 16px 18px;
+  margin: 0;
+  list-style: none;
+}
+
+.overview-layout-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-left: 3px solid transparent;
+  border-radius: 8px;
+  background: var(--button-bg);
+  color: var(--muted);
+  cursor: default;
+  transition: background 0.16s ease, border-color 0.16s ease;
+}
+
+.overview-layout-item .check {
+  cursor: pointer;
+}
+
+.overview-layout-item.is-selected {
+  border-color: color-mix(in srgb, var(--brand) 38%, var(--border-soft));
+  border-left-color: var(--brand);
+  background: color-mix(in srgb, var(--brand) 12%, var(--panel-bg));
+  color: var(--text);
+}
+
+.overview-layout-item.is-selected .check > span {
+  font-weight: 700;
+}
+
+.overview-layout-item.is-dragging {
+  opacity: 0.55;
+}
+
+.overview-layout-item.is-drag-over {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--brand) 24%, transparent);
+}
+
+.overview-layout-item-main {
+  min-width: 0;
+}
+
+.overview-layout-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.overview-layout-move-button,
+.overview-layout-item-handle {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--panel-bg);
+  color: var(--muted-strong);
+}
+
+.overview-layout-move-button {
+  cursor: pointer;
+}
+
+.overview-layout-move-button:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--button-hover);
+}
+
+.overview-layout-move-button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.overview-layout-item-handle {
+  cursor: grab;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.overview-layout-item-handle:active {
+  cursor: grabbing;
+}
+
+.overview-layout-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 18px 16px;
+}
+
+/* The dashboard action button shrinks on phones. */
+@media (max-width: 700px) {
+  .overview-layout-fab {
+    width: 44px;
+    height: 44px;
+  }
+
+  .overview-layout-fab-label {
+    display: none;
+  }
 }
 
 .connectivity-row,

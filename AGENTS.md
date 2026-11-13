@@ -41,6 +41,7 @@
 - `data/embypanel.db`
 - `data/qqwry.ipdb`
 - `data/embypanel-dev.sh`
+- `data/clean-target.sh`
 - `Cargo.lock`
 - `frontend/package-lock.json`
 - `frontend/node_modules/`
@@ -51,6 +52,45 @@
 - 前端：`npx vite --host 0.0.0.0 --strictPort true`，监听 `http://localhost:8090/ui/`。
 
 执行任务时优先使用源码开发模式完成验证，不要生成 release 编译产物。
+
+## 编译成功后清理
+
+`data/clean-target.sh` 与 `data/embypanel-dev.sh` 是**本地开发工具，不在版本库**（`.gitignore` 忽略 `data/*`，只保留 `data/config.toml.example`）。新克隆的环境里没有这两个脚本，此时应直接跳过清理而不是报错。
+
+每次源码重新编译成功后，有该脚本时必须清理上一轮编译遗留的过时产物，避免 `target/debug` 无限膨胀。
+
+执行时机：
+
+- `cargo check`、`cargo test`、`cargo build` 等验证命令**成功结束后**再清理，且必须等所有 cargo / rustc 进程退出、最后一次编译完成之后再清理。
+- 编译失败时不清理。
+- 禁止与编译并行清理。清理脚本自身会先取 `target/debug/.cargo-lock` 的独占锁，遇到正在编译的 cargo 会直接跳过，并把原因写到 stderr。
+- 开发模式 `./data/embypanel-dev.sh -r` 启动成功后脚本已自动调用一次清理，不需要再手动重复执行。
+
+常用命令：
+
+```bash
+./data/clean-target.sh            # 清理并报告释放的空间
+./data/clean-target.sh --dry-run  # 只列出计划删除的内容，不做任何改动
+./data/clean-target.sh --quiet    # 只清理，不打印逐项报告
+./data/clean-target.sh --help     # 用法说明
+```
+
+清理范围与保留范围：
+
+- 只处理本项目 `target/debug/deps` 下 `emby302gateway_rs-<16位hash>` 形式的本 crate 可执行文件、该 crate 的 `*.rcgu.o` 对象文件，以及 `target/debug/incremental` 下 `emby302gateway_rs-<哈希>` 形式的本 crate 增量目录；不碰依赖产物。
+- 只处理在 `target/debug/.fingerprint/emby302gateway-rs-<hash>` 下存在 `bin-emby302gateway-rs` 或 `test-bin-emby302gateway-rs` 成功标记的编译单元；没有成功标记的一律保留。
+- 始终保留：最新的普通运行二进制和最新的测试二进制各一套；与 `target/debug/emby302gateway-rs` 同文件（硬链接）或内容相同的 `deps` 副本；依赖的 `lib*.rlib` / `*.rmeta`；`target/debug/emby302gateway-rs`；`target/debug/build`；`target/debug/.fingerprint`。
+- 顶层程序 `target/debug/emby302gateway-rs` 本身是软链接时，脚本按它**指向的真实文件**取 inode，并把该 inode 与同内容副本纳入保留集合，不会删掉软链接目标后留下悬空入口。
+- 对象文件只在对应二进制被本次清理删除、对象文件时间不晚于该成功二进制、且已不被任何保留二进制引用时才删除。macOS 默认 `split-debuginfo=unpacked` 时 DWARF 调试信息保存在 `*.rcgu.o` 内，脚本用 `dsymutil --dump-debug-map` 读取保留二进制的 debug map，被引用的对象文件一律保留；`dsymutil` 报告无法打开的对象文件同样受保护。
+- debug map 读取有 120 秒超时；超时、`dsymutil` 缺失，或输出的格式不被识别（stderr 会打印 `debug map output not understood (unsupported dsymutil format)`）时，脚本**保守降级**：保留当前二进制的整组对象文件，并且对本次要删除的二进制，只回收既**早于 48 小时**、又不晚于对应二进制时间的对象文件。48 小时保守窗口是降级时的兜底判据，48 小时内的新对象一律保留。
+- 降级与跳过的原因始终写 stderr，不受 `--quiet` 影响；`--quiet` 只抑制逐项报告。否则 `./data/embypanel-dev.sh -r` 里的静默调用会让清理失效而无任何痕迹。
+- 不保证清空所有过时对象文件：归属或时间关系无法确认的对象文件一律保留。
+- 增量缓存不是整目录删除：`target/debug/incremental` 下**最多保留 2 个** `emby302gateway_rs-<哈希>` 目录——按 mtime 最新的一个，加上当前运行程序所属编译单元的一个（同一目录不重复计）——每个保留目录内再保留**最新的一个** `s-*` session 目录，更旧的增量目录与更旧的 session 目录会被删除以回收空间。额外保留当前编译单元的目录，是为了保证该单元下次编译仍走增量缓存；否则它会退化为全量重编该单元（结果正确，只是更慢）。
+- `target/debug/incremental` 下不符合 `emby302gateway_rs-<哈希>` 形式的目录（例如其他 crate 的目录）一律跳过，并在清理报告里说明。
+- 清理范围不得离开 `target/debug`：`target/debug/deps`、`.fingerprint`、`incremental` 如果是指向「项目内但 `target/debug` 之外」位置（例如 `target/build`）的软链接，脚本拒绝清理并说明原因，而不是跟着软链接删到别处。
+- `deps` 里的 `*.rcgu.o` 与 `incremental` session 内的对象文件是同一 inode 的硬链接：只删 `deps` 副本不会释放磁盘。脚本先删旧增量目录/session，再删计划内的 `deps` 对象文件与过时可执行文件。
+- 报告里的 freed 是**真实释放量**：计划内的 `deps` 副本照常删除，但**计数**时只有 inode 的最后一个硬链接被删掉才计入 freed（因此可能为 0，这是真实结果而不是统计错误）。
+- 脚本以退出码 0 表示成功，删除失败会打印错误并返回非 0；清理失败不影响编译结果与运行中的服务。
 
 ## 模块复用与禁止重复造轮子
 

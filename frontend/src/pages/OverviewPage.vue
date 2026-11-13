@@ -8,11 +8,14 @@ import {
   PlayCircle,
   Server,
   ShieldCheck,
+  SlidersHorizontal,
   UserRound,
   Waypoints,
 } from '@lucide/vue'
-import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref, watch, type ComponentPublicInstance } from 'vue'
+import OverviewLayoutDialog from '@/components/OverviewLayoutDialog.vue'
 import RefreshButton from '@/components/ui/RefreshButton.vue'
+import { useOverviewLayout } from '@/composables/useOverviewLayout'
 import { usePanelContext } from '@/composables/panel-context'
 import type { PlaybackSession } from '@/types/panel'
 
@@ -52,11 +55,32 @@ const {
   formatTicks,
 } = usePanelContext()
 
+const {
+  playingVisible,
+  visibleModules,
+  draftModules,
+  editorOpen,
+  openEditor,
+  closeEditor,
+  applyDraft,
+  resetDraft,
+  toggleDraftModule,
+  moveDraftModule,
+  reorderDraft,
+} = useOverviewLayout()
+
 const serverList = ref<HTMLElement | null>(null)
 const artworkUrls = ref<Record<string, string>>({})
 const artworkRequests = new Map<string, AbortController>()
 const missingArtworkKeys = new Set<string>()
 let serverListObserver: ResizeObserver | undefined
+
+// The list lives inside a `v-for` over the rendered modules, so a plain template ref
+// would collect an array. A function ref keeps a single element (or null when the
+// media-library module is hidden), which the ResizeObserver setup depends on.
+function setServerListRef(el: Element | ComponentPublicInstance | null) {
+  serverList.value = el instanceof HTMLElement ? el : null
+}
 
 function artworkKey(session: PlaybackSession) {
   return `${session.server_id}:${session.item_id}`
@@ -132,6 +156,10 @@ function reconcileArtwork() {
     if (!activeKeys.has(key)) missingArtworkKeys.delete(key)
   })
 
+  // Artwork already fetched above is kept so a re-shown module reuses it; only new
+  // downloads are skipped while the playing module is hidden.
+  if (!playingVisible.value) return
+
   playbackSessions.value.forEach((session) => {
     if (!session.server_id || !session.item_id) return
     const key = artworkKey(session)
@@ -164,6 +192,16 @@ function playbackTitle(session: PlaybackSession) {
 
 function playbackPercent(session: PlaybackSession) {
   return Math.min(100, Math.max(0, session.percent ?? 0))
+}
+
+// The dialog is controlled by the layout composable: every close path (the ×
+// button, the footer cancel button, ESC and the overlay click) drops the draft.
+function handleEditorOpenChange(value: boolean) {
+  if (value) {
+    openEditor()
+    return
+  }
+  closeEditor()
 }
 
 function playbackModeLabel(mode: PlaybackSession['playback_mode']) {
@@ -207,7 +245,20 @@ async function observeServerList() {
 }
 
 watch(mediaOverviews, observeServerList, { flush: 'post' })
+// `v-if` rebuilds the list node when a module is hidden and restored; the fresh node
+// has to be re-observed or the max-height custom property stays unset.
+watch(serverList, (list) => {
+  if (!list) {
+    serverListObserver?.disconnect()
+    return
+  }
+  void observeServerList()
+}, { flush: 'post' })
 watch(playbackSessions, reconcileArtwork, { immediate: true })
+watch(playingVisible, (visible) => {
+  if (visible) reconcileArtwork()
+})
+
 onMounted(observeServerList)
 onBeforeUnmount(() => {
   serverListObserver?.disconnect()
@@ -220,7 +271,24 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="dashboard">
-    <section class="panel media-overview">
+    <Teleport to="#page-action-slot">
+      <button
+        class="overview-layout-fab"
+        type="button"
+        :aria-label="t('设置仪表板')"
+        @click="openEditor"
+      >
+        <SlidersHorizontal :size="20" aria-hidden="true" />
+        <span class="overview-layout-fab-label" aria-hidden="true">{{
+          t('设置仪表板')
+        }}</span>
+      </button>
+    </Teleport>
+
+    <template v-for="module in visibleModules" :key="module.id">
+      <div class="overview-module" :class="{ 'is-wide': module.span === 2 }">
+
+    <section v-if="module.id === 'media'" class="panel media-overview">
       <div class="panel-head">
         <div class="panel-title-line">
           <Database :size="18" />
@@ -259,7 +327,7 @@ onBeforeUnmount(() => {
       </div>
       <div v-if="mediaOverviews.length" class="overview-server-frame">
         <div
-          ref="serverList"
+          :ref="setServerListRef"
           class="overview-server-list"
           :class="{
             'has-multiple-servers': mediaOverviews.length > 1,
@@ -295,7 +363,7 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <section class="panel health-panel">
+    <section v-else-if="module.id === 'health'" class="panel health-panel">
       <div class="panel-head">
         <div>
           <div class="panel-title-line">
@@ -363,7 +431,7 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <section class="panel operations-panel">
+    <section v-else-if="module.id === 'operations'" class="panel operations-panel">
       <div class="panel-head">
         <div>
           <div class="panel-title-line">
@@ -466,7 +534,7 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <section class="panel rate-limit-overview">
+    <section v-else-if="module.id === 'rate-limit'" class="panel rate-limit-overview">
       <div class="panel-head">
         <div>
           <div class="panel-title-line">
@@ -565,7 +633,7 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <section class="panel playing-panel">
+    <section v-else-if="module.id === 'playing'" class="panel playing-panel">
       <div class="panel-head">
         <div class="panel-title-line">
           <PlayCircle :size="18" />
@@ -688,5 +756,18 @@ onBeforeUnmount(() => {
         }}
       </div>
     </section>
+      </div>
+    </template>
+
+    <OverviewLayoutDialog
+      :open="editorOpen"
+      :modules="draftModules"
+      @update:open="handleEditorOpenChange"
+      @toggle="toggleDraftModule"
+      @move="moveDraftModule"
+      @reorder="reorderDraft"
+      @save="applyDraft"
+      @reset="resetDraft"
+    />
   </section>
 </template>

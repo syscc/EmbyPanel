@@ -320,6 +320,9 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <div class="top-actions">
+          <!-- Teleport target for page-level actions. It must render before the
+               routed view so the target exists when a page teleports into it. -->
+          <span id="page-action-slot" class="page-action-slot"></span>
           <PreferenceControls
             :locale="locale"
             :dark-mode="darkMode"

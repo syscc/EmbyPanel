@@ -28,11 +28,9 @@ data/*
 /.mindfs/
 /.playwright-cli/
 /.playwright-mcp/
+/.serena/
+/.orca/
 /.vite/
 /dogfood-output/
 /tmp/
 /frontend/.playwright-cli/
-
-# Local QA screenshots
-/settings-switches-mobile.png
-/ui-before-desktop.png

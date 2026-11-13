@@ -9,6 +9,7 @@ use std::{
 
 use serde::Serialize;
 
+use crate::diagnostics::decode_log_detail_url;
 use crate::ip_location::IpLocation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,7 +208,12 @@ impl ActivityLogStore {
                             entry.detail
                         )
                         .to_ascii_lowercase();
+                        // The detail is stored percent-encoded while the UI shows
+                        // it decoded, so a search has to match both forms.
                         haystack.contains(keyword)
+                            || decode_log_detail_url(&entry.detail)
+                                .to_ascii_lowercase()
+                                .contains(keyword)
                     })
             })
             .take(filter.limit.clamp(1, self.limit))
@@ -309,5 +315,173 @@ mod tests {
             store.list(Some("a"), Some(ActivityKind::General), 10).len(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::{
+        ActivityKind, ActivityLevel, ActivityLogFilter, ActivityLogStore, decode_log_detail_url,
+    };
+
+    #[test]
+    fn log_detail_url_decodes_percent_encoded_file_names() {
+        assert_eq!(
+            decode_log_detail_url(
+                "https://cdn.example.com/hash/%E9%87%8D%E5%99%A8.S01E21.1080p.WEB-DL.H264.DDP%205.1-Pure%40HDSWEB.mkv"
+            ),
+            "https://cdn.example.com/hash/重器.S01E21.1080p.WEB-DL.H264.DDP 5.1-Pure@HDSWEB.mkv"
+        );
+    }
+
+    #[test]
+    fn log_detail_url_keeps_the_correlation_marker_and_decodes_the_url() {
+        assert_eq!(
+            decode_log_detail_url(
+                "request_id=diag-0123456789abcdef0123456789abcdef https://cdn.example.com/%E9%87%8D%E5%99%A8.mkv"
+            ),
+            "request_id=diag-0123456789abcdef0123456789abcdef https://cdn.example.com/重器.mkv"
+        );
+        assert_eq!(
+            decode_log_detail_url("request_id=diag-0123456789abcdef0123456789abcdef"),
+            "request_id=diag-0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(
+            decode_log_detail_url("request_id=diag-abc https://cdn.example.com/a%20b.mkv"),
+            "request_id=diag-abc https://cdn.example.com/a b.mkv"
+        );
+        // Any whitespace separates the marker, matching the frontend rule.
+        assert_eq!(
+            decode_log_detail_url("request_id=diag-abc\thttps://cdn.example.com/a%20b.mkv"),
+            "request_id=diag-abc\thttps://cdn.example.com/a b.mkv"
+        );
+        assert_eq!(
+            decode_log_detail_url("request_id=diag-abc  https://cdn.example.com/a%20b.mkv"),
+            "request_id=diag-abc  https://cdn.example.com/a b.mkv"
+        );
+    }
+
+    #[test]
+    fn log_detail_url_keeps_credential_separators_encoded() {
+        assert_eq!(
+            decode_log_detail_url("https://cdn.example.com/x/api_key%3DSECRET.mkv"),
+            "https://cdn.example.com/x/api_key%3DSECRET.mkv"
+        );
+        assert_eq!(
+            decode_log_detail_url("https://cdn.example.com/x/a%3Ab.mkv"),
+            "https://cdn.example.com/x/a%3Ab.mkv"
+        );
+    }
+
+    #[test]
+    fn log_detail_url_keeps_malformed_segments_fully_encoded() {
+        assert_eq!(
+            decode_log_detail_url("https://cdn.example.com/a%ZZb%20c.mkv"),
+            "https://cdn.example.com/a%ZZb%20c.mkv"
+        );
+    }
+
+    #[test]
+    fn log_detail_url_keeps_query_and_fragment_encoded() {
+        assert_eq!(
+            decode_log_detail_url("https://cdn.example.com/a%20b.mkv?token=%E9%87%8D#f"),
+            "https://cdn.example.com/a b.mkv?token=%E9%87%8D#f"
+        );
+    }
+
+    #[test]
+    fn log_detail_url_leaves_unsafe_and_malformed_escapes_alone() {
+        assert_eq!(
+            decode_log_detail_url("https://cdn.example.com/dir/a%2Fb.mkv"),
+            "https://cdn.example.com/dir/a%2Fb.mkv"
+        );
+        assert_eq!(
+            decode_log_detail_url("https://cdn.example.com/bad%ZZ.mkv"),
+            "https://cdn.example.com/bad%ZZ.mkv"
+        );
+        assert_eq!(
+            decode_log_detail_url("https://cdn.example.com/trunc%E9%87.mkv"),
+            "https://cdn.example.com/trunc%E9%87.mkv"
+        );
+        assert_eq!(
+            decode_log_detail_url("https://%65xample.com/a.mkv"),
+            "https://%65xample.com/a.mkv"
+        );
+    }
+
+    #[test]
+    fn log_detail_url_ignores_non_url_text() {
+        assert_eq!(
+            decode_log_detail_url("重器 S01E21 直接播放"),
+            "重器 S01E21 直接播放"
+        );
+        assert_eq!(decode_log_detail_url(""), "");
+        assert_eq!(
+            decode_log_detail_url("ftp://cdn.example.com/a%20b.mkv"),
+            "ftp://cdn.example.com/a%20b.mkv"
+        );
+    }
+
+    #[test]
+    fn log_detail_url_keeps_control_characters_encoded() {
+        assert_eq!(
+            decode_log_detail_url("https://cdn.example.com/a%0Ab.mkv"),
+            "https://cdn.example.com/a%0Ab.mkv"
+        );
+        assert_eq!(
+            decode_log_detail_url("https://cdn.example.com/a%0D%0Ab.mkv"),
+            "https://cdn.example.com/a%0D%0Ab.mkv"
+        );
+        assert_eq!(
+            decode_log_detail_url("https://cdn.example.com/a%09b.mkv"),
+            "https://cdn.example.com/a%09b.mkv"
+        );
+    }
+
+    fn filter(keyword: &str) -> ActivityLogFilter<'_> {
+        ActivityLogFilter {
+            server_id: None,
+            kind: None,
+            level: None,
+            keyword: Some(keyword),
+            since_ms: None,
+            until_ms: None,
+            limit: 20,
+        }
+    }
+
+    #[test]
+    fn keyword_matches_the_decoded_detail_as_well_as_the_stored_form() {
+        let store = ActivityLogStore::new(20);
+        store.record(
+            ActivityKind::Playback,
+            ActivityLevel::Success,
+            Some("srv-a"),
+            "Emby",
+            "直链跳转",
+            "request_id=diag-0123456789abcdef0123456789abcdef https://cdn.example.com/%E9%87%8D%E5%99%A8.S01E21.mkv",
+        );
+
+        // The decoded form is what the UI shows.
+        assert_eq!(store.list_filtered(filter("重器")).len(), 1);
+        // The stored percent-encoded form keeps matching as before.
+        assert_eq!(store.list_filtered(filter("%E9%87%8D")).len(), 1);
+        // Unrelated keywords do not match.
+        assert_eq!(store.list_filtered(filter("不存在")).len(), 0);
+    }
+
+    #[test]
+    fn keyword_matches_plain_fields() {
+        let store = ActivityLogStore::new(20);
+        store.record(
+            ActivityKind::General,
+            ActivityLevel::Info,
+            Some("srv-a"),
+            "Emby",
+            "反代监听启动",
+            "http://127.0.0.1:18090",
+        );
+        assert_eq!(store.list_filtered(filter("反代监听")).len(), 1);
+        assert_eq!(store.list_filtered(filter("18090")).len(), 1);
     }
 }

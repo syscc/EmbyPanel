@@ -20,6 +20,7 @@ use crate::{
     app_version, auth,
     config::Config,
     db::PlaybackAnalyticsSampleWrite,
+    diagnostics::decode_log_detail_url,
     emby::{MediaOverview, PlaybackSession},
     error::{AppError, AppResult, safe_error_message},
     management_listen_addr, tz_offset_seconds,
@@ -589,7 +590,7 @@ pub async fn export_activity_logs(
             csv_escape(entry.playback_user.as_deref().unwrap_or("")),
             csv_escape(entry.playback_ip.as_deref().unwrap_or("")),
             csv_escape(&entry.message),
-            csv_escape(&entry.detail),
+            csv_escape(&decode_log_detail_url(&entry.detail)),
         ));
     }
     Ok((
@@ -940,8 +941,8 @@ fn local_date() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MONITORING_READ_PERMISSION, authorized_playback_configs, is_valid_item_id,
-        server_options_for_context,
+        MONITORING_READ_PERMISSION, authorized_playback_configs, csv_escape, decode_log_detail_url,
+        is_valid_item_id, server_options_for_context,
     };
     use crate::{
         auth::{self, AuthContext, AuthKind},
@@ -1295,5 +1296,14 @@ mod tests {
         assert!(!is_valid_item_id(&"a".repeat(129)));
         assert!(!is_valid_item_id("item/123"));
         assert!(!is_valid_item_id("媒体-123"));
+    }
+
+    #[test]
+    fn log_detail_csv_row_carries_the_decoded_detail() {
+        let detail = "https://cdn.example.com/%E9%87%8D%E5%99%A8.S01E21.mkv";
+        assert_eq!(
+            csv_escape(&decode_log_detail_url(detail)),
+            "\"https://cdn.example.com/重器.S01E21.mkv\""
+        );
     }
 }
