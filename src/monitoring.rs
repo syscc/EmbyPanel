@@ -53,8 +53,10 @@ pub struct ActivityLogQuery {
     kind: Option<String>,
     level: Option<String>,
     keyword: Option<String>,
-    since_ms: Option<u128>,
-    until_ms: Option<u128>,
+    /// Millisecond timestamp bound. Declared as `u64` because the query-string
+    /// deserializer does not support `u128`; the store filters keep `u128`.
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
     limit: Option<usize>,
 }
 
@@ -77,8 +79,8 @@ pub struct RequestDetailQuery {
     /// correct. It is ignored by every other endpoint.
     exclude_path_type: Option<String>,
     keyword: Option<String>,
-    since_ms: Option<u128>,
-    until_ms: Option<u128>,
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
     limit: Option<usize>,
 }
 
@@ -88,8 +90,8 @@ pub struct BlockLogQuery {
     path_type: Option<String>,
     level: Option<String>,
     keyword: Option<String>,
-    since_ms: Option<u128>,
-    until_ms: Option<u128>,
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
     limit: Option<usize>,
 }
 
@@ -544,8 +546,8 @@ pub async fn list_activity_logs(
             kind,
             level: query.level.as_deref(),
             keyword: query.keyword.as_deref(),
-            since_ms: query.since_ms,
-            until_ms: query.until_ms,
+            since_ms: query.since_ms.map(u128::from),
+            until_ms: query.until_ms.map(u128::from),
             limit: query.limit.unwrap_or(120),
         },
         allowed_servers.as_ref(),
@@ -579,8 +581,8 @@ pub async fn export_activity_logs(
             kind,
             level: query.level.as_deref(),
             keyword: query.keyword.as_deref(),
-            since_ms: query.since_ms,
-            until_ms: query.until_ms,
+            since_ms: query.since_ms.map(u128::from),
+            until_ms: query.until_ms.map(u128::from),
             limit: query.limit.unwrap_or(500),
         },
         allowed_servers.as_ref(),
@@ -712,8 +714,8 @@ fn request_detail_filter<'a>(
         path_type: query.path_type.as_deref().filter(|value| *value != "all"),
         exclude_path_type: normalize_exclude_path_type(query.exclude_path_type.as_deref()),
         keyword: query.keyword.as_deref(),
-        since_ms: query.since_ms,
-        until_ms: query.until_ms,
+        since_ms: query.since_ms.map(u128::from),
+        until_ms: query.until_ms.map(u128::from),
         limit: query.limit.unwrap_or(200),
     }
 }
@@ -754,8 +756,8 @@ pub async fn block_logs(
             path_type: query.path_type.as_deref().filter(|value| *value != "all"),
             level: query.level.as_deref().filter(|value| *value != "all"),
             keyword: query.keyword.as_deref(),
-            since_ms: query.since_ms,
-            until_ms: query.until_ms,
+            since_ms: query.since_ms.map(u128::from),
+            until_ms: query.until_ms.map(u128::from),
             limit: query.limit.unwrap_or(200),
         },
         allowed_servers.as_ref(),
@@ -1606,11 +1608,11 @@ mod tests {
         }
     }
 
-    async fn monitoring_request_details_rows(
+    async fn monitoring_get(
         app: &axum::Router,
         uri: &str,
         token: &str,
-    ) -> Vec<serde_json::Value> {
+    ) -> (axum::http::StatusCode, Vec<u8>) {
         use tower::ServiceExt;
         let response = app
             .clone()
@@ -1627,6 +1629,15 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap();
+        (status, bytes.to_vec())
+    }
+
+    async fn monitoring_request_details_rows(
+        app: &axum::Router,
+        uri: &str,
+        token: &str,
+    ) -> Vec<serde_json::Value> {
+        let (status, bytes) = monitoring_get(app, uri, token).await;
         assert_eq!(
             status,
             axum::http::StatusCode::OK,
@@ -1634,6 +1645,352 @@ mod tests {
             String::from_utf8_lossy(&bytes)
         );
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn monitoring_temp_path(prefix: &str, extension: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        // The pid and the in-process counter are not enough on their own: a crash
+        // can leave files behind that make the next run with the same pid fail.
+        // A nanosecond stamp keeps every run in its own namespace.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!(
+            "embypanel-{prefix}-{}-{nonce}-{}.{extension}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// Opens an isolated test database with a super-admin session token.
+    fn monitoring_test_auth_store(
+        label: &str,
+    ) -> (crate::db::SettingsStore, std::path::PathBuf, String) {
+        let path = monitoring_temp_path(label, "sqlite");
+        let store = crate::db::SettingsStore::open_for_test(path.clone()).unwrap();
+        store
+            .create_admin("monitoring-admin", "synthetic-password-hash")
+            .unwrap();
+        let owner = store.list_admin_users().unwrap()[0].id;
+        let token = format!("monitoring-{label}-token");
+        store
+            .create_session(
+                owner,
+                &crate::auth::hash_token(&token),
+                crate::auth::now_ts() + 3600,
+            )
+            .unwrap();
+        (store, path, token)
+    }
+
+    fn monitoring_block_log_entry(
+        store: &crate::block_log::BlockLogStore,
+        timestamp_ms: u128,
+        path: &str,
+    ) {
+        store.record(crate::block_log::BlockLogInsert {
+            event_type: "request",
+            timestamp_ms,
+            server_id: "server-a",
+            server_name: "Fixture Server",
+            port: 8096,
+            method: "GET",
+            path,
+            path_type: "proxy",
+            status_code: 302,
+            outcome: "redirect",
+            duration_ms: 3,
+            playback_user: "fixture",
+            playback_ip: "192.0.2.10",
+            ip_location_text: "",
+            cache_hit: false,
+            detail: "request_id=diag-fixture",
+        });
+    }
+
+    fn monitoring_now_ms() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default()
+    }
+
+    fn monitoring_remove_sqlite(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// Builds an app with a fixture database, an isolated block log and rows in
+    /// every log store, so the four log views can be queried over real HTTP.
+    fn monitoring_time_filter_app(
+        label: &str,
+        base: u128,
+    ) -> (
+        axum::Router,
+        crate::AppState,
+        String,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let (store, db_path, token) = monitoring_test_auth_store(label);
+        let block_path = monitoring_temp_path(label, "log");
+        let block_store = std::sync::Arc::new(crate::block_log::BlockLogStore::open_for_test(
+            block_path.clone(),
+        ));
+        for (offset, path) in [
+            (500, "/blocked/1"),
+            (300, "/blocked/2"),
+            (100, "/blocked/3"),
+        ] {
+            monitoring_block_log_entry(&block_store, base - offset, path);
+        }
+        let mut state = monitoring_test_state(store);
+        state.block_log = block_store;
+        state.activity_log.record(
+            crate::activity_log::ActivityKind::Playback,
+            crate::activity_log::ActivityLevel::Info,
+            Some("server-a"),
+            "Fixture Server",
+            "playback start",
+            "request_id=diag-fixture",
+        );
+        state.activity_log.record(
+            crate::activity_log::ActivityKind::Playback,
+            crate::activity_log::ActivityLevel::Info,
+            Some("server-a"),
+            "Fixture Server",
+            "playback stop",
+            "request_id=diag-fixture-2",
+        );
+        for row in [
+            monitoring_detail_row(base - 500, "server-a", "proxy", "/emby/Items"),
+            monitoring_detail_row(base - 400, "server-a", "proxy", "/emby/Sessions"),
+            monitoring_detail_row(base - 300, "server-a", "proxy", "/emby/System/Info"),
+            monitoring_detail_row(base - 200, "server-a", "video_stream", "/videos/1/stream"),
+            monitoring_detail_row(base - 100, "server-a", "video_stream", "/videos/2/stream"),
+        ] {
+            state.telemetry_writes.proxy_request_detail(row);
+        }
+        state.telemetry_writes.shutdown().unwrap();
+        let app = crate::build_management_app(state.clone());
+        (app, state, token, db_path, block_path)
+    }
+
+    #[tokio::test]
+    async fn millisecond_time_filters_are_accepted_by_the_http_query_layer() {
+        // Regression: the millisecond bounds used to be declared as `u128`, which
+        // the query-string deserializer cannot parse, so every log view answered
+        // HTTP 400 as soon as the UI sent `since_ms`/`until_ms`.
+        let base = monitoring_now_ms();
+        let (app, _state, token, db_path, block_path) =
+            monitoring_time_filter_app("time-filter-status", base);
+        let window = format!("since_ms={}&until_ms={}", base - 350, base - 250);
+        for uri in [
+            format!("/api/monitoring/logs?kind=playback&{window}"),
+            format!("/api/monitoring/logs/export?kind=playback&{window}"),
+            format!("/api/monitoring/request-details?{window}"),
+            format!("/api/monitoring/block-logs?{window}"),
+        ] {
+            let (status, body) = monitoring_get(&app, &uri, &token).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::OK,
+                "unexpected status for {uri}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        // The bounds stay optional.
+        for uri in [
+            "/api/monitoring/logs?kind=playback".to_string(),
+            "/api/monitoring/logs/export?kind=playback".to_string(),
+            "/api/monitoring/request-details".to_string(),
+            "/api/monitoring/block-logs".to_string(),
+        ] {
+            let (status, body) = monitoring_get(&app, &uri, &token).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::OK,
+                "unexpected status for {uri}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        monitoring_remove_sqlite(&db_path);
+        let _ = std::fs::remove_file(&block_path);
+    }
+
+    #[tokio::test]
+    async fn millisecond_time_filters_apply_the_window_over_http() {
+        let base = monitoring_now_ms();
+        let (app, _state, token, db_path, block_path) =
+            monitoring_time_filter_app("time-filter-window", base);
+
+        // Proxy request details: five rows, only the middle one is in the window.
+        let all =
+            monitoring_request_details_rows(&app, "/api/monitoring/request-details", &token).await;
+        assert_eq!(all.len(), 5);
+        let windowed = monitoring_request_details_rows(
+            &app,
+            &format!(
+                "/api/monitoring/request-details?since_ms={}&until_ms={}",
+                base - 350,
+                base - 250
+            ),
+            &token,
+        )
+        .await;
+        assert_eq!(windowed.len(), 1);
+        assert_eq!(windowed[0]["path"], "/emby/System/Info");
+        assert_eq!(windowed[0]["timestamp_ms"], (base - 300) as u64);
+        // A window outside the seeded rows keeps nothing.
+        let empty = monitoring_request_details_rows(
+            &app,
+            &format!(
+                "/api/monitoring/request-details?since_ms={}&until_ms={}",
+                base - 90,
+                base - 80
+            ),
+            &token,
+        )
+        .await;
+        assert!(empty.is_empty());
+        // A bound above `i64::MAX` must saturate instead of wrapping into a
+        // negative value: `since_ms` then matches nothing, `until_ms` everything.
+        let saturated_since = monitoring_request_details_rows(
+            &app,
+            &format!("/api/monitoring/request-details?since_ms={}", u64::MAX),
+            &token,
+        )
+        .await;
+        assert!(saturated_since.is_empty());
+        let saturated_until = monitoring_request_details_rows(
+            &app,
+            &format!("/api/monitoring/request-details?until_ms={}", u64::MAX),
+            &token,
+        )
+        .await;
+        assert_eq!(saturated_until.len(), 5);
+
+        // Blocked requests: three rows, the window keeps the middle one.
+        let block_all = monitoring_get(&app, "/api/monitoring/block-logs", &token).await;
+        assert_eq!(block_all.0, axum::http::StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Vec<serde_json::Value>>(&block_all.1)
+                .unwrap()
+                .len(),
+            3
+        );
+        let (status, body) = monitoring_get(
+            &app,
+            &format!(
+                "/api/monitoring/block-logs?since_ms={}&until_ms={}",
+                base - 350,
+                base - 250
+            ),
+            &token,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let block_windowed: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(block_windowed.len(), 1);
+        assert_eq!(block_windowed[0]["path"], "/blocked/2");
+
+        // Activity logs are recorded at runtime time, so the window is anchored
+        // around now and a window in the past has to drop every row.
+        let logs_now = monitoring_get(
+            &app,
+            &format!(
+                "/api/monitoring/logs?kind=playback&since_ms={}&until_ms={}",
+                base - 60_000,
+                base + 60_000
+            ),
+            &token,
+        )
+        .await;
+        assert_eq!(logs_now.0, axum::http::StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Vec<serde_json::Value>>(&logs_now.1)
+                .unwrap()
+                .len(),
+            2
+        );
+        let logs_past = monitoring_get(
+            &app,
+            &format!(
+                "/api/monitoring/logs?kind=playback&until_ms={}",
+                base - 60_000
+            ),
+            &token,
+        )
+        .await;
+        assert_eq!(logs_past.0, axum::http::StatusCode::OK);
+        assert!(
+            serde_json::from_slice::<Vec<serde_json::Value>>(&logs_past.1)
+                .unwrap()
+                .is_empty()
+        );
+        // `since_ms` alone has to exclude the rows as well, otherwise the bound
+        // could be dropped without any test noticing.
+        let logs_future = monitoring_get(
+            &app,
+            &format!(
+                "/api/monitoring/logs?kind=playback&since_ms={}",
+                base + 60_000
+            ),
+            &token,
+        )
+        .await;
+        assert_eq!(logs_future.0, axum::http::StatusCode::OK);
+        assert!(
+            serde_json::from_slice::<Vec<serde_json::Value>>(&logs_future.1)
+                .unwrap()
+                .is_empty()
+        );
+
+        // The CSV export honours the same window.
+        let export_windowed = monitoring_get(
+            &app,
+            &format!(
+                "/api/monitoring/logs/export?kind=playback&since_ms={}&until_ms={}",
+                base - 60_000,
+                base + 60_000
+            ),
+            &token,
+        )
+        .await;
+        assert_eq!(export_windowed.0, axum::http::StatusCode::OK);
+        let csv = String::from_utf8(export_windowed.1).unwrap();
+        assert_eq!(csv.lines().count(), 3);
+        let export_past = monitoring_get(
+            &app,
+            &format!(
+                "/api/monitoring/logs/export?kind=playback&until_ms={}",
+                base - 60_000
+            ),
+            &token,
+        )
+        .await;
+        assert_eq!(export_past.0, axum::http::StatusCode::OK);
+        assert_eq!(String::from_utf8(export_past.1).unwrap().lines().count(), 1);
+        let export_future = monitoring_get(
+            &app,
+            &format!(
+                "/api/monitoring/logs/export?kind=playback&since_ms={}",
+                base + 60_000
+            ),
+            &token,
+        )
+        .await;
+        assert_eq!(export_future.0, axum::http::StatusCode::OK);
+        assert_eq!(
+            String::from_utf8(export_future.1).unwrap().lines().count(),
+            1
+        );
+
+        monitoring_remove_sqlite(&db_path);
+        let _ = std::fs::remove_file(&block_path);
     }
 
     #[tokio::test]
@@ -1746,10 +2103,8 @@ mod tests {
         .await;
         assert!(keyword_playback.is_empty());
 
-        // The time window keeps working together with the exclusion.
-        // Note: the HTTP query uses `u128` for the time bounds, which the query
-        // string deserializer does not support, so the time window is covered by
-        // the store level test instead of the HTTP level.
+        // The time window keeps working together with the exclusion; the HTTP
+        // query layer is covered by the `millisecond_time_filters_*` tests.
         let time_filtered = state
             .settings_store
             .list_proxy_request_details(crate::db::ProxyRequestDetailFilter {

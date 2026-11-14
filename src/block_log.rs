@@ -89,6 +89,16 @@ impl BlockLogStore {
         }
     }
 
+    /// Builds a store backed by an explicit path so tests never touch the
+    /// runtime `data/logs/block.log`.
+    #[cfg(test)]
+    pub(crate) fn open_for_test(path: PathBuf) -> Self {
+        Self {
+            path,
+            lock: Mutex::new(()),
+        }
+    }
+
     pub fn record(&self, record: BlockLogInsert<'_>) {
         let _guard = self.lock.lock().expect("block log mutex poisoned");
         if let Some(parent) = self.path.parent() {

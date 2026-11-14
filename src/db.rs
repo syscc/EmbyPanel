@@ -3282,13 +3282,16 @@ impl SettingsStore {
                 values.push(Box::new(exclude_path_type.to_string()));
             }
         }
+        // Saturate instead of `as i64`: a millisecond bound above `i64::MAX`
+        // would otherwise wrap into a negative value and silently invert the
+        // comparison (`since` matched everything, `until` matched nothing).
         if let Some(since_ms) = filter.since_ms {
             conditions.push("timestamp_ms >= ?");
-            values.push(Box::new(since_ms as i64));
+            values.push(Box::new(Self::sqlite_i64(since_ms)));
         }
         if let Some(until_ms) = filter.until_ms {
             conditions.push("timestamp_ms <= ?");
-            values.push(Box::new(until_ms as i64));
+            values.push(Box::new(Self::sqlite_i64(until_ms)));
         }
         let keyword = filter
             .keyword
