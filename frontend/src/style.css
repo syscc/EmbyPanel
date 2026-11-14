@@ -1753,6 +1753,54 @@ button.settings-card-main {
   padding: 7px 12px;
 }
 
+.log-playback-group {
+  min-width: 0;
+  border: 1px solid var(--border-soft);
+  border-left: 3px solid var(--brand);
+  border-radius: 7px;
+  background: var(--panel-soft);
+  overflow-wrap: anywhere;
+}
+
+.log-group-summary {
+  padding: 10px 12px;
+  cursor: pointer;
+  font-size: var(--font-size-body);
+  line-height: 1.6;
+}
+
+.log-group-summary::marker {
+  color: var(--muted);
+}
+
+.log-group-summary:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+  border-radius: 7px;
+}
+
+.log-group-summary .log-body {
+  margin-top: 4px;
+}
+
+.log-group-count {
+  color: var(--muted);
+  font-size: var(--font-size-help);
+}
+
+.log-group-requests {
+  padding: 0 12px;
+}
+
+.log-group-request {
+  display: grid;
+  grid-template-columns: 170px minmax(0, 1fr);
+  gap: 14px;
+  border-top: 1px solid var(--border-soft);
+  padding: 10px 0;
+  min-width: 0;
+}
+
 .log-entry.playback {
   border-left-color: var(--accent-green);
 }
@@ -1830,10 +1878,44 @@ button.settings-card-main {
   overflow-wrap: anywhere;
 }
 
+.log-body .log-media {
+  color: var(--text);
+  font-size: var(--font-size-body);
+  line-height: 1.6;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.log-media span {
+  color: var(--muted);
+  font-weight: 400;
+}
+
 .log-detail {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   line-height: 1.45;
   word-break: break-all;
+}
+
+.log-request-hint {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: var(--font-size-help);
+  line-height: 1.6;
+}
+
+.log-body .log-request-id,
+.request-main .log-request-id {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: var(--font-size-meta);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.log-request-id code {
+  font-size: inherit;
+  overflow-wrap: anywhere;
 }
 
 .copy-link {
@@ -2961,6 +3043,7 @@ textarea:focus {
   }
 
   .log-entry,
+  .log-group-request,
   .request-detail-row {
     grid-template-columns: 1fr;
     gap: 6px;

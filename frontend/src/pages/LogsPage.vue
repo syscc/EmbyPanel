@@ -9,7 +9,8 @@ import {
 import { computed, unref } from 'vue'
 import RefreshButton from '@/components/ui/RefreshButton.vue'
 import { usePanelContext } from '@/composables/panel-context'
-import { copyableLogDetail, formatLogDetail } from '@/lib/panel-formatters'
+import { copyableLogDetail, formatLogDetail, logRequestId } from '@/lib/panel-formatters'
+import type { PlaybackMedia } from '@/types/panel'
 
 const {
   logsLoading,
@@ -60,13 +61,50 @@ const {
   saveLogConfig,
 } = usePanelContext()
 
+function mediaSummary(media?: PlaybackMedia | null) {
+  const number = (prefix: string, value?: number | null) =>
+    value != null && Number.isInteger(value) && value >= 0
+      ? `${prefix}${String(value).padStart(2, '0')}` : ''
+  const episode = number('S', media?.season_number) + number('E', media?.episode_number)
+  return [media?.series_name, episode, media?.name].filter(Boolean).join(' · ') || t('媒体信息未知')
+}
+
 const displayActivityLogRows = computed(() =>
   unref(visibleActivityLogRows).map((entry) => ({
     ...entry,
     displayDetail: formatLogDetail(entry.detail),
     copyDetail: copyableLogDetail(entry.detail),
+    requestId: logRequestId(entry.detail),
+    mediaSummary: mediaSummary(entry.media),
   })),
 )
+
+const groupedActivityLogRows = computed(() => {
+  type Entry = (typeof displayActivityLogRows.value)[number]
+  type Row = { key: string; grouped: boolean; latest: Entry; requests: Entry[] }
+  const rows: Row[] = []
+  const groups = new Map<string, Row>()
+  for (const entry of displayActivityLogRows.value) {
+    const eligible = entry.kind === 'playback'
+      && (entry.level === 'success' || entry.level === 'info')
+      && typeof entry.playback_group_id === 'string' && entry.playback_group_id.length === 69
+      && /^play-[0-9a-f]{64}$/.test(entry.playback_group_id)
+      && typeof entry.server_id === 'string' && entry.server_id.trim() !== ''
+    const key = eligible
+      ? `playback-${JSON.stringify([entry.server_id, entry.playback_group_id])}`
+      : `activity-${entry.id}`
+    const existing = eligible ? groups.get(key) : undefined
+    if (existing) {
+      existing.requests.push(entry)
+      if (entry.timestamp_ms > existing.latest.timestamp_ms) existing.latest = entry
+    } else {
+      const row = { key, grouped: Boolean(eligible), latest: entry, requests: [entry] }
+      rows.push(row)
+      if (eligible) groups.set(key, row)
+    }
+  }
+  return rows
+})
 
 // The request-detail and block views read their detail from the proxy detail
 // store, so the same formatting keeps every log view consistent.
@@ -75,6 +113,7 @@ const displayRequestDetailRows = computed(() =>
     ...row,
     displayDetail: formatLogDetail(row.detail),
     copyDetail: copyableLogDetail(row.detail),
+    requestId: logRequestId(row.detail),
   })),
 )
 </script>
@@ -112,7 +151,7 @@ const displayRequestDetailRows = computed(() =>
             class="secondary"
             @click="exportLogs"
           >
-            <Download :size="15" />{{ t('导出 CSV') }}
+            <Download :size="15" />{{ t(selectedLogView === 'playback' ? '导出原始请求 CSV' : '导出 CSV') }}
           </button>
         </div>
       </div>
@@ -209,7 +248,11 @@ const displayRequestDetailRows = computed(() =>
 
       <div class="log-console-meta">
         <span>{{ selectedLogViewLabel }}</span>
-        <strong>{{ visibleLogCount }}</strong>
+        <template v-if="selectedLogView === 'playback'">
+          <span>{{ t('显示条目') }}</span><strong>{{ groupedActivityLogRows.length }}</strong>
+          <span>{{ t('已加载原始请求') }}</span><strong>{{ displayActivityLogRows.length }}</strong>
+        </template>
+        <strong v-else>{{ visibleLogCount }}</strong>
         <span v-if="isRequestDetailLogView">
           {{ t('单次最多') }} {{ requestDetailDisplayMax }} {{ t('条') }}，{{
             t('保留')
@@ -222,6 +265,14 @@ const displayRequestDetailRows = computed(() =>
           {{ t('条可视化日志') }}</span
         >
       </div>
+      <p v-if="selectedLogView === 'playback'" class="log-request-hint">
+        {{ t('同一播放的多个 Range 分段请求折叠展示，展开可查看原始请求；警告和错误单独显示。') }}
+        {{ t('数量仅包含当前已加载且匹配筛选的请求，不代表完整会话。') }}
+        {{ t('CSV 按当前筛选导出最多 500 条原始请求，不按显示条目合并。') }}
+      </p>
+      <p v-if="selectedLogView === 'proxy'" class="log-request-hint">
+        {{ t('播放请求按播放会话折叠展示在「播放日志」中；「反代请求」默认不列出播放流，选择「视频流」仍可查看原始播放请求。') }}
+      </p>
 
       <div
         v-if="visibleLogCount"
@@ -229,39 +280,80 @@ const displayRequestDetailRows = computed(() =>
         @scroll="handleScrollableLogListScroll($event, loadMoreSelectedLogs)"
       >
         <template v-if="!isRequestDetailLogView">
-          <article
-            v-for="entry in displayActivityLogRows"
-            :key="`activity-${entry.id}`"
-            :class="['log-entry', entry.kind, entry.level]"
-          >
-            <div class="log-time">{{ formatLogTime(entry.timestamp_ms) }}</div>
-            <div class="log-body">
-              <div class="log-title">
-                <strong>{{ entry.message }}</strong>
-                <span :class="['level-pill', entry.level]">{{
-                  logLevelLabel(entry.level)
-                }}</span>
-                <span class="server-pill">{{ entry.server_name }}</span>
-                <span v-if="entry.playback_user" class="user-pill">{{
-                  entry.playback_user
-                }}</span>
-                <span v-if="entry.playback_ip" class="ip-pill">{{
-                  ipWithLocation(entry.playback_ip, entry.ip_location)
-                }}</span>
+          <template v-for="row in groupedActivityLogRows" :key="row.key">
+            <details v-if="row.grouped" class="log-playback-group">
+              <summary class="log-group-summary">
+                <span class="log-time">{{ t('最近请求') }}：{{ formatLogTime(row.latest.timestamp_ms) }}</span>
+                <span class="log-body">
+                  <span class="log-title">
+                    <strong>{{ t('播放请求摘要') }}</strong>
+                    <span class="server-pill">{{ row.latest.server_name }}</span>
+                    <span v-if="row.latest.playback_user" class="user-pill">{{ row.latest.playback_user }}</span>
+                  </span>
+                  <span class="log-media" :title="row.latest.mediaSummary">{{ row.latest.mediaSummary }}</span>
+                  <span class="log-group-count">{{ t('当前已加载请求数') }}：{{ row.requests.length }} · {{ t('展开查看原始请求') }}</span>
+                </span>
+              </summary>
+              <div class="log-group-requests">
+                <div v-for="entry in row.requests" :key="`request-${entry.id}`" class="log-group-request">
+                  <div class="log-time">{{ formatLogTime(entry.timestamp_ms) }}</div>
+                  <div class="log-body">
+                    <div class="log-title">
+                      <strong>{{ t(entry.message) }}</strong>
+                      <span :class="['level-pill', entry.level]">{{ logLevelLabel(entry.level) }}</span>
+                      <span class="server-pill">{{ entry.server_name }}</span>
+                      <span v-if="entry.playback_user" class="user-pill">{{ entry.playback_user }}</span>
+                      <span v-if="entry.playback_ip" class="ip-pill">{{ ipWithLocation(entry.playback_ip, entry.ip_location) }}</span>
+                    </div>
+                    <p class="log-media" :title="entry.mediaSummary">{{ entry.mediaSummary }}</p>
+                    <p class="log-detail">
+                      <a v-if="entry.displayDetail && isHttpUrl(entry.displayDetail)" class="copy-link" href="#"
+                        :title="t('点击复制链接')" @click.prevent="copyText(entry.copyDetail)">{{ entry.displayDetail }}</a>
+                      <template v-else>{{ entry.displayDetail || t('暂无详情') }}</template>
+                    </p>
+                    <p v-if="entry.requestId" class="log-request-id">{{ t('关联 ID') }}：<code>{{ entry.requestId }}</code></p>
+                  </div>
+                </div>
               </div>
-              <p :class="{ 'log-detail': entry.kind === 'playback' }">
-                <a
-                  v-if="entry.displayDetail && isHttpUrl(entry.displayDetail)"
-                  class="copy-link"
-                  href="#"
-                  :title="t('点击复制链接')"
-                  @click.prevent="copyText(entry.copyDetail)"
-                  >{{ entry.displayDetail }}</a
-                >
-                <template v-else>{{ entry.displayDetail || t('暂无详情') }}</template>
-              </p>
-            </div>
-          </article>
+            </details>
+            <article v-else :class="['log-entry', row.latest.kind, row.latest.level]">
+              <template v-for="entry in row.requests" :key="entry.id">
+                <div class="log-time">{{ formatLogTime(entry.timestamp_ms) }}</div>
+                <div class="log-body">
+                  <div class="log-title">
+                    <strong>{{ t(entry.message) }}</strong>
+                    <span :class="['level-pill', entry.level]">{{
+                      logLevelLabel(entry.level)
+                    }}</span>
+                    <span class="server-pill">{{ entry.server_name }}</span>
+                    <span v-if="entry.playback_user" class="user-pill">{{
+                      entry.playback_user
+                    }}</span>
+                    <span v-if="entry.playback_ip" class="ip-pill">{{
+                      ipWithLocation(entry.playback_ip, entry.ip_location)
+                    }}</span>
+                  </div>
+                  <p v-if="entry.kind === 'playback'" class="log-media" :title="entry.mediaSummary">
+                    <span>{{ t('媒体') }}：</span>{{ entry.mediaSummary }}
+                  </p>
+                  <p :class="{ 'log-detail': entry.kind === 'playback' }">
+                    <a
+                      v-if="entry.displayDetail && isHttpUrl(entry.displayDetail)"
+                      class="copy-link"
+                      href="#"
+                      :title="t('点击复制链接')"
+                      @click.prevent="copyText(entry.copyDetail)"
+                      >{{ entry.displayDetail }}</a
+                    >
+                    <template v-else>{{ entry.displayDetail || t('暂无详情') }}</template>
+                  </p>
+                  <p v-if="entry.requestId" class="log-request-id">
+                    {{ t('关联 ID') }}：<code>{{ entry.requestId }}</code>
+                  </p>
+                </div>
+              </template>
+            </article>
+          </template>
         </template>
         <template v-else>
           <article
@@ -297,6 +389,9 @@ const displayRequestDetailRows = computed(() =>
                   ><span>{{ row.displayDetail || t('暂无详情') }}</span></template
                 >
               </div>
+              <p v-if="row.requestId" class="log-request-id">
+                {{ t('关联 ID') }}：<code>{{ row.requestId }}</code>
+              </p>
             </div>
             <div class="request-state">
               <span>{{ row.outcome }}</span>
@@ -345,7 +440,11 @@ const displayRequestDetailRows = computed(() =>
               : `${t('加载更多')} ${selectedLogViewLabel}`
           }}
         </button>
-        <div v-else class="log-limit-note">
+        <div v-if="selectedLogView === 'playback'" class="log-limit-note">
+          {{ t('显示条目') }}：{{ groupedActivityLogRows.length }} ·
+          {{ t('已加载原始请求') }}：{{ displayActivityLogRows.length }}
+        </div>
+        <div v-else-if="!canLoadMoreSelectedLogs" class="log-limit-note">
           {{ t('已显示') }} {{ visibleLogCount }} {{ t('条') }}
           {{ selectedLogViewLabel }}
         </div>

@@ -3396,6 +3396,289 @@ test('log detail copy value keeps the raw percent-encoded URL so it stays valid'
   assert.equal(copyableLogDetail(''), '')
 })
 
+test('log request IDs are extracted separately without changing URL display or copy', () => {
+  const { logRequestId, formatLogDetail, copyableLogDetail } = load('lib/panel-formatters.ts')
+  const raw = 'request_id=diag-abc123 https://cdn.example.invalid/%E7%89%87%E5%90%8D/part%3Dfinal.mkv?token=synthetic'
+  assert.equal(logRequestId(raw), 'diag-abc123')
+  assert.equal(formatLogDetail(raw), 'https://cdn.example.invalid/片名/part%3Dfinal.mkv')
+  assert.equal(copyableLogDetail(raw), 'https://cdn.example.invalid/%E7%89%87%E5%90%8D/part%3Dfinal.mkv')
+  assert.equal(logRequestId('request_id=diag-only'), 'diag-only')
+  for (const value of ['', 'legacy detail', 'prefix request_id=diag-abc', 'request_id=diag- status=206', 'request_id=diag-abc/token', `request_id=diag-${'a'.repeat(121)} detail`]) {
+    assert.equal(logRequestId(value), '', value)
+  }
+})
+
+test('LogsPage distinguishes Range requests with separate IDs and preserves legacy rows in both locales', async () => {
+  const { translations } = load('lib/translations.ts')
+  const ranges = ['bytes=0-4095', 'bytes=4096-8191']
+  const rows = ranges.map((range, index) => ({
+    id: index + 1, kind: 'playback', level: 'info', server_name: 'Synthetic',
+    media: { media_id: 'same-media', name: 'Synthetic movie' },
+    message: '服务器代理播放',
+    detail: `request_id=diag-request-${index + 1} status=206 path=/Videos/same-media/stream range=${range}`,
+  }))
+  rows.push({ id: 3, kind: 'playback', level: 'info', server_name: 'Synthetic', message: '服务器代理播放', detail: 'legacy detail' })
+  for (const language of ['zh', 'en']) {
+    let state
+    const html = await renderPage('LogsPage.vue', {
+      t: (key) => language === 'en' ? translations[key] || key : key,
+      selectedLogView: 'playback', visibleActivityLogRows: rows,
+      filteredRequestDetailRows: [], isRequestDetailLogView: false,
+      formatLogTime: () => 'Synthetic time', logLevelLabel: () => 'Info',
+      isHttpUrl: (value) => /^https?:\/\//.test(value || ''), copyText: () => {},
+      logServers: [], logLevelOptions: [], visibleLogCount: 3,
+      logConfig: { level: 'info', max_size_mb: 20, max_backups: 5, format: '' },
+    }, (value) => { state = value })
+    assert.equal((html.match(/<article\b/g) || []).length, 3)
+    assert.equal((html.match(/class="log-request-id"/g) || []).length, 2)
+    for (let index = 0; index < ranges.length; index++) {
+      assert.ok(html.includes(`range=${ranges[index]}`))
+      assert.equal((html.match(new RegExp(`diag-request-${index + 1}`, 'g')) || []).length, 1)
+      assert.equal(state.displayActivityLogRows.value[index].requestId, `diag-request-${index + 1}`)
+      assert.doesNotMatch(state.displayActivityLogRows.value[index].displayDetail, /request_id=/)
+    }
+    assert.equal(state.displayActivityLogRows.value[2].requestId, '')
+    assert.ok(html.includes('legacy detail'))
+    assert.ok(html.includes(language === 'en' ? 'Correlation ID' : '关联 ID'))
+    assert.ok(html.includes(language === 'en' ? 'Multiple Range requests' : '多个 Range 分段请求'))
+  }
+})
+
+function groupedPlaybackFixture(id, extra = {}) {
+  return {
+    id, timestamp_ms: 1767323045000 + id, kind: 'playback', level: 'info',
+    server_id: 'synthetic-server', server_name: 'Synthetic', playback_user: 'Fixture user',
+    playback_ip: '192.0.2.1', playback_group_id: `play-${'a'.repeat(64)}`,
+    media: { media_id: 'same-media', series_name: '番外', name: '本集标题', season_number: 0, episode_number: 0 },
+    message: '服务器代理播放',
+    detail: `request_id=diag-group-${id} status=206 path=/Videos/same-media/stream range=bytes=${id * 100}-${id * 100 + 99}`,
+    ...extra,
+  }
+}
+
+function groupedLogsPanel(rows, language = 'zh') {
+  const vue = require('vue')
+  const { translations } = load('lib/translations.ts')
+  const visibleActivityLogRows = vue.ref(rows)
+  return {
+    t: (key) => language === 'en' ? translations[key] || key : key,
+    selectedLogView: 'playback', selectedLogViewLabel: 'Playback logs', visibleActivityLogRows,
+    filteredRequestDetailRows: [], isRequestDetailLogView: false,
+    formatLogTime: (time) => String(time), logLevelLabel: (level) => level,
+    ipWithLocation: (ip) => ip, isHttpUrl: (value) => /^https?:\/\//.test(value || ''), copyText: () => {},
+    logServers: [], logLevelOptions: [], visibleLogCount: vue.computed(() => visibleActivityLogRows.value.length),
+    logConfig: { level: 'info', max_size_mb: 20, max_backups: 5, format: '' },
+  }
+}
+
+test('actual LogsPage collapses three requests into one summary in zh/en and preserves every raw detail', async () => {
+  const rows = [3, 2, 1].map((id) => groupedPlaybackFixture(id))
+  rows[1].detail = 'request_id=diag-group-2 https://cdn.example.invalid/%E7%89%87%E5%90%8D/part%3Dfinal.mkv?token=synthetic'
+  for (const language of ['zh', 'en']) {
+    let state
+    const html = await renderPage('LogsPage.vue', groupedLogsPanel(rows, language), (value) => { state = value })
+    assert.equal((html.match(/<details\b/g) || []).length, 1)
+    assert.doesNotMatch(html, /<details[^>]*\sopen(?:\s|[=>])/)
+    assert.equal((html.match(/<article\b/g) || []).length, 0)
+    assert.equal((html.match(/class="log-group-request"/g) || []).length, 3)
+    const summary = html.match(/<summary[^]*?<\/summary>/)[0]
+    assert.match(summary, /(?:当前已加载请求数|Currently loaded requests)：3/)
+    assert.match(summary, /番外 · S00E00 · 本集标题/)
+    assert.match(summary, /1767323045003/)
+    assert.match(summary, /Fixture user/)
+    assert.match(summary, /Synthetic/)
+    assert.doesNotMatch(summary, /diag-group|range=|status=|cdn\.example/)
+    for (const id of [3, 2, 1]) assert.ok(html.includes(`diag-group-${id}`))
+    assert.match(html, /range=bytes=300-399/)
+    assert.match(html, /range=bytes=100-199/)
+    assert.match(html, /path=\/Videos\/same-media\/stream/)
+    assert.match(html, /片名\/part%3Dfinal\.mkv/)
+    assert.doesNotMatch(html, /token=synthetic|request_id=|play-aaaa/)
+    assert.equal(state.groupedActivityLogRows.value[0].requests[1].copyDetail,
+      'https://cdn.example.invalid/%E7%89%87%E5%90%8D/part%3Dfinal.mkv')
+    assert.match(html, /(?:显示条目|Displayed entries)<\/span><strong>1<\/strong>/)
+    assert.match(html, /(?:已加载原始请求|Loaded original requests)<\/span><strong>3<\/strong>/)
+    assert.match(html, /class="log-limit-note"[^]*?(?:显示条目|Displayed entries)：1 · (?:已加载原始请求|Loaded original requests)：3/)
+    assert.ok(html.includes(language === 'en' ? 'Export original requests CSV' : '导出原始请求 CSV'))
+    assert.ok(html.includes(language === 'en' ? 'up to 500 original requests' : '最多 500 条原始请求'))
+  }
+})
+
+test('actual LogsPage isolates opaque identities, server scopes, legacy, invalid, and failed requests', async () => {
+  const rows = [groupedPlaybackFixture(1), groupedPlaybackFixture(2)]
+  // Backend supplies distinct opaque IDs for session/device/source/user/media/config partitions.
+  for (const [index, identity] of ['session', 'device', 'source', 'user', 'media', 'config'].entries()) {
+    rows.push(groupedPlaybackFixture(index + 3, { playback_group_id: `play-${String(index + 1).repeat(64)}`, message: identity }))
+  }
+  rows.push(groupedPlaybackFixture(9, { server_id: 'another-server' }))
+  for (const [index, extra] of [
+    { playback_group_id: null }, { playback_group_id: undefined },
+    { playback_group_id: `play-${'A'.repeat(64)}` }, { playback_group_id: `play-${'a'.repeat(64)}\n` },
+    { playback_group_id: 'raw-session' }, { server_id: null }, { server_id: ' ' },
+    { kind: 'general' }, { level: 'warn', detail: 'synthetic HTTP 404 failure' },
+    { level: 'error', detail: 'synthetic HTTP 500 failure' },
+  ].entries()) rows.push(groupedPlaybackFixture(index + 10, extra))
+  let state
+  const html = await renderPage('LogsPage.vue', groupedLogsPanel(rows), (value) => { state = value })
+  assert.equal(state.groupedActivityLogRows.value.length, rows.length - 1)
+  assert.equal((html.match(/<details\b/g) || []).length, 8)
+  assert.equal((html.match(/<article\b/g) || []).length, 10)
+  const collapsedDetails = html.replace(/<details\b[^]*?<\/details>/g, '')
+  assert.match(collapsedDetails, /class="log-entry playback warn"[^]*?synthetic HTTP 404 failure/)
+  assert.match(collapsedDetails, /class="log-entry playback error"[^]*?synthetic HTTP 500 failure/)
+})
+
+test('actual LogsPage retains its expanded node and URL copy handler across snapshot replacement', async () => {
+  const vue = require('vue')
+  const panel = groupedLogsPanel([groupedPlaybackFixture(1)])
+  const copied = []
+  panel.copyText = (value) => copied.push(value)
+  // Minimal in-memory host exercises Vue keyed patching; native browser keyboard behavior is verified separately.
+  const node = (tag, text = '') => ({ tag, text, children: [], props: {}, parent: null })
+  const renderer = vue.createRenderer({
+    createElement: (tag) => node(tag), createText: (text) => node('#text', text), createComment: (text) => node('#comment', text),
+    setText: (el, text) => { el.text = text }, setElementText: (el, text) => { el.text = text; el.children = [] },
+    parentNode: (el) => el.parent,
+    nextSibling: (el) => el.parent?.children[el.parent.children.indexOf(el) + 1] || null,
+    patchProp: (el, key, before, after) => { el.props[key] = after },
+    insert: (el, parent, anchor = null) => {
+      if (el.parent) el.parent.children.splice(el.parent.children.indexOf(el), 1)
+      const index = anchor ? parent.children.indexOf(anchor) : -1
+      parent.children.splice(index < 0 ? parent.children.length : index, 0, el)
+      el.parent = parent
+    },
+    remove: (el) => { el.parent.children.splice(el.parent.children.indexOf(el), 1); el.parent = null },
+  })
+  const root = node('root')
+  const app = renderer.createApp(loadPageComponent('LogsPage.vue', panel, {
+    // Form controls are outside this host test; exercise the real render and keyed patching.
+    vue: { ...vue, vModelText: {}, vModelSelect: {} },
+  }))
+  const find = (parent, predicate) => [parent, ...parent.children.flatMap((child) => find(child, () => true))].filter(predicate)
+  app.mount(root)
+  try {
+    const details = find(root, (el) => el.tag === 'details')[0]
+    assert.ok(details)
+    details.open = true
+    const url = 'https://cdn.example.invalid/%E7%89%87%E5%90%8D/part%3Dfinal.mkv'
+    panel.visibleActivityLogRows.value = [groupedPlaybackFixture(3), groupedPlaybackFixture(2, {
+      detail: `request_id=diag-group-2 ${url}?token=synthetic`,
+    }), groupedPlaybackFixture(1)]
+    await vue.nextTick()
+    assert.equal(find(root, (el) => el.tag === 'details')[0], details)
+    assert.equal(details.open, true)
+    assert.equal(find(details, (el) => el.props.class === 'log-group-request').length, 3)
+    find(details, (el) => el.props.class === 'copy-link')[0].props.onClick({ preventDefault() {} })
+    assert.deepEqual(copied, [url])
+    panel.visibleActivityLogRows.value = [groupedPlaybackFixture(2)]
+    await vue.nextTick()
+    assert.equal(find(root, (el) => el.tag === 'details')[0], details)
+    assert.equal(find(details, (el) => el.props.class === 'log-group-request').length, 1)
+    panel.visibleActivityLogRows.value = []
+    await vue.nextTick()
+    assert.equal(find(root, (el) => el.tag === 'details').length, 0)
+    assert.equal(find(root, (el) => el.props.class === 'empty-state').length, 1)
+  } finally { app.unmount() }
+})
+
+test('grouped LogsPage uses filtered raw counts and original controller pagination and CSV query', async (context) => {
+  let rows = Array.from({ length: 120 }, (_, index) => groupedPlaybackFixture(index + 1))
+  const requests = []
+  const harness = panelHarness(context, 'logs', async (url) => {
+    requests.push(url)
+    if (url === '/api/setup-status') return { initialized: true }
+    if (url === '/api/profile') return { username: 'fixture' }
+    if (url === '/api/servers/options') return { servers: [{ id: 'synthetic-server', name: 'Synthetic' }], can_control_sessions: false }
+    if (url.startsWith('/api/monitoring/logs?')) return rows
+    return {}
+  })
+  await harness.start()
+  await harness.panel.refreshActivityLogs()
+  let state
+  const html = await renderPage('LogsPage.vue', harness.panel, (value) => { state = value })
+  assert.equal(state.groupedActivityLogRows.value.length, 1)
+  assert.equal(harness.panel.visibleLogCount.value, 120)
+  assert.equal(harness.panel.canLoadMoreSelectedLogs.value, true)
+  assert.match(html, /class="load-more-row"/)
+  assert.match(html, /class="log-limit-note"[^]*?显示条目：1 · 已加载原始请求：120/)
+  harness.panel.loadMoreSelectedLogs()
+  await tick()
+  assert.equal(new URL(requests.filter((url) => url.startsWith('/api/monitoring/logs?')).at(-1), 'http://fixture').searchParams.get('limit'), '200')
+  harness.panel.selectedLogLevel.value = 'error'
+  assert.equal(harness.panel.visibleLogCount.value, 0)
+  assert.equal(state.groupedActivityLogRows.value.length, 0, 'grouping follows the visible row filter')
+  harness.panel.selectedLogLevel.value = 'all'
+  rows = [groupedPlaybackFixture(5, { level: 'error', detail: 'filtered failure' })]
+  harness.panel.selectedLogServer.value = 'synthetic-server'
+  harness.panel.logKeywordFilter.value = 'diag-group-5'
+  await harness.panel.refreshActivityLogs()
+  const filtered = await renderPage('LogsPage.vue', harness.panel)
+  assert.equal(harness.panel.visibleLogCount.value, 1)
+  assert.match(filtered, /filtered failure/)
+  assert.doesNotMatch(filtered, /<details\b/)
+  const params = new URL(requests.filter((url) => url.startsWith('/api/monitoring/logs?')).at(-1), 'http://fixture').searchParams
+  assert.equal(params.get('level'), null, 'playback view preserves its existing no-level-query contract')
+  assert.equal(params.get('server_id'), 'synthetic-server')
+  assert.equal(params.get('keyword'), 'diag-group-5')
+  let exportParams
+  context.mock.method(globalThis, 'fetch', async (url) => {
+    exportParams = new URL(url, 'http://fixture').searchParams
+    return new Response('synthetic export unavailable', { status: 503 })
+  })
+  await harness.panel.exportLogs()
+  assert.equal(exportParams.get('limit'), '500')
+  for (const key of ['level', 'server_id', 'keyword', 'kind']) assert.equal(exportParams.get(key), params.get(key))
+  rows = []
+  await harness.panel.refreshActivityLogs()
+  assert.equal(harness.panel.visibleLogCount.value, 0)
+  assert.equal(harness.panel.canLoadMoreSelectedLogs.value, false)
+})
+
+test('actual LogsPage renders structured movie/episode/long/unknown media in both languages independently of detail and copy', async () => {
+  const { translations } = load('lib/translations.ts')
+  const raw = 'request_id=diag-abc https://cdn.example.com/%E7%89%87%E5%90%8D%20file.mkv?token=secret'
+  const longTitle = '长媒体名称'.repeat(80)
+  for (const language of ['zh', 'en']) {
+    const localize = (key) => language === 'en' ? translations[key] || key : key
+    let state
+    const html = await renderPage('LogsPage.vue', {
+      t: localize,
+      visibleActivityLogRows: [
+        { media: { media_id: '1', name: '电影标题' } },
+        { media: { media_id: '2', name: '本集标题', series_name: '剧名', season_number: 1, episode_number: 22 } },
+        { media: { media_id: '3', name: longTitle, series_name: '番外', season_number: 0, episode_number: 0 } },
+        {}, { media: { media_id: 'unknown' } },
+        { media: { media_id: 'audio', name: 'Song', season_number: null, episode_number: null } },
+        { media: { media_id: 'movie', name: 'Basic Instinct' } },
+        { media: { media_id: 'movie2', name: 'The Secret: Dare to Dream' } },
+      ].map((entry, id) => ({ ...entry, id, kind: 'playback', level: 'info', message: '服务器代理播放', detail: id === 0 ? raw : 'status=206 media_stream_not_measured', server_name: 'Synthetic' })),
+      filteredRequestDetailRows: [], isRequestDetailLogView: false,
+      formatLogTime: () => 'Synthetic time', logLevelLabel: () => 'Info',
+      isHttpUrl: (value) => /^https?:\/\//.test(value || ''), copyText: () => {},
+      logServers: [], logLevelOptions: [], visibleLogCount: 8,
+      logConfig: { level: 'info', max_size_mb: 20, max_backups: 5, format: '' },
+    }, (value) => { state = value })
+    assert.ok(html.includes('电影标题'))
+    assert.match(html, /class="log-media" title="Song"/)
+    assert.ok(html.includes('Basic Instinct'))
+    assert.ok(html.includes('The Secret: Dare to Dream'))
+    assert.doesNotMatch(html, /S01E05 · Song/)
+    assert.ok(html.includes('剧名 · S01E22 · 本集标题'))
+    assert.ok(html.includes(`番外 · S00E00 · ${longTitle}`))
+    assert.ok(html.includes(language === 'en' ? 'Media information unknown' : '媒体信息未知'))
+    assert.ok(html.includes(language === 'en' ? 'Media' : '媒体'))
+    assert.match(html, /片名 file\.mkv/)
+    assert.match(html, /status=206 media_stream_not_measured/)
+    assert.match(html, /class="copy-link"/)
+    assert.doesNotMatch(html, /undefined|NaN|token=secret/)
+    assert.match(html, /class="log-request-id"[^]*?<code>diag-abc<\/code>/)
+    assert.doesNotMatch(html, /request_id=diag-/)
+    assert.equal(state.displayActivityLogRows.value[0].copyDetail, 'https://cdn.example.com/%E7%89%87%E5%90%8D%20file.mkv')
+  }
+  const css = readFileSync(path.resolve(__dirname, '../src/style.css'), 'utf8')
+  assert.match(css, /\.log-body \.log-media\s*\{[^}]*overflow-wrap: anywhere/s)
+})
+
 test('the request detail view renders the decoded detail as a copyable link', async () => {
   const row = {
     id: 1, server_id: 'server-a', server_name: 'Synthetic', status_code: 302,
@@ -3418,8 +3701,109 @@ test('the request detail view renders the decoded detail as a copyable link', as
   // The decoded file name is visible and the raw escapes are gone.
   assert.match(html, /重器\.S01E21 DDP\.mkv/)
   assert.doesNotMatch(html, /%E9%87%8D%E5%99%A8/)
+  assert.match(html, /<code>diag-0123456789abcdef0123456789abcdef<\/code>/)
   assert.doesNotMatch(html, /request_id=diag-/)
   assert.doesNotMatch(html, /token=secret/)
   // It is rendered as the same copyable link the playback log view uses.
   assert.match(html, /copy-link/)
+})
+
+test('the proxy request view excludes playback rows by default while explicit types and other views stay untouched', async (context) => {
+  const requests = []
+  const harness = panelHarness(context, 'logs', async (url) => {
+    requests.push(url)
+    if (url === '/api/setup-status') return { initialized: true }
+    if (url === '/api/profile') return { username: 'fixture' }
+    if (url === '/api/servers/options') return { servers: [], can_control_sessions: false }
+    if (url.startsWith('/api/monitoring/')) return []
+    return {}
+  })
+  await harness.start()
+  const panel = harness.panel
+  const lastParams = (path) => {
+    const matched = requests.filter((url) => url.startsWith(path))
+    assert.ok(matched.length, `expected a request to ${path}`)
+    return new URL(matched.at(-1), 'http://fixture').searchParams
+  }
+
+  // 反代请求默认排除播放行：播放流按播放会话展示在播放日志中。
+  panel.selectedLogView.value = 'proxy'
+  panel.selectedRequestPathType.value = 'all'
+  await panel.refreshActivityLogs()
+  let params = lastParams('/api/monitoring/request-details')
+  assert.equal(params.get('exclude_path_type'), 'video_stream')
+  assert.equal(params.get('path_type'), null)
+
+  // 明确选择请求类型时不发送排除参数，诊断深链（video_stream + 关键词）仍可查到原始行。
+  for (const pathType of ['video_stream', 'playback_info', 'proxy']) {
+    panel.selectedRequestPathType.value = pathType
+    await panel.refreshActivityLogs()
+    params = lastParams('/api/monitoring/request-details')
+    assert.equal(params.get('path_type'), pathType)
+    assert.equal(params.get('exclude_path_type'), null, `${pathType} rows must stay reachable`)
+  }
+
+  // 回到「全部请求」时恢复默认排除。
+  panel.selectedRequestPathType.value = 'all'
+  await panel.refreshActivityLogs()
+  assert.equal(lastParams('/api/monitoring/request-details').get('exclude_path_type'), 'video_stream')
+
+  // 拦截日志视图走自己的端点，被拦截的播放请求仍然可见。
+  panel.selectedLogView.value = 'blocked'
+  panel.selectedRequestPathType.value = 'all'
+  await panel.refreshActivityLogs()
+  params = lastParams('/api/monitoring/block-logs')
+  assert.equal(params.get('exclude_path_type'), null)
+  assert.equal(params.get('path_type'), null)
+
+  // 播放日志视图走自己的端点，分组语义不变。
+  panel.selectedLogView.value = 'playback'
+  await panel.refreshActivityLogs()
+  params = lastParams('/api/monitoring/logs')
+  assert.equal(params.get('exclude_path_type'), null)
+  assert.equal(params.get('kind'), 'playback')
+})
+
+function proxyLogsPanel(localize) {
+  return {
+    t: localize,
+    logsLoading: false, logsError: '',
+    selectedLogServer: 'all', selectedLogView: 'proxy', selectedLogLevel: 'all',
+    selectedRequestPathType: 'all', logKeywordFilter: '', logSince: '', logUntil: '',
+    logConfig: { level: 'info', max_size_mb: 20, max_backups: 5, format: '' },
+    canManageLogConfig: false, logConfigLoading: false, logConfigSaving: false, logConfigError: '',
+    refreshLogConfig: () => {}, saveLogConfig: () => {},
+    activityLogMaxLimit: 200,
+    requestDetailDisplayMax: 100, requestDetailPersistDays: 7, requestDetailPersistMax: 10000,
+    logServers: [], selectedLogViewLabel: localize('反代请求'),
+    visibleActivityLogRows: [], isRequestDetailLogView: true,
+    showLogLevelFilter: true, logLevelOptions: [],
+    filteredRequestDetailRows: [], visibleLogCount: 0, canLoadMoreSelectedLogs: false,
+    refreshActivityLogs: () => {}, exportLogs: () => {}, handleLogViewChange: () => {},
+    refreshLogsWithReset: () => {}, handleScrollableLogListScroll: () => {},
+    loadMoreSelectedLogs: () => {}, formatLogTime: (time) => String(time),
+    logLevelLabel: (level) => level, ipWithLocation: (ip) => ip,
+    isHttpUrl: () => false, copyText: () => {},
+    requestOutcomeClass: () => 'ok', requestSeverity: () => 'info',
+    requestSeverityLabel: () => 'info', requestRowTitle: () => 'Synthetic request',
+    requestPathTypeLabel: () => localize('视频流'),
+  }
+}
+
+test('the proxy view explains where playback requests live in zh and en without touching the playback hints', async () => {
+  const { translations } = load('lib/translations.ts')
+  const hint = '播放请求按播放会话折叠展示在「播放日志」中；「反代请求」默认不列出播放流，选择「视频流」仍可查看原始播放请求。'
+  assert.ok(translations[hint], 'the proxy hint needs an English mapping')
+  for (const language of ['zh', 'en']) {
+    const localize = (key) => language === 'en' ? translations[key] || key : key
+    const proxyHtml = await renderPage('LogsPage.vue', proxyLogsPanel(localize))
+    assert.ok(proxyHtml.includes(localize(hint)), `the proxy hint is visible in ${language}`)
+    assert.match(proxyHtml, /class="log-request-hint"/)
+    // 视频流选项保留，诊断深链仍可手动筛选原始播放请求。
+    assert.match(proxyHtml, /<option value="video_stream">/)
+    assert.ok(proxyHtml.includes(localize('视频流')))
+    const playbackHtml = await renderPage('LogsPage.vue', groupedLogsPanel([groupedPlaybackFixture(1)], language))
+    assert.ok(!playbackHtml.includes(localize(hint)), `the proxy hint stays out of the playback view in ${language}`)
+    assert.ok(playbackHtml.includes(localize('同一播放的多个 Range 分段请求折叠展示，展开可查看原始请求；警告和错误单独显示。')))
+  }
 })

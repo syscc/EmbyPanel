@@ -9,7 +9,7 @@ use std::{
 
 use serde::Serialize;
 
-use crate::diagnostics::decode_log_detail_url;
+use crate::diagnostics::{decode_log_detail_url, sanitize_diagnostic_text, sanitize_media_label};
 use crate::ip_location::IpLocation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +56,37 @@ impl ActivityLevel {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PlaybackMedia {
+    pub media_id: String,
+    pub name: Option<String>,
+    pub series_name: Option<String>,
+    pub season_number: Option<i32>,
+    pub episode_number: Option<i32>,
+}
+
+impl PlaybackMedia {
+    pub fn sanitized(mut self) -> Self {
+        fn clean(value: &str) -> String {
+            sanitize_diagnostic_text(value)
+                .trim()
+                .chars()
+                .take(256)
+                .collect()
+        }
+        self.media_id = clean(&self.media_id);
+        self.name = self
+            .name
+            .map(|name| sanitize_media_label(&name))
+            .filter(|name| !name.is_empty());
+        self.series_name = self
+            .series_name
+            .map(|name| sanitize_media_label(&name))
+            .filter(|name| !name.is_empty());
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ActivityLogEntry {
     pub id: u64,
@@ -67,7 +98,11 @@ pub struct ActivityLogEntry {
     pub playback_user: Option<String>,
     pub playback_ip: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub playback_group_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ip_location: Option<IpLocation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<PlaybackMedia>,
     pub message: String,
     pub detail: String,
 }
@@ -78,8 +113,32 @@ pub struct PlaybackLogRecord<'a> {
     pub server_name: &'a str,
     pub playback_user: &'a str,
     pub playback_ip: &'a str,
+    pub playback_group_id: Option<&'a str>,
+    pub media: Option<PlaybackMedia>,
+    pub request_path: Option<&'a str>,
+    pub range: Option<&'a str>,
     pub message: String,
     pub detail: String,
+}
+
+fn playback_range_for_log(value: &str) -> String {
+    // Do not log arbitrary header text, even when it looks partly like a byte range.
+    let valid = value.len() <= 256
+        && !value.chars().any(char::is_control)
+        && value.strip_prefix("bytes=").is_some_and(|ranges| {
+            ranges.split(',').all(|range| {
+                let Some((start, end)) = range.trim().split_once('-') else {
+                    return false;
+                };
+                let digits = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+                (!start.is_empty() || !end.is_empty()) && digits(start) && digits(end)
+            })
+        });
+    if valid {
+        value.to_string()
+    } else {
+        "[invalid]".to_string()
+    }
 }
 
 pub struct ActivityLogStore {
@@ -119,13 +178,28 @@ impl ActivityLogStore {
             server_name: server_name.to_string(),
             playback_user: None,
             playback_ip: None,
+            playback_group_id: None,
             ip_location: None,
+            media: None,
             message: message.into(),
             detail: detail.into(),
         });
     }
 
     pub fn record_playback(&self, record: PlaybackLogRecord<'_>) {
+        let mut detail = record.detail;
+        if let Some(path) = record.request_path {
+            let path: String = crate::diagnostics::sanitize_path(path)
+                .chars()
+                .take(512)
+                .collect();
+            if !path.is_empty() {
+                detail.push_str(&format!(" path={path}"));
+            }
+        }
+        if let Some(range) = record.range {
+            detail.push_str(&format!(" range={}", playback_range_for_log(range)));
+        }
         let mut entries = self.entries.lock().expect("activity log mutex poisoned");
         while entries.len() >= self.limit {
             entries.pop_front();
@@ -139,9 +213,21 @@ impl ActivityLogStore {
             server_name: record.server_name.to_string(),
             playback_user: Some(record.playback_user.to_string()),
             playback_ip: Some(record.playback_ip.to_string()),
+            playback_group_id: record
+                .playback_group_id
+                .filter(|value| {
+                    value.len() == 69
+                        && value.strip_prefix("play-").is_some_and(|digest| {
+                            digest
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                        })
+                })
+                .map(str::to_string),
             ip_location: None,
+            media: record.media.map(PlaybackMedia::sanitized),
             message: record.message,
-            detail: record.detail,
+            detail,
         });
     }
 
@@ -199,7 +285,21 @@ impl ActivityLogStore {
                         .is_none_or(|until| entry.timestamp_ms <= until)
                     && keyword.as_ref().is_none_or(|keyword| {
                         let haystack = format!(
-                            "{} {} {} {} {} {}",
+                            "{} {} {} {} {} {} {} {} {}",
+                            entry
+                                .media
+                                .as_ref()
+                                .map_or("", |media| media.media_id.as_str()),
+                            entry
+                                .media
+                                .as_ref()
+                                .and_then(|media| media.name.as_deref())
+                                .unwrap_or(""),
+                            entry
+                                .media
+                                .as_ref()
+                                .and_then(|media| media.series_name.as_deref())
+                                .unwrap_or(""),
                             entry.server_name,
                             entry.playback_user.as_deref().unwrap_or(""),
                             entry.playback_ip.as_deref().unwrap_or(""),
@@ -277,6 +377,297 @@ mod tests {
                 .list_filtered_scoped(explicit, Some(&allowed))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn playback_request_context_is_sanitized_at_storage() {
+        let oversized_range = format!("bytes=0-{}", "9".repeat(256));
+        for (range, expected) in [
+            (None, None),
+            (Some("bytes=0-1023"), Some("bytes=0-1023")),
+            (Some("bytes=1024-"), Some("bytes=1024-")),
+            (Some("bytes=-512"), Some("bytes=-512")),
+            (Some("bytes=0-1, 4-5"), Some("bytes=0-1, 4-5")),
+            (Some("bytes=-"), Some("[invalid]")),
+            (Some("bytes=0-1,token=range-canary"), Some("[invalid]")),
+            (
+                Some("bytes=0-1\r\nAuthorization: range-canary"),
+                Some("[invalid]"),
+            ),
+            (Some("bytes=0-1\t"), Some("[invalid]")),
+            (Some("Bearer range-canary"), Some("[invalid]")),
+            (Some(oversized_range.as_str()), Some("[invalid]")),
+        ] {
+            let store = ActivityLogStore::new(1);
+            store.record_playback(PlaybackLogRecord {
+                level: ActivityLevel::Info,
+                server_id: None,
+                server_name: "Fixture",
+                playback_user: "Fixture",
+                playback_ip: "127.0.0.1",
+                media: None,
+                request_path: Some("/Videos/id/stream\n?api_key=query-canary&opaque=hidden"),
+                range,
+                playback_group_id: None,
+                message: "Playback".into(),
+                detail: "request_id=diag-fixture status=206 upstream_response_headers_received media_stream_not_measured".into(),
+            });
+            let logs = store.list(None, None, 1);
+            let detail = &logs[0].detail;
+            assert!(detail.starts_with("request_id=diag-fixture status=206"));
+            assert!(detail.contains(" path=/Videos/id/stream"));
+            assert!(!detail.contains('?'));
+            assert!(!detail.contains("canary"));
+            assert!(!detail.chars().any(char::is_control));
+            match expected {
+                Some(value) => assert!(detail.ends_with(&format!(" range={value}"))),
+                None => assert!(!detail.contains(" range=")),
+            }
+        }
+    }
+
+    #[test]
+    fn playback_group_ids_are_validated_without_dropping_raw_records() {
+        let store = ActivityLogStore::new(20);
+        let valid = format!("play-{}", "a1".repeat(32));
+        let invalid = [
+            String::new(),
+            "session-device-token".into(),
+            format!("play-{}", "A".repeat(64)),
+            format!("play-{}", "a".repeat(63)),
+            format!("{valid}\n"),
+        ];
+        for group in [None, Some(valid.as_str())]
+            .into_iter()
+            .chain(invalid.iter().map(|value| Some(value.as_str())))
+        {
+            store.record_playback(PlaybackLogRecord {
+                level: ActivityLevel::Info,
+                server_id: Some("fixture"),
+                server_name: "Fixture",
+                playback_user: "Fixture",
+                playback_ip: "127.0.0.1",
+                playback_group_id: group,
+                media: None,
+                request_path: None,
+                range: None,
+                message: "Playback".into(),
+                detail: "raw detail".into(),
+            });
+            let rows = store.list(None, None, 20);
+            assert_eq!(
+                rows[0].playback_group_id.as_deref(),
+                group.filter(|value| *value == valid)
+            );
+            assert_eq!(rows[0].detail, "raw detail");
+            let json = serde_json::to_value(&rows[0]).unwrap();
+            assert_eq!(
+                json.get("playback_group_id").is_some(),
+                group == Some(valid.as_str())
+            );
+        }
+        assert_eq!(store.list(None, None, 20).len(), 7);
+        store.record(
+            ActivityKind::General,
+            ActivityLevel::Info,
+            None,
+            "Fixture",
+            "General",
+            "",
+        );
+        assert!(store.list(None, None, 1)[0].playback_group_id.is_none());
+    }
+
+    #[test]
+    fn playback_request_path_is_redacted_and_bounded_without_changing_redirects() {
+        let store = ActivityLogStore::new(1);
+        let long_path = format!("/Videos/{}/stream", "a".repeat(600));
+        for (path, expected) in [
+            (
+                None,
+                "request_id=diag-fixture https://media.invalid/movie".to_string(),
+            ),
+            (
+                Some("/Videos/token=path-canary/stream"),
+                "request_id=diag-fixture https://media.invalid/movie path=/Videos/token=[REDACTED]"
+                    .to_string(),
+            ),
+            (
+                Some(long_path.as_str()),
+                format!(
+                    "request_id=diag-fixture https://media.invalid/movie path={}",
+                    long_path.chars().take(512).collect::<String>()
+                ),
+            ),
+        ] {
+            store.record_playback(PlaybackLogRecord {
+                level: ActivityLevel::Info,
+                server_id: None,
+                server_name: "Fixture",
+                playback_user: "Fixture",
+                playback_ip: "127.0.0.1",
+                media: None,
+                request_path: path,
+                range: None,
+                playback_group_id: None,
+                message: "Playback".into(),
+                detail: "request_id=diag-fixture https://media.invalid/movie".into(),
+            });
+            let logs = store.list(None, None, 1);
+            assert_eq!(logs[0].detail, expected);
+            assert!(!logs[0].detail.contains("path-canary"));
+        }
+    }
+
+    #[test]
+    fn quoted_media_credentials_never_reach_storage_or_search() {
+        let store = ActivityLogStore::new(10);
+        for title in [
+            r#"Authorization="Bearer quote_canary_42""#,
+            "Authorization='Basic quote_canary_42'",
+        ] {
+            store.record_playback(PlaybackLogRecord {
+                level: ActivityLevel::Info,
+                server_id: Some("fixture"),
+                server_name: "Fixture",
+                playback_user: "Fixture",
+                playback_ip: "127.0.0.1",
+                message: "Playback".into(),
+                detail: String::new(),
+                request_path: None,
+                range: None,
+                playback_group_id: None,
+                media: Some(PlaybackMedia {
+                    media_id: "42".into(),
+                    name: Some(title.into()),
+                    series_name: Some(title.into()),
+                    ..Default::default()
+                }),
+            });
+        }
+        for entry in store.list(None, None, 10) {
+            assert!(
+                !serde_json::to_string(&entry)
+                    .unwrap()
+                    .contains("quote_canary_42")
+            );
+        }
+        assert!(
+            store
+                .list_filtered(ActivityLogFilter {
+                    server_id: None,
+                    kind: None,
+                    level: None,
+                    keyword: Some("quote_canary_42"),
+                    since_ms: None,
+                    until_ms: None,
+                    limit: 10,
+                })
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn review_media_titles_survive_storage_and_search() {
+        for title in ["Basic Instinct", "The Secret: Dare to Dream"] {
+            let store = ActivityLogStore::new(10);
+            store.record_playback(PlaybackLogRecord {
+                level: ActivityLevel::Info,
+                server_id: Some("fixture"),
+                server_name: "Fixture",
+                playback_user: "Fixture",
+                playback_ip: "127.0.0.1",
+                message: "Playback".into(),
+                detail: String::new(),
+                request_path: None,
+                range: None,
+                playback_group_id: None,
+                media: Some(PlaybackMedia {
+                    media_id: "42".into(),
+                    name: Some(title.into()),
+                    series_name: Some(title.into()),
+                    ..Default::default()
+                }),
+            });
+            let entries = store.list(None, None, 10);
+            let media = entries[0].media.as_ref().unwrap();
+            assert_eq!(media.name.as_deref(), Some(title));
+            assert_eq!(media.series_name.as_deref(), Some(title));
+            assert_eq!(
+                store
+                    .list_filtered(ActivityLogFilter {
+                        server_id: None,
+                        kind: None,
+                        level: None,
+                        keyword: Some(title),
+                        since_ms: None,
+                        until_ms: None,
+                        limit: 10,
+                    })
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn playback_media_is_sanitized_and_searchable_without_changing_scope() {
+        let store = ActivityLogStore::new(20);
+        store.record_playback(PlaybackLogRecord {
+            level: ActivityLevel::Info,
+            server_id: Some("a"),
+            server_name: "A",
+            playback_user: "Fixture",
+            playback_ip: "127.0.0.1",
+            message: "播放".into(),
+            detail: "technical".into(),
+            playback_group_id: None,
+            request_path: None,
+            range: None,
+            media: Some(PlaybackMedia {
+                media_id: "media-42".into(),
+                name: Some(format!(
+                    "电影\n token=synthetic-secret {}",
+                    "名".repeat(400)
+                )),
+                series_name: Some("剧名".into()),
+                season_number: Some(0),
+                episode_number: Some(0),
+            }),
+        });
+        let rows = store.list(None, None, 20);
+        let media = rows[0].media.as_ref().unwrap();
+        let title = media.name.as_ref().unwrap();
+        assert!(!title.contains("synthetic-secret"));
+        assert!(!title.chars().any(char::is_control));
+        assert!(title.chars().count() <= 256);
+        assert_eq!(media.season_number, Some(0));
+        for keyword in ["电影", "剧名", "media-42"] {
+            let filter = ActivityLogFilter {
+                server_id: None,
+                kind: Some(ActivityKind::Playback),
+                level: None,
+                keyword: Some(keyword),
+                since_ms: None,
+                until_ms: None,
+                limit: 1,
+            };
+            assert_eq!(store.list_filtered(filter).len(), 1);
+            let filter = ActivityLogFilter {
+                server_id: None,
+                kind: None,
+                level: None,
+                keyword: Some(keyword),
+                since_ms: None,
+                until_ms: None,
+                limit: 1,
+            };
+            assert!(
+                store
+                    .list_filtered_scoped(filter, Some(&HashSet::new()))
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

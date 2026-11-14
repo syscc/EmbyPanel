@@ -82,6 +82,8 @@ struct ItemsResponse {
 
 #[derive(Debug, Deserialize)]
 struct EmbyItem {
+    #[serde(rename = "Type")]
+    item_type: Option<String>,
     #[serde(rename = "MediaSources", default)]
     media_sources: Vec<MediaSource>,
     #[serde(rename = "Name")]
@@ -124,6 +126,7 @@ pub async fn get_media_path(
 /// Media labels come from the same Items request; callers must not fetch on cache hits.
 #[derive(Debug, Default)]
 pub(crate) struct MediaPathResolution {
+    pub item_type: Option<String>,
     pub path: Option<String>,
     pub media_name: Option<String>,
     pub series_name: Option<String>,
@@ -145,7 +148,7 @@ pub(crate) async fn get_media_path_observed(
         .append_pair("Ids", item_id)
         .append_pair(
             "Fields",
-            "Path,MediaSources,SeriesName,ParentIndexNumber,IndexNumber",
+            "Type,Path,MediaSources,SeriesName,ParentIndexNumber,IndexNumber",
         );
 
     let mut request = client.get(url);
@@ -174,6 +177,7 @@ pub(crate) async fn get_media_path_observed(
     };
 
     Ok(MediaPathResolution {
+        item_type: item.item_type.clone(),
         path: source.and_then(|source| source.path.clone()),
         media_source_id: source.and_then(|source| source.id.clone()),
         media_name: item.name.clone(),

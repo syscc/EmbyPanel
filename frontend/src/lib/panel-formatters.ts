@@ -7,8 +7,14 @@ export function isHttpUrl(value: string) {
   return /^https?:\/\//i.test(value.trim())
 }
 
+const LOG_REQUEST_PREFIX = /^request_id=(diag-[a-zA-Z0-9-]{1,120})(?:\s+|$)/
+
+export function logRequestId(value: string) {
+  return value.match(LOG_REQUEST_PREFIX)?.[1] ?? ''
+}
+
 export function formatLogDetail(value: string) {
-  const detail = value.replace(/^request_id=diag-[a-zA-Z0-9-]{1,120}(?:\s+|$)/, '')
+  const detail = value.replace(LOG_REQUEST_PREFIX, '')
   const trimmed = detail.trim()
   if (!/^https?:\/\/\S+$/i.test(trimmed)) return detail
 
@@ -75,7 +81,7 @@ export function emptyToNull(value: string | null) {
  */
 export function copyableLogDetail(value: string) {
   const detail = value
-    .replace(/^request_id=diag-[a-zA-Z0-9-]{1,120}(?:\s+|$)/, '')
+    .replace(LOG_REQUEST_PREFIX, '')
     .trim()
   if (!/^https?:\/\/\S+$/i.test(detail)) return detail
 

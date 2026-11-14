@@ -459,6 +459,7 @@ mod diagnostics_expansion {
             .list_proxy_request_details(db::ProxyRequestDetailFilter {
                 server_id: None,
                 path_type: Some("video_stream"),
+                exclude_path_type: None,
                 keyword: None,
                 since_ms: None,
                 until_ms: None,

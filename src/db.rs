@@ -3273,6 +3273,15 @@ impl SettingsStore {
             conditions.push("path_type = ?");
             values.push(Box::new(path_type.to_string()));
         }
+        // The exclusion is part of the SQL WHERE clause, so it runs before the
+        // LIMIT and the returned page stays filled with the rows that are shown.
+        if let Some(exclude_path_type) = filter.exclude_path_type {
+            let exclude_path_type = exclude_path_type.trim();
+            if !exclude_path_type.is_empty() {
+                conditions.push("path_type <> ?");
+                values.push(Box::new(exclude_path_type.to_string()));
+            }
+        }
         if let Some(since_ms) = filter.since_ms {
             conditions.push("timestamp_ms >= ?");
             values.push(Box::new(since_ms as i64));
@@ -4261,6 +4270,12 @@ pub struct ProxyAnalyticsSample {
 pub struct ProxyRequestDetailFilter<'a> {
     pub server_id: Option<&'a str>,
     pub path_type: Option<&'a str>,
+    /// Excludes every row whose `path_type` equals this value.
+    ///
+    /// The exclusion is applied inside the SQL `WHERE` clause, so it runs
+    /// before `LIMIT` and the returned page stays filled with the rows that
+    /// are actually shown.
+    pub exclude_path_type: Option<&'a str>,
     pub keyword: Option<&'a str>,
     pub since_ms: Option<u128>,
     pub until_ms: Option<u128>,
@@ -5727,6 +5742,7 @@ mod tests {
             .list_proxy_request_details(ProxyRequestDetailFilter {
                 server_id: Some("server-a"),
                 path_type: None,
+                exclude_path_type: None,
                 keyword: None,
                 since_ms: None,
                 until_ms: None,
@@ -5768,6 +5784,7 @@ mod tests {
         let detail_filter = |keyword: &'static str| ProxyRequestDetailFilter {
             server_id: None,
             path_type: None,
+            exclude_path_type: None,
             keyword: Some(keyword),
             since_ms: None,
             until_ms: None,
@@ -5807,6 +5824,144 @@ mod tests {
 
         drop(store);
         remove_test_database(&path);
+    }
+
+    #[test]
+    fn proxy_request_detail_exclusion_runs_before_limit_and_keeps_other_filters() {
+        let (store, conn) = memory_security_store("proxy-detail-exclude");
+        // Five rows: three newer playback rows plus two non-playback rows.
+        for (timestamp, server, path_type, path, blocked) in [
+            (
+                500_i64,
+                "server-a",
+                "video_stream",
+                "/videos/1/stream",
+                1_i64,
+            ),
+            (400, "server-a", "video_stream", "/videos/2/stream", 0),
+            (300, "server-a", "video_stream", "/videos/3/stream", 0),
+            (200, "server-a", "proxy", "/emby/Items", 0),
+            (100, "server-b", "playback_info", "/Items/1/PlaybackInfo", 0),
+        ] {
+            conn.execute(
+                "INSERT INTO proxy_request_logs(timestamp_ms,server_id,server_name,port,method,path,path_type,status_code,outcome,duration_ms,playback_user,playback_ip,cache_hit,blocked,detail)
+                 VALUES (?1,?2,?2,8096,'GET',?3,?4,200,'ok',1,'','',0,?5,?6)",
+                params![
+                    timestamp,
+                    server,
+                    path,
+                    path_type,
+                    blocked,
+                    format!("request_id=diag-{timestamp:016x}"),
+                ],
+            )
+            .unwrap();
+        }
+        let filter = |exclude_path_type: Option<&'static str>,
+                      path_type: Option<&'static str>,
+                      keyword: Option<&'static str>,
+                      limit: usize| ProxyRequestDetailFilter {
+            server_id: None,
+            path_type,
+            exclude_path_type,
+            keyword,
+            since_ms: None,
+            until_ms: None,
+            limit,
+        };
+
+        // The exclusion drops the playback rows and keeps every other path type.
+        let rows = store
+            .list_proxy_request_details(filter(Some("video_stream"), None, None, 10))
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.path_type != "video_stream"));
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.path_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["proxy", "playback_info"]
+        );
+
+        // The exclusion happens before LIMIT: a small limit is still filled with
+        // the non-playback rows instead of being consumed by the newer playback rows.
+        let limited = store
+            .list_proxy_request_details(filter(Some("video_stream"), None, None, 2))
+            .unwrap();
+        assert_eq!(limited.len(), 2);
+        assert!(limited.iter().all(|row| row.path_type != "video_stream"));
+        let without_exclusion = store
+            .list_proxy_request_details(filter(None, None, None, 2))
+            .unwrap();
+        assert_eq!(without_exclusion.len(), 2);
+        assert!(
+            without_exclusion
+                .iter()
+                .all(|row| row.path_type == "video_stream")
+        );
+
+        // The keyword filter still applies together with the exclusion.
+        let keyword_rows = store
+            .list_proxy_request_details(filter(Some("video_stream"), None, Some("emby"), 10))
+            .unwrap();
+        assert_eq!(keyword_rows.len(), 1);
+        assert_eq!(keyword_rows[0].path, "/emby/Items");
+        let keyword_playback_info = store
+            .list_proxy_request_details(filter(
+                Some("video_stream"),
+                None,
+                Some("playbackinfo"),
+                10,
+            ))
+            .unwrap();
+        assert_eq!(keyword_playback_info.len(), 1);
+        assert_eq!(keyword_playback_info[0].path_type, "playback_info");
+        let keyword_playback = store
+            .list_proxy_request_details(filter(Some("video_stream"), None, Some("videos"), 10))
+            .unwrap();
+        assert!(keyword_playback.is_empty());
+
+        // An explicit path type is not affected when no exclusion is requested.
+        let playback_only = store
+            .list_proxy_request_details(filter(None, Some("video_stream"), None, 10))
+            .unwrap();
+        assert_eq!(playback_only.len(), 3);
+        assert!(
+            playback_only
+                .iter()
+                .all(|row| row.path_type == "video_stream")
+        );
+
+        // Server scoping and the time window keep working with the exclusion.
+        let allowed = std::collections::HashSet::from(["server-a".to_string()]);
+        let scoped = store
+            .list_proxy_request_details_scoped(
+                filter(Some("video_stream"), None, None, 10),
+                Some(&allowed),
+            )
+            .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].server_id, "server-a");
+        assert_eq!(scoped[0].path_type, "proxy");
+        let time_filtered = store
+            .list_proxy_request_details(ProxyRequestDetailFilter {
+                server_id: None,
+                path_type: None,
+                exclude_path_type: Some("video_stream"),
+                keyword: None,
+                since_ms: Some(150),
+                until_ms: Some(250),
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(time_filtered.len(), 1);
+        assert_eq!(time_filtered[0].timestamp_ms, 200);
+
+        // Blocked playback rows are untouched: the block log view keeps them.
+        let blocked = store.list_blocked_proxy_request_details(10).unwrap();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].path_type, "video_stream");
+        assert!(blocked[0].blocked);
     }
 
     #[test]

@@ -69,6 +69,13 @@ pub struct AuditLogQuery {
 pub struct RequestDetailQuery {
     server_id: Option<String>,
     path_type: Option<String>,
+    /// Optional single `path_type` value that must not appear in the result.
+    ///
+    /// The proxy request view uses it to hide playback rows that the playback
+    /// log already groups per playback session. The exclusion is applied in SQL
+    /// before the `LIMIT`, so the returned page and the shown row count stay
+    /// correct. It is ignored by every other endpoint.
+    exclude_path_type: Option<String>,
     keyword: Option<String>,
     since_ms: Option<u128>,
     until_ms: Option<u128>,
@@ -578,10 +585,12 @@ pub async fn export_activity_logs(
         },
         allowed_servers.as_ref(),
     );
-    let mut csv = String::from("id,time,kind,level,server,user,ip,message,detail\n");
+    let mut csv = String::from(
+        "id,time,kind,level,server,user,ip,message,detail,media_id,media_name,series_name,season_number,episode_number\n",
+    );
     for entry in logs {
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{}\n",
             entry.id,
             entry.timestamp_ms,
             csv_escape(&entry.kind),
@@ -591,6 +600,7 @@ pub async fn export_activity_logs(
             csv_escape(entry.playback_ip.as_deref().unwrap_or("")),
             csv_escape(&entry.message),
             csv_escape(&decode_log_detail_url(&entry.detail)),
+            playback_media_csv(entry.media.as_ref()),
         ));
     }
     Ok((
@@ -664,6 +674,50 @@ pub async fn connectivity_status(
     Ok(Json(statuses))
 }
 
+/// Maximum accepted length of the `exclude_path_type` query value.
+const EXCLUDE_PATH_TYPE_MAX_LEN: usize = 64;
+
+/// Normalizes the optional `exclude_path_type` query value.
+///
+/// Blank values, the `all` placeholder and values that are not plain
+/// identifiers are ignored, so a malformed value can never narrow the result
+/// set in an unexpected way.
+fn normalize_exclude_path_type(value: Option<&str>) -> Option<&str> {
+    let value = value?.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("all") {
+        return None;
+    }
+    if value.len() > EXCLUDE_PATH_TYPE_MAX_LEN {
+        return None;
+    }
+    if !value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+    {
+        return None;
+    }
+    Some(value)
+}
+
+/// Builds the store filter for the proxy request view.
+///
+/// `path_type` and `exclude_path_type` are independent filters and are
+/// combined with `AND`; the caller decides whether to send an exclusion.
+fn request_detail_filter<'a>(
+    query: &'a RequestDetailQuery,
+    server_id: Option<&'a str>,
+) -> crate::db::ProxyRequestDetailFilter<'a> {
+    crate::db::ProxyRequestDetailFilter {
+        server_id,
+        path_type: query.path_type.as_deref().filter(|value| *value != "all"),
+        exclude_path_type: normalize_exclude_path_type(query.exclude_path_type.as_deref()),
+        keyword: query.keyword.as_deref(),
+        since_ms: query.since_ms,
+        until_ms: query.until_ms,
+        limit: query.limit.unwrap_or(200),
+    }
+}
+
 pub async fn request_details(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -675,14 +729,7 @@ pub async fn request_details(
     let requested_server_id =
         auth::require_server_filter(&auth_context, query.server_id.as_deref())?;
     let mut rows = state.settings_store.list_proxy_request_details_scoped(
-        crate::db::ProxyRequestDetailFilter {
-            server_id: requested_server_id,
-            path_type: query.path_type.as_deref().filter(|value| *value != "all"),
-            keyword: query.keyword.as_deref(),
-            since_ms: query.since_ms,
-            until_ms: query.until_ms,
-            limit: query.limit.unwrap_or(200),
-        },
+        request_detail_filter(&query, requested_server_id),
         allowed_servers.as_ref(),
     )?;
     for row in &mut rows {
@@ -924,6 +971,32 @@ fn percent(used: u64, total: u64) -> u8 {
     ((used as f64 / total as f64) * 100.0)
         .round()
         .clamp(0.0, 100.0) as u8
+}
+
+fn playback_media_csv(media: Option<&crate::activity_log::PlaybackMedia>) -> String {
+    let values = media.map_or_else(
+        || vec![String::new(); 5],
+        |media| {
+            vec![
+                media.media_id.clone(),
+                media.name.clone().unwrap_or_default(),
+                media.series_name.clone().unwrap_or_default(),
+                media
+                    .season_number
+                    .map(|n| n.to_string())
+                    .unwrap_or_default(),
+                media
+                    .episode_number
+                    .map(|n| n.to_string())
+                    .unwrap_or_default(),
+            ]
+        },
+    );
+    values
+        .iter()
+        .map(|value| csv_escape(value))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn csv_escape(value: &str) -> String {
@@ -1299,11 +1372,401 @@ mod tests {
     }
 
     #[test]
+    fn quoted_media_credentials_never_reach_csv() {
+        let store = crate::activity_log::ActivityLogStore::new(10);
+        for title in [
+            r#"Authorization="Bearer quote_canary_42""#,
+            "Authorization='Basic quote_canary_42'",
+        ] {
+            store.record_playback(crate::activity_log::PlaybackLogRecord {
+                level: crate::activity_log::ActivityLevel::Info,
+                server_id: Some("fixture"),
+                server_name: "Fixture",
+                playback_user: "Fixture",
+                playback_ip: "127.0.0.1",
+                message: "Playback".into(),
+                detail: String::new(),
+                request_path: None,
+                range: None,
+                playback_group_id: None,
+                media: Some(crate::activity_log::PlaybackMedia {
+                    media_id: "42".into(),
+                    name: Some(title.into()),
+                    series_name: Some(title.into()),
+                    ..Default::default()
+                }),
+            });
+        }
+        for entry in store.list(None, None, 10) {
+            let csv = super::playback_media_csv(entry.media.as_ref());
+            assert!(!csv.contains("quote_canary_42"), "{csv}");
+            assert!(csv.contains("[REDACTED]"));
+        }
+    }
+
+    #[test]
+    fn review_media_csv_keeps_safe_real_titles_and_redacts_credentials() {
+        let store = crate::activity_log::ActivityLogStore::new(10);
+        for title in [
+            "Basic Instinct",
+            "The Secret: Dare to Dream",
+            "token=synthetic_canary",
+        ] {
+            store.record_playback(crate::activity_log::PlaybackLogRecord {
+                level: crate::activity_log::ActivityLevel::Info,
+                server_id: Some("fixture"),
+                server_name: "Fixture",
+                playback_user: "Fixture",
+                playback_ip: "127.0.0.1",
+                message: "Playback".into(),
+                detail: String::new(),
+                request_path: None,
+                range: None,
+                playback_group_id: None,
+                media: Some(crate::activity_log::PlaybackMedia {
+                    media_id: "42".into(),
+                    name: Some(title.into()),
+                    series_name: Some(title.into()),
+                    ..Default::default()
+                }),
+            });
+        }
+        let rows = store.list(None, None, 10);
+        assert!(!super::playback_media_csv(rows[0].media.as_ref()).contains("synthetic_canary"));
+        assert!(
+            super::playback_media_csv(rows[1].media.as_ref()).contains("The Secret: Dare to Dream")
+        );
+        assert!(super::playback_media_csv(rows[2].media.as_ref()).contains("Basic Instinct"));
+    }
+
+    #[test]
+    fn playback_media_csv_appends_five_escaped_columns_and_preserves_zero() {
+        let media = crate::activity_log::PlaybackMedia {
+            media_id: "42".into(),
+            name: Some("Film, \"Title\"".into()),
+            series_name: Some("Series".into()),
+            season_number: Some(0),
+            episode_number: Some(22),
+        };
+        assert_eq!(
+            super::playback_media_csv(Some(&media)),
+            "\"42\",\"Film, \"\"Title\"\"\",\"Series\",\"0\",\"22\""
+        );
+        assert_eq!(super::playback_media_csv(None), "\"\",\"\",\"\",\"\",\"\"");
+    }
+
+    #[test]
     fn log_detail_csv_row_carries_the_decoded_detail() {
         let detail = "https://cdn.example.com/%E9%87%8D%E5%99%A8.S01E21.mkv";
         assert_eq!(
             csv_escape(&decode_log_detail_url(detail)),
             "\"https://cdn.example.com/重器.S01E21.mkv\""
         );
+    }
+
+    #[test]
+    fn request_detail_query_maps_the_exclusion_parameter() {
+        let parse = |uri: &str| {
+            axum::extract::Query::<super::RequestDetailQuery>::try_from_uri(
+                &uri.parse::<axum::http::Uri>().unwrap(),
+            )
+            .unwrap()
+            .0
+        };
+        let query = parse("/api/monitoring/request-details?exclude_path_type=video_stream");
+        let filter = super::request_detail_filter(&query, None);
+        assert_eq!(filter.exclude_path_type, Some("video_stream"));
+        assert_eq!(filter.path_type, None);
+        assert_eq!(filter.limit, 200);
+
+        // A concrete path type is listed unless the caller asks for an exclusion.
+        let query = parse("/api/monitoring/request-details?path_type=video_stream");
+        let filter = super::request_detail_filter(&query, None);
+        assert_eq!(filter.path_type, Some("video_stream"));
+        assert_eq!(filter.exclude_path_type, None);
+
+        // `all` stays the "no path type filter" placeholder.
+        let query =
+            parse("/api/monitoring/request-details?path_type=all&exclude_path_type=video_stream");
+        let filter = super::request_detail_filter(&query, None);
+        assert_eq!(filter.path_type, None);
+        assert_eq!(filter.exclude_path_type, Some("video_stream"));
+
+        // Malformed exclusion values are ignored instead of narrowing the list.
+        let too_long = "x".repeat(65);
+        for value in [
+            "",
+            "%20",
+            "all",
+            "video%20stream",
+            "video/stream",
+            too_long.as_str(),
+        ] {
+            let query = parse(&format!(
+                "/api/monitoring/request-details?exclude_path_type={value}"
+            ));
+            let filter = super::request_detail_filter(&query, None);
+            assert_eq!(filter.exclude_path_type, None, "{value} must be ignored");
+        }
+
+        // The block log query has no exclusion field, so the parameter is ignored there.
+        let block_query = |uri: &str| {
+            axum::extract::Query::<super::BlockLogQuery>::try_from_uri(
+                &uri.parse::<axum::http::Uri>().unwrap(),
+            )
+            .unwrap()
+            .0
+        };
+        let plain = block_query("/api/monitoring/block-logs?path_type=video_stream");
+        let with_exclusion = block_query(
+            "/api/monitoring/block-logs?path_type=video_stream&exclude_path_type=video_stream",
+        );
+        assert_eq!(plain.path_type, with_exclusion.path_type);
+        assert_eq!(plain.limit, with_exclusion.limit);
+        assert_eq!(plain.server_id, with_exclusion.server_id);
+    }
+
+    fn monitoring_test_state(store: crate::db::SettingsStore) -> crate::AppState {
+        use std::sync::{
+            Arc, RwLock as StdRwLock,
+            atomic::{AtomicU64, Ordering},
+        };
+        use tokio::sync::{Mutex, RwLock};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let alerts_path = std::env::temp_dir().join(format!(
+            "embypanel-monitoring-alerts-test-{}-{}.db",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        crate::AppState {
+            config: Arc::new(RwLock::new(crate::config::Config::default_runtime())),
+            config_updates: Arc::new(Mutex::new(())),
+            client: crate::build_http_client().unwrap(),
+            proxy_client: crate::build_proxy_http_client().unwrap(),
+            cache: Arc::new(RwLock::new(crate::cache::DirectLinkCache::new(
+                true, 180, 10_000,
+            ))),
+            settings_store: store.clone(),
+            telemetry_writes: crate::db::TelemetryWriteQueue::start(store.clone()).unwrap(),
+            alerts: crate::alerts::Alerts::new(alerts_path).unwrap(),
+            alert_runtime: crate::alerts_runtime::AlertRuntime::disabled(),
+            client_control_cache: Arc::new(StdRwLock::new(None)),
+            user_policies_cache: Arc::new(StdRwLock::new(None)),
+            rate_limit_updates: Arc::new(Mutex::new(())),
+            playback_sessions_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            password_tasks: Arc::new(tokio::sync::Semaphore::new(
+                crate::PASSWORD_TASK_CONCURRENCY_LIMIT,
+            )),
+            user_password_tasks: Arc::new(tokio::sync::Semaphore::new(
+                crate::USER_PASSWORD_RESET_CONCURRENCY_LIMIT,
+            )),
+            crypto_keys: crate::crypto_api::CryptoKeys::generate().unwrap(),
+            activity_log: Arc::new(crate::activity_log::ActivityLogStore::new(100)),
+            file_log: Arc::new(crate::file_log::FileLogStore::new(&store)),
+            block_log: Arc::new(crate::block_log::BlockLogStore::new()),
+            ip_location: Arc::new(crate::ip_location::IpLocationStore::new()),
+            connectivity: Arc::new(crate::connectivity::ConnectivityMonitor::new()),
+            proxy_manager: None,
+            proxy_server_id: None,
+            proxy_metrics: None,
+            playback_paths: Arc::new(Mutex::new(crate::PlaybackPathState::default())),
+            playback_users: crate::playback_user_cache(),
+            playback_media: crate::playback_media_cache(),
+            playback_rate_hits: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            playback_rate_recent_events: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            playback_rate_bans: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            playback_rate_ip_bans: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            login_failures: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            update_check: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn monitoring_detail_row(
+        timestamp_ms: u128,
+        server_id: &str,
+        path_type: &str,
+        path: &str,
+    ) -> crate::db::ProxyRequestDetailWrite {
+        crate::db::ProxyRequestDetailWrite {
+            timestamp_ms,
+            server_id: server_id.to_string(),
+            server_name: "Fixture Server".to_string(),
+            port: 8096,
+            method: "GET".to_string(),
+            path: path.to_string(),
+            path_type: path_type.to_string(),
+            status_code: 200,
+            outcome: "ok".to_string(),
+            duration_ms: 5,
+            playback_user: "fixture".to_string(),
+            playback_ip: "192.0.2.10".to_string(),
+            cache_hit: false,
+            blocked: false,
+            detail: format!("request_id=diag-{timestamp_ms:016x}"),
+        }
+    }
+
+    async fn monitoring_request_details_rows(
+        app: &axum::Router,
+        uri: &str,
+        token: &str,
+    ) -> Vec<serde_json::Value> {
+        use tower::ServiceExt;
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "unexpected status for {uri}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn request_details_endpoint_excludes_playback_rows_only_on_demand() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "embypanel-monitoring-request-details-{}-{}.sqlite",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = crate::db::SettingsStore::open_for_test(path.clone()).unwrap();
+        store
+            .create_admin("monitoring-admin", "synthetic-password-hash")
+            .unwrap();
+        let owner = store.list_admin_users().unwrap()[0].id;
+        let token = "monitoring-request-details-token";
+        store
+            .create_session(
+                owner,
+                &crate::auth::hash_token(token),
+                crate::auth::now_ts() + 3600,
+            )
+            .unwrap();
+        let state = monitoring_test_state(store);
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
+        for row in [
+            monitoring_detail_row(base - 500, "server-a", "proxy", "/emby/Items"),
+            monitoring_detail_row(base - 400, "server-a", "proxy", "/emby/Sessions"),
+            monitoring_detail_row(base - 300, "server-b", "system_info", "/emby/System/Info"),
+            monitoring_detail_row(base - 200, "server-a", "video_stream", "/videos/1/stream"),
+            monitoring_detail_row(base - 100, "server-a", "video_stream", "/videos/2/stream"),
+        ] {
+            state.telemetry_writes.proxy_request_detail(row);
+        }
+        state.telemetry_writes.shutdown().unwrap();
+        let app = crate::build_management_app(state.clone());
+
+        // Without the exclusion the playback rows are listed as before.
+        let all =
+            monitoring_request_details_rows(&app, "/api/monitoring/request-details", token).await;
+        assert_eq!(all.len(), 5);
+        assert_eq!(
+            all.iter()
+                .filter(|row| row["path_type"] == "video_stream")
+                .count(),
+            2
+        );
+
+        // The exclusion removes the playback rows and keeps the other path types.
+        let filtered = monitoring_request_details_rows(
+            &app,
+            "/api/monitoring/request-details?exclude_path_type=video_stream",
+            token,
+        )
+        .await;
+        assert_eq!(filtered.len(), 3);
+        assert!(
+            filtered
+                .iter()
+                .all(|row| row["path_type"] != "video_stream")
+        );
+
+        // The exclusion runs before the limit, so a small limit is still filled
+        // with the non-playback rows instead of the newer playback rows.
+        let limited = monitoring_request_details_rows(
+            &app,
+            "/api/monitoring/request-details?exclude_path_type=video_stream&limit=2",
+            token,
+        )
+        .await;
+        assert_eq!(limited.len(), 2);
+        assert!(limited.iter().all(|row| row["path_type"] != "video_stream"));
+        let limited_all =
+            monitoring_request_details_rows(&app, "/api/monitoring/request-details?limit=2", token)
+                .await;
+        assert_eq!(limited_all.len(), 2);
+        assert!(
+            limited_all
+                .iter()
+                .all(|row| row["path_type"] == "video_stream")
+        );
+
+        // An explicit path type still lists the playback rows.
+        let playback = monitoring_request_details_rows(
+            &app,
+            "/api/monitoring/request-details?path_type=video_stream",
+            token,
+        )
+        .await;
+        assert_eq!(playback.len(), 2);
+
+        // The keyword filter keeps working together with the exclusion.
+        let keyword = monitoring_request_details_rows(
+            &app,
+            "/api/monitoring/request-details?exclude_path_type=video_stream&keyword=emby%2FItems",
+            token,
+        )
+        .await;
+        assert_eq!(keyword.len(), 1);
+        assert_eq!(keyword[0]["path"], "/emby/Items");
+        let keyword_playback = monitoring_request_details_rows(
+            &app,
+            "/api/monitoring/request-details?exclude_path_type=video_stream&keyword=videos",
+            token,
+        )
+        .await;
+        assert!(keyword_playback.is_empty());
+
+        // The time window keeps working together with the exclusion.
+        // Note: the HTTP query uses `u128` for the time bounds, which the query
+        // string deserializer does not support, so the time window is covered by
+        // the store level test instead of the HTTP level.
+        let time_filtered = state
+            .settings_store
+            .list_proxy_request_details(crate::db::ProxyRequestDetailFilter {
+                server_id: None,
+                path_type: None,
+                exclude_path_type: Some("video_stream"),
+                keyword: None,
+                since_ms: Some(base - 350),
+                until_ms: Some(base - 250),
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(time_filtered.len(), 1);
+        assert_eq!(time_filtered[0].timestamp_ms, base - 300);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 }

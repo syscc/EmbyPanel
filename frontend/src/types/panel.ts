@@ -297,6 +297,14 @@ export type ClientControlConfig = {
   records: ClientRuleRecord[]
 }
 
+export type PlaybackMedia = {
+  media_id: string
+  name?: string | null
+  series_name?: string | null
+  season_number?: number | null
+  episode_number?: number | null
+}
+
 export type ActivityLogEntry = {
   id: number
   timestamp_ms: number
@@ -307,6 +315,8 @@ export type ActivityLogEntry = {
   playback_user: string | null
   playback_ip: string | null
   ip_location?: IpLocation
+  playback_group_id?: string | null
+  media?: PlaybackMedia | null
   message: string
   detail: string
 }

@@ -2134,6 +2134,12 @@ export function usePanelController() {
     const params = new URLSearchParams({ limit: String(requestDetailLimit.value) })
     if (selectedLogServer.value !== 'all') params.set('server_id', selectedLogServer.value)
     if (selectedRequestPathType.value !== 'all') params.set('path_type', selectedRequestPathType.value)
+    // 反代请求默认不再重复播放请求：播放流按播放会话展示在播放日志中。
+    // 只有反代请求视图且请求类型为「全部请求」时排除；明确选择具体类型时不排除，
+    // 保证诊断深链（path_type=video_stream + 关键词）仍能查到原始播放请求。
+    if (selectedLogView.value === 'proxy' && selectedRequestPathType.value === 'all') {
+      params.set('exclude_path_type', 'video_stream')
+    }
     if (selectedLogView.value === 'blocked' && selectedLogLevel.value !== 'all') params.set('level', selectedLogLevel.value)
     if (logKeywordFilter.value.trim()) params.set('keyword', logKeywordFilter.value.trim())
     if (logSince.value) params.set('since_ms', String(new Date(logSince.value).getTime()))

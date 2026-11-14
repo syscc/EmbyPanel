@@ -67,7 +67,9 @@ use tracing_subscriber::{
 };
 
 use crate::cache::{DirectLinkCache, DirectLinkCachePolicy};
-use activity_log::{ActivityKind, ActivityLevel, ActivityLogStore, PlaybackLogRecord};
+use activity_log::{
+    ActivityKind, ActivityLevel, ActivityLogStore, PlaybackLogRecord, PlaybackMedia,
+};
 use alerts::Alerts;
 use alerts_runtime::AlertRuntime;
 use block_log::BlockLogStore;
@@ -222,6 +224,7 @@ struct AppState {
     proxy_metrics: Option<Arc<ProxyRuntimeMetrics>>,
     playback_paths: Arc<Mutex<PlaybackPathState>>,
     playback_users: moka::future::Cache<String, String>,
+    playback_media: moka::future::Cache<PlaybackMediaKey, Option<PlaybackMedia>>,
     playback_rate_hits: Arc<Mutex<HashMap<String, VecDeque<client_control::PlaybackRateHit>>>>,
     playback_rate_recent_events: Arc<Mutex<HashMap<String, u64>>>,
     playback_rate_bans: Arc<Mutex<HashMap<String, u64>>>,
@@ -756,6 +759,7 @@ async fn main() -> AppResult<()> {
         proxy_metrics: None,
         playback_paths: Arc::new(Mutex::new(PlaybackPathState::default())),
         playback_users: playback_user_cache(),
+        playback_media: playback_media_cache(),
         playback_rate_hits: Arc::new(Mutex::new(HashMap::new())),
         playback_rate_recent_events: Arc::new(Mutex::new(HashMap::new())),
         playback_rate_bans: Arc::new(Mutex::new(HashMap::new())),
@@ -892,6 +896,224 @@ fn playback_user_cache() -> moka::future::Cache<String, String> {
         .max_capacity(PLAYBACK_USER_CACHE_CAPACITY)
         .time_to_idle(PLAYBACK_USER_CACHE_TTL)
         .build()
+}
+
+// Labels serve generic transport and redirects, independently of direct-link caching.
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct PlaybackMediaKey {
+    server_id: String,
+    config_identity: [u8; 32],
+    item_id: String,
+}
+
+fn playback_media_key(config: &Config, item_id: &str) -> PlaybackMediaKey {
+    use sha2::{Digest, Sha256};
+    let mut identity = Sha256::new();
+    identity.update(config.emby_host.as_bytes());
+    identity.update([0]);
+    identity.update(config.emby_api_key.as_bytes());
+    PlaybackMediaKey {
+        server_id: config_server_label(config).0,
+        config_identity: identity.finalize().into(),
+        item_id: item_id.to_string(),
+    }
+}
+
+// Grouping is display-only: incomplete identity must never merge independent requests.
+// The resolved display name is deliberately excluded: it may be "--" while a lookup
+// fails and a real name once it recovers, and that must not split one playback.
+fn playback_group_id(
+    config: &Config,
+    method: &Method,
+    uri: &Uri,
+    headers: &axum::http::HeaderMap,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    const MAX_IDENTITY_BYTES: usize = 1024;
+    let valid = |value: &str| {
+        !value.trim().is_empty()
+            && value.len() <= MAX_IDENTITY_BYTES
+            && !value.chars().any(char::is_control)
+    };
+    if method != Method::GET || !rewrite::is_playback_log_path(uri.path()) {
+        return None;
+    }
+    let query = uri.query().unwrap_or("");
+    // Check before existing extractors trim values or fall back to another source.
+    for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if [
+            "PlaySessionId",
+            "DeviceId",
+            "X-Emby-Device-Id",
+            "MediaSourceId",
+            "UserId",
+            "X-Emby-User-Id",
+            "X-Emby-Token",
+            "api_key",
+        ]
+        .iter()
+        .any(|key| name.eq_ignore_ascii_case(key))
+            && !valid(&value)
+        {
+            return None;
+        }
+    }
+    for name in [
+        "X-Emby-Device-Id",
+        "X-Emby-User-Id",
+        "X-Emby-Token",
+        "X-MediaBrowser-Token",
+        "X-Emby-Authorization",
+        "X-MediaBrowser-Authorization",
+        "Authorization",
+    ] {
+        for value in headers.get_all(name) {
+            if !valid(value.to_str().ok()?) {
+                return None;
+            }
+        }
+    }
+    let session = non_empty_query_param(query, "PlaySessionId")?;
+    let device = playback_device_id(query, headers)?;
+    let source = non_empty_query_param(query, "MediaSourceId")?;
+    let item = playback_entry_item_id(uri)?;
+    let user_id = playback_context_value(query, headers, "UserId", "X-Emby-User-Id");
+    let token = playback_auth_token(query, headers);
+    if user_id.is_none() && token.is_none() {
+        return None;
+    }
+    if !valid(&config.emby_host) || !valid(&config.emby_api_key) {
+        return None;
+    }
+    let key = playback_media_key(config, item);
+    for value in [
+        session.as_str(),
+        device.as_str(),
+        source.as_str(),
+        item,
+        key.server_id.as_str(),
+    ]
+    .into_iter()
+    .chain(user_id.as_deref())
+    .chain(token.as_deref())
+    {
+        if !valid(value) {
+            return None;
+        }
+    }
+    let auth_digest = token
+        .as_ref()
+        .map(|token| Sha256::digest(token.trim().as_bytes()));
+    let mut digest = Sha256::new();
+    for value in [
+        b"embypanel-playback-group-v1".as_slice(),
+        key.server_id.as_bytes(),
+        key.config_identity.as_slice(),
+        key.item_id.as_bytes(),
+        session.as_bytes(),
+        device.as_bytes(),
+        source.as_bytes(),
+        user_id.as_deref().unwrap_or("").as_bytes(),
+        auth_digest
+            .as_ref()
+            .map_or(b"missing-auth".as_slice(), |value| value.as_slice()),
+    ] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    Some(format!("play-{:x}", digest.finalize()))
+}
+
+fn playback_entry_item_id(uri: &Uri) -> Option<&str> {
+    if !rewrite::is_playback_log_path(uri.path()) {
+        return None;
+    }
+    let mut segments = uri.path().trim_start_matches('/').split('/');
+    if segments.next()?.eq_ignore_ascii_case("emby") {
+        segments.next()?;
+    }
+    segments.next()
+}
+
+struct PlaybackMediaExpiry;
+impl moka::Expiry<PlaybackMediaKey, Option<PlaybackMedia>> for PlaybackMediaExpiry {
+    fn expire_after_create(
+        &self,
+        _: &PlaybackMediaKey,
+        value: &Option<PlaybackMedia>,
+        _: Instant,
+    ) -> Option<Duration> {
+        Some(Duration::from_secs(if value.is_some() { 600 } else { 15 }))
+    }
+
+    fn expire_after_update(
+        &self,
+        key: &PlaybackMediaKey,
+        value: &Option<PlaybackMedia>,
+        now: Instant,
+        _: Option<Duration>,
+    ) -> Option<Duration> {
+        self.expire_after_create(key, value, now)
+    }
+}
+
+fn playback_media_cache() -> moka::future::Cache<PlaybackMediaKey, Option<PlaybackMedia>> {
+    moka::future::Cache::builder()
+        .max_capacity(4096)
+        .expire_after(PlaybackMediaExpiry)
+        .build()
+}
+
+fn resolved_playback_media(item_id: &str, resolution: &emby::MediaPathResolution) -> PlaybackMedia {
+    // Older Items responses may omit Type; a real SeriesName is the narrow fallback.
+    // Explicit Audio/Movie types never reinterpret disc/track indexes as episodes.
+    let is_episode = resolution.item_type.as_deref().map_or_else(
+        || {
+            resolution
+                .series_name
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty())
+        },
+        |kind| kind.eq_ignore_ascii_case("Episode"),
+    );
+    PlaybackMedia {
+        media_id: item_id.to_string(),
+        name: resolution.media_name.clone(),
+        series_name: resolution.series_name.clone(),
+        season_number: resolution.season_number.filter(|_| is_episode),
+        episode_number: resolution.episode_number.filter(|_| is_episode),
+    }
+    .sanitized()
+}
+
+async fn generic_playback_media(
+    state: &AppState,
+    config: &Config,
+    uri: &Uri,
+) -> Option<PlaybackMedia> {
+    // Only confirmed GET playback entries reach here, never segments or APIs.
+    let item_id = playback_entry_item_id(uri)?;
+    state
+        .playback_media
+        .get_with(playback_media_key(config, item_id), async {
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                emby::get_media_path_observed(
+                    &state.client,
+                    config,
+                    item_id,
+                    None,
+                    "",
+                    &mut Default::default(),
+                ),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|resolution| resolved_playback_media(item_id, &resolution))
+            .filter(|media| media.name.is_some() || media.series_name.is_some())
+        })
+        .await
 }
 
 async fn run_proxy_server(
@@ -1227,6 +1449,22 @@ async fn handle_request_scoped(
         .await;
     }
 
+    // Reuse known user identity; optional media lookup is bounded separately.
+    let playback_user = if method == Method::GET && rewrite::is_playback_log_path(path) {
+        if let Some(name) = query_param(uri.query().unwrap_or(""), "UserName")
+            .filter(|name| !name.trim().is_empty())
+        {
+            name
+        } else if let Some(device_id) = playback_device_id(uri.query().unwrap_or(""), &headers) {
+            remembered_playback_user(&state, &request_config, &device_id)
+                .await
+                .unwrap_or_else(|| "--".to_string())
+        } else {
+            "--".to_string()
+        }
+    } else {
+        "--".to_string()
+    };
     proxy_to_emby_recorded(
         &state,
         &request_config,
@@ -1239,7 +1477,7 @@ async fn handle_request_scoped(
             started_at_ms: timing.started_at_ms,
             started: timing.started,
             path_type: request_path_type(path),
-            playback_user: "--".to_string(),
+            playback_user,
             playback_ip: proxy::real_ip_for_log(&request_config, &headers, peer_addr.ip()),
         }),
         None,
@@ -1747,6 +1985,7 @@ async fn record_significant_proxy_result(
     duration_ms: u128,
     playback_user: &str,
     playback_ip: &str,
+    playback_recorded: bool,
 ) {
     if status.is_success() && duration_ms < 3000 {
         return;
@@ -1771,14 +2010,16 @@ async fn record_significant_proxy_result(
         empty_log_value(playback_user),
         empty_log_value(playback_ip)
     ));
-    state.activity_log.record(
-        ActivityKind::General,
-        level,
-        Some(&server_id),
-        &server_name,
-        message,
-        &detail,
-    );
+    if !playback_recorded {
+        state.activity_log.record(
+            ActivityKind::General,
+            level,
+            Some(&server_id),
+            &server_name,
+            message,
+            &detail,
+        );
+    }
     state.file_log.write(
         match level {
             ActivityLevel::Success | ActivityLevel::Info => "info",
@@ -1886,6 +2127,21 @@ async fn proxy_to_emby_recorded(
     mut diagnosis: Option<&mut proxy::PlaybackDiagnosisTrace>,
 ) -> AppResult<Response> {
     let method_label = method.as_str().to_string();
+    let is_playback = method == Method::GET && rewrite::is_playback_log_path(uri.path());
+    let group_id = playback_group_id(config, &method, uri, headers);
+    let media = if !is_playback {
+        None
+    } else if let Some(diagnosis) = diagnosis.as_deref() {
+        Some(PlaybackMedia {
+            media_id: rewrite::parse_item_id(uri.path()).unwrap_or_default(),
+            name: diagnosis.context.media_name.clone(),
+            series_name: diagnosis.context.series_name.clone(),
+            season_number: diagnosis.context.season_number,
+            episode_number: diagnosis.context.episode_number,
+        })
+    } else {
+        generic_playback_media(state, config, uri).await
+    };
     let mut untraced_observation = diagnostics::UpstreamObservation::default();
     if let Some(diagnosis) = diagnosis.as_deref_mut() {
         diagnosis.begin_step(
@@ -1954,6 +2210,36 @@ async fn proxy_to_emby_recorded(
                     },
                 )
                 .await;
+                let playback_recorded = is_playback
+                    && (status.is_success()
+                        || status.is_client_error()
+                        || status.is_server_error());
+                if playback_recorded {
+                    let (server_id, server_name) = config_server_label(config);
+                    let (level, message) = if status.is_server_error() {
+                        (ActivityLevel::Error, "服务器代理播放失败")
+                    } else if status.is_client_error() {
+                        (ActivityLevel::Warn, "服务器代理播放失败")
+                    } else {
+                        (ActivityLevel::Info, "服务器代理播放")
+                    };
+                    state.activity_log.record_playback(PlaybackLogRecord {
+                        level,
+                        server_id: Some(&server_id),
+                        server_name: &server_name,
+                        playback_user: empty_log_value(&trace.playback_user),
+                        playback_ip: empty_log_value(&trace.playback_ip),
+                        media: media.clone(),
+                        playback_group_id: group_id.as_deref(),
+                        request_path: Some(uri.path()),
+                        range: headers.get(header::RANGE).map(|value| value.to_str().unwrap_or("[invalid]")),
+                        message: message.to_string(),
+                        detail: correlated_detail(&format!(
+                            "status={} duration={}ms upstream_response_headers_received media_stream_not_measured",
+                            status.as_u16(), duration_ms
+                        )),
+                    });
+                }
                 record_significant_proxy_result(
                     state,
                     config,
@@ -1964,9 +2250,11 @@ async fn proxy_to_emby_recorded(
                     duration_ms,
                     &trace.playback_user,
                     &trace.playback_ip,
+                    playback_recorded,
                 )
                 .await;
-                if diagnosis.is_some()
+                if !playback_recorded
+                    && diagnosis.is_some()
                     && !status.is_client_error()
                     && !status.is_server_error()
                     && duration_ms < 3000
@@ -1993,14 +2281,38 @@ async fn proxy_to_emby_recorded(
             if let Some(metrics) = state.proxy_metrics.as_ref() {
                 metrics.record_error(error_detail.clone());
             }
-            state.activity_log.record(
-                ActivityKind::General,
-                ActivityLevel::Error,
-                Some(&server_id),
-                &server_name,
-                "代理请求失败",
-                error_detail.clone(),
-            );
+            if is_playback {
+                state.activity_log.record_playback(PlaybackLogRecord {
+                    level: ActivityLevel::Error,
+                    server_id: Some(&server_id),
+                    server_name: &server_name,
+                    playback_user: trace
+                        .as_ref()
+                        .map_or("--", |trace| empty_log_value(&trace.playback_user)),
+                    playback_ip: trace
+                        .as_ref()
+                        .map_or("--", |trace| empty_log_value(&trace.playback_ip)),
+                    media,
+                    playback_group_id: group_id.as_deref(),
+                    request_path: Some(uri.path()),
+                    range: headers
+                        .get(header::RANGE)
+                        .map(|value| value.to_str().unwrap_or("[invalid]")),
+                    message: "服务器代理播放失败".to_string(),
+                    detail: correlated_detail(
+                        "status=502 upstream_request_failed media_stream_not_measured",
+                    ),
+                });
+            } else {
+                state.activity_log.record(
+                    ActivityKind::General,
+                    ActivityLevel::Error,
+                    Some(&server_id),
+                    &server_name,
+                    "代理请求失败",
+                    error_detail.clone(),
+                );
+            }
             state.file_log.write("error", "代理请求失败", &error_detail);
             if let Some(trace) = trace {
                 record_proxy_request_detail(
@@ -2377,6 +2689,7 @@ async fn handle_video_stream(
     )
     .await;
     trace.context.user_name = (playback_user != "--").then(|| playback_user.clone());
+    let group_id = playback_group_id(config, &method, &uri, &headers);
     trace.complete_step("playback user resolution completed");
     if method == Method::HEAD {
         trace.skip_step(
@@ -2567,12 +2880,19 @@ async fn handle_video_stream(
             Instant::now(),
             &redirect_diagnosis_detail(&cached),
         );
+        let media = state
+            .playback_media
+            .get(&playback_media_key(&config, &item_id))
+            .await
+            .flatten();
         trace.finish().await;
         record_playback_redirect(
             state,
             &config,
             &playback_user,
             &playback_ip,
+            media,
+            group_id.as_deref(),
             "直链缓存命中",
             &cached,
         );
@@ -2622,11 +2942,26 @@ async fn handle_video_stream(
         &mut trace.observation,
     )
     .await;
+    let media = media_resolution
+        .as_ref()
+        .ok()
+        .map(|resolution| resolved_playback_media(&item_id, resolution));
+    if method == Method::GET && rewrite::is_playback_log_path(uri.path()) {
+        state
+            .playback_media
+            .insert(
+                playback_media_key(&config, &item_id),
+                media
+                    .clone()
+                    .filter(|media| media.name.is_some() || media.series_name.is_some()),
+            )
+            .await;
+    }
     if let Ok(resolution) = &media_resolution {
         trace.context.media_name = resolution.media_name.clone();
         trace.context.series_name = resolution.series_name.clone();
-        trace.context.season_number = resolution.season_number;
-        trace.context.episode_number = resolution.episode_number;
+        trace.context.season_number = media.as_ref().and_then(|media| media.season_number);
+        trace.context.episode_number = media.as_ref().and_then(|media| media.episode_number);
         trace.context.media_source_id = resolution
             .media_source_id
             .clone()
@@ -2754,6 +3089,8 @@ async fn handle_video_stream(
             &config,
             &playback_user,
             &playback_ip,
+            media,
+            group_id.as_deref(),
             redirect_log_message(&config, should_cache),
             &redirect_url,
         );
@@ -2939,6 +3276,8 @@ async fn handle_video_stream(
         &config,
         &playback_user,
         &playback_ip,
+        media,
+        group_id.as_deref(),
         redirect_log_message(&config, should_cache),
         &raw_url,
     );
@@ -3179,6 +3518,8 @@ fn record_playback_redirect(
     config: &Config,
     playback_user: &str,
     playback_ip: &str,
+    media: Option<PlaybackMedia>,
+    playback_group_id: Option<&str>,
     message: impl Into<String>,
     redirect_url: &str,
 ) {
@@ -3191,6 +3532,10 @@ fn record_playback_redirect(
         server_name: &server_name,
         playback_user,
         playback_ip,
+        media,
+        playback_group_id,
+        request_path: None,
+        range: None,
         message: message.clone(),
         detail: log_detail.clone(),
     });
@@ -3357,13 +3702,7 @@ async fn user_name_by_token(
     query: &str,
     headers: &axum::http::HeaderMap,
 ) -> Option<String> {
-    let token = query_param(query, "X-Emby-Token")
-        .or_else(|| query_param(query, "api_key"))
-        .or_else(|| header_value(headers, "X-Emby-Token"))
-        .or_else(|| header_value(headers, "X-MediaBrowser-Token"))
-        .or_else(|| emby_authorization_value(headers, "Token"))
-        .or_else(|| emby_token_from_authorization(headers));
-    let token = token?.trim().to_string();
+    let token = playback_auth_token(query, headers)?.trim().to_string();
     if token.is_empty() || token == config.emby_api_key {
         return None;
     }
@@ -3379,6 +3718,15 @@ async fn user_name_by_token(
             None
         }
     }
+}
+
+fn playback_auth_token(query: &str, headers: &axum::http::HeaderMap) -> Option<String> {
+    query_param(query, "X-Emby-Token")
+        .or_else(|| query_param(query, "api_key"))
+        .or_else(|| header_value(headers, "X-Emby-Token"))
+        .or_else(|| header_value(headers, "X-MediaBrowser-Token"))
+        .or_else(|| emby_authorization_value(headers, "Token"))
+        .or_else(|| emby_token_from_authorization(headers))
 }
 
 fn playback_context_value(
@@ -3802,6 +4150,7 @@ mod tests {
     include!("test-fixtures/review_api_fixes.rs");
     include!("test-fixtures/diagnostics_expansion.rs");
     include!("test-fixtures/network_timing_api.rs");
+    include!("test-fixtures/playback_proxy_logs.rs");
 
     fn test_config(emby_host: &str, openlist_addr: &str, port: u16) -> Config {
         Config {
@@ -3901,6 +4250,7 @@ mod tests {
             proxy_metrics: None,
             playback_paths: Arc::new(Mutex::new(PlaybackPathState::default())),
             playback_users: playback_user_cache(),
+            playback_media: playback_media_cache(),
             playback_rate_hits: Arc::new(Mutex::new(HashMap::new())),
             playback_rate_recent_events: Arc::new(Mutex::new(HashMap::new())),
             playback_rate_bans: Arc::new(Mutex::new(HashMap::new())),
@@ -5058,6 +5408,7 @@ mod tests {
             .list_proxy_request_details(crate::db::ProxyRequestDetailFilter {
                 server_id: None,
                 path_type: Some("video_stream"),
+                exclude_path_type: None,
                 keyword: Some(request_id),
                 since_ms: None,
                 until_ms: None,

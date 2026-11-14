@@ -1722,6 +1722,16 @@ pub fn sanitize_diagnostic_text(input: &str) -> String {
     truncate_chars(&with_creds, MAX_DETAIL_CHARS)
 }
 
+/// Item Name/SeriesName are labels, not authorization text. Preserve bare auth
+/// scheme words and ambiguous subtitle keys, but retain explicit credential syntax.
+pub(crate) fn sanitize_media_label(input: &str) -> String {
+    let stripped: String = input.chars().filter(|ch| !ch.is_control()).collect();
+    let urls = sanitize_urls_in_text(&stripped);
+    let json = replace_json_sensitive_strings(&urls);
+    let cleaned = replace_header_or_kv_secrets(&json, true);
+    truncate_chars(cleaned.trim(), 256)
+}
+
 /// Backward-compatible step mutator; prefer [`sanitize_diagnosis_step`].
 pub fn redact_sensitive_info(steps: &mut Vec<DiagnosisStep>) {
     for step in steps.iter_mut() {
@@ -1864,7 +1874,7 @@ fn sanitize_url_str(value: &str) -> Option<String> {
 
 fn redact_credential_patterns(input: &str) -> String {
     let mut out = replace_json_sensitive_strings(input);
-    out = replace_header_or_kv_secrets(&out);
+    out = replace_header_or_kv_secrets(&out, false);
     replace_auth_schemes(&out)
 }
 
@@ -1934,7 +1944,7 @@ fn scan_json_string(chars: &[char], start: usize) -> Option<(String, usize)> {
     None
 }
 
-fn replace_header_or_kv_secrets(input: &str) -> String {
+fn replace_header_or_kv_secrets(input: &str, media_label: bool) -> String {
     let mut out = String::with_capacity(input.len());
     let lower = input.to_ascii_lowercase();
     let mut idx = 0;
@@ -1953,7 +1963,17 @@ fn replace_header_or_kv_secrets(input: &str) -> String {
             let rest = &input[after_key..];
             let trimmed = rest.trim_start();
             let ws = rest.len() - trimmed.len();
-            if let Some(sep) = trimmed.chars().next().filter(|c| *c == ':' || *c == '=') {
+            // These ordinary nouns can introduce subtitles in a structured label.
+            // Their '=' assignments and quoted JSON fields are still credentials.
+            if let Some(sep) = trimmed.chars().next().filter(|c| {
+                *c == '='
+                    || (*c == ':'
+                        && (!media_label
+                            || !matches!(
+                                &lower[idx..after_key],
+                                "secret" | "credential" | "sign" | "signature" | "sig"
+                            )))
+            }) {
                 let after_sep = &trimmed[sep.len_utf8()..];
                 let value_ws_len = after_sep.len() - after_sep.trim_start().len();
                 let value = after_sep.trim_start();
@@ -2000,6 +2020,25 @@ fn match_sensitive_key_at(lower: &str, idx: usize) -> Option<usize> {
 }
 
 fn value_len_for(sep: char, value: &str) -> usize {
+    if value.starts_with(REDACTED_PLACEHOLDER) {
+        return REDACTED_PLACEHOLDER.len();
+    }
+    if let Some(quote @ ('\'' | '"')) = value.chars().next() {
+        // This is already a sensitive key's value, not an arbitrary title.
+        // Consume quoted whitespace/separators and escaped quotes as one value;
+        // an unterminated value conservatively consumes the remaining text.
+        let mut escaped = false;
+        for (idx, ch) in value.char_indices().skip(1) {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                return idx + ch.len_utf8();
+            }
+        }
+        return value.len();
+    }
     if sep == ':' {
         // Header-style values may contain spaces (Bearer xxx). Stop at list separators.
         value
@@ -2015,7 +2054,13 @@ fn value_len_for(sep: char, value: &str) -> usize {
         if token.is_empty() {
             value_token_len(value)
         } else {
-            label_len + ws + value_token_len(token)
+            label_len
+                + ws
+                + if token.starts_with(['\'', '"']) {
+                    value_len_for('=', token)
+                } else {
+                    value_token_len(token)
+                }
         }
     } else {
         value_token_len(value)
@@ -2454,6 +2499,88 @@ mod tests {
         assert!(!record.server_id.contains('\u{0001}'));
         assert!(record.media_id.chars().count() <= MAX_ID_CHARS);
         assert!(!record.steps[0].name.contains('\u{0008}'));
+    }
+
+    #[test]
+    fn quoted_media_credentials_are_consumed_and_redaction_is_idempotent() {
+        for input in [
+            r#"Authorization="Bearer quote_canary_42" title"#,
+            "Authorization='Basic quote_canary_42' title",
+            r#"Token = "quote_canary_42 with spaces" title"#,
+            r#"api_key="escaped\"quote_canary_42" title"#,
+            r"password='escaped\'quote_canary_42' title",
+            r#"Authorization="Bearer quote_canary_42 unfinished"#,
+            "Authorization='Basic quote_canary_42 unfinished",
+            r#"Token="quote_canary_42\""#,
+            r#"Authorization=Bearer "quote_canary_42 with spaces" title"#,
+            "Authorization=Basic 'quote_canary_42 with spaces' title",
+            r#"Authorization = "Bearer quote_canary_42"; api_key='quote_canary_42'"#,
+            r#"Token="电影\"quote_canary_42" title"#,
+            r#"Authorization: "Bearer quote_canary_42; more" title"#,
+        ] {
+            let safe = sanitize_media_label(input);
+            assert!(!safe.contains("quote_canary_42"), "{safe}");
+            assert_eq!(sanitize_media_label(&safe), safe);
+            let strict = sanitize_diagnostic_text(input);
+            assert!(!strict.contains("quote_canary_42"), "{strict}");
+            assert_eq!(sanitize_diagnostic_text(&strict), strict);
+        }
+        for input in [
+            r#"Token="" title"#,
+            "Token='' title",
+            r#"Token= "   " title"#,
+            r#"Authorization="Bearer quote_canary_42" title"#,
+        ] {
+            let safe = sanitize_media_label(input);
+            assert!(safe.ends_with(" title"), "{safe}");
+            assert_eq!(sanitize_media_label(&safe), safe);
+        }
+    }
+
+    #[test]
+    fn review_media_label_preserves_titles_but_redacts_explicit_credentials() {
+        for title in [
+            "Basic Instinct",
+            "The Secret: Dare to Dream",
+            "Secret: A Subtitle",
+            "Signature: A Story",
+            "Bearer of Hope",
+        ] {
+            assert_eq!(sanitize_media_label(title), title);
+        }
+        for input in [
+            "Authorization: Basic synthetic-credential",
+            "Authorization=Bearer synthetic-credential",
+            "Token=synthetic-credential",
+            "api_key=synthetic-credential",
+            "password=synthetic-credential",
+            "password: synthetic-credential",
+            "secret=synthetic-credential",
+            "Cookie: synthetic-credential",
+            r#"{"secret":"synthetic-credential","api_key":"synthetic-credential"}"#,
+            "https://fixture:synthetic-credential@example.invalid/movie?token=synthetic-credential&other=synthetic-credential#synthetic-credential",
+        ] {
+            let safe = sanitize_media_label(input);
+            assert!(!safe.contains("synthetic-credential"), "{safe}");
+            assert_eq!(sanitize_media_label(&safe), safe);
+        }
+        for key in SENSITIVE_KEYS {
+            let json = format!(r#"{{"{key}":"fixture_canary_42"}}"#);
+            let kv = format!("{key}=fixture_canary_42");
+            assert!(!sanitize_media_label(&json).contains("fixture_canary_42"));
+            assert!(!sanitize_media_label(&kv).contains("fixture_canary_42"));
+        }
+        assert_eq!(sanitize_media_label("Basic\n Instinct\0"), "Basic Instinct");
+        assert_eq!(sanitize_media_label(&"名".repeat(300)).chars().count(), 256);
+        // Diagnostic/free-form callers retain their original strict behavior.
+        assert_eq!(
+            sanitize_diagnostic_text("Basic Instinct"),
+            "Basic [REDACTED]"
+        );
+        assert_eq!(
+            sanitize_diagnostic_text("Secret: subtitle"),
+            "Secret: [REDACTED]"
+        );
     }
 
     #[test]

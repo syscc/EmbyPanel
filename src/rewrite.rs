@@ -28,6 +28,33 @@ pub fn is_video_stream(path: &str) -> bool {
     lower.contains("/videos/") && (lower.contains("/stream") || lower.contains("/original"))
 }
 
+// Playback entry points only: do not classify images, subtitles or HLS segments.
+// This deliberately does not change the direct-link routing predicate above.
+pub fn is_playback_log_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let mut segments = lower.trim_start_matches('/').split('/');
+    let mut domain = segments.next();
+    if domain == Some("emby") {
+        domain = segments.next();
+    }
+    if !matches!(domain, Some("videos" | "audio")) {
+        return false;
+    }
+    if segments.next().is_none_or(str::is_empty) {
+        return false;
+    }
+    let Some(endpoint) = segments.next() else {
+        return false;
+    };
+    if segments.next().is_some() {
+        return false;
+    }
+    let base = endpoint.split('.').next().unwrap_or_default();
+    matches!(base, "stream" | "original")
+        || endpoint == "master.m3u8"
+        || (domain == Some("audio") && endpoint == "universal")
+}
+
 pub fn parse_item_id(path: &str) -> Option<String> {
     let mut segments = path
         .trim_start_matches('/')

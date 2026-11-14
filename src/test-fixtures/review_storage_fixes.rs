@@ -282,6 +282,7 @@ fn review_storage_request_scope_precedes_cap() {
             ProxyRequestDetailFilter {
                 server_id: None,
                 path_type: None,
+                exclude_path_type: None,
                 keyword: None,
                 since_ms: None,
                 until_ms: None,

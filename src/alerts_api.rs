@@ -1288,6 +1288,7 @@ mod tests {
                 proxy_metrics: None,
                 playback_paths: Arc::new(Mutex::new(PlaybackPathState::default())),
                 playback_users: playback_user_cache(),
+                playback_media: crate::playback_media_cache(),
                 playback_rate_hits: Arc::new(Mutex::new(HashMap::new())),
                 playback_rate_recent_events: Arc::new(Mutex::new(HashMap::new())),
                 playback_rate_bans: Arc::new(Mutex::new(HashMap::new())),
