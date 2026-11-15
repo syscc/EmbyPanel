@@ -1,4 +1,4 @@
-<!-- Character animation ported from https://github.com/guohaolian/animated-characters-login-page (MIT); see THIRD_PARTY_NOTICES.md. -->
+<!-- Character animation ported from https://github.com/guohaolian/animated-characters-login-page (MIT); see docs/third-party-notices.md. -->
 <script setup lang="ts">
 import { computed, type CSSProperties } from 'vue'
 import Pupil from './Pupil.vue'

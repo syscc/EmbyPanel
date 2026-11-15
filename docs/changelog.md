@@ -27,7 +27,7 @@
 
 ### 第三方
 
-- 角色动画与登录卡视觉参考 `guohaolian/animated-characters-login-page`，来源、改造范围与许可说明记录在 `THIRD_PARTY_NOTICES.md`；未使用对方品牌名、Logo 与图片素材。
+- 角色动画与登录卡视觉参考 `guohaolian/animated-characters-login-page`，来源、改造范围与许可说明记录在 `docs/third-party-notices.md`；未使用对方品牌名、Logo 与图片素材。
 
 ## v0.3.7
 
