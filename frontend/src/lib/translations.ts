@@ -141,6 +141,8 @@ export const translations: Record<string, string> = {
   '首次初始化': 'First-time setup',
   '管理员登录': 'Administrator sign in',
   '密码': 'Password',
+  '显示密码': 'Show password',
+  '隐藏密码': 'Hide password',
   '处理中': 'Working',
   '创建并进入': 'Create and enter',
   '登录': 'Sign in',

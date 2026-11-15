@@ -1,9 +1,12 @@
 <script setup lang="ts">
 import {
   Activity,
+  ArrowRight,
   ChevronDown,
   ChevronRight,
   CircleCheck,
+  Eye,
+  EyeOff,
   KeyRound,
   LogOut,
   Menu as MenuIcon,
@@ -15,6 +18,7 @@ import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterView } from 'vue-router'
 import ParticleBackdrop from '@/components/ParticleBackdrop.vue'
 import ActionDialogHost from '@/components/ActionDialogHost.vue'
+import AnimatedCharacters from '@/components/auth/AnimatedCharacters.vue'
 import PreferenceControls from '@/components/ui/PreferenceControls.vue'
 import { providePanelContext } from '@/composables/panel-context'
 import { usePanelController } from '@/composables/usePanelController'
@@ -64,6 +68,10 @@ const {
 const profileMenu = ref<HTMLElement | null>(null)
 const profileMenuTrigger = ref<HTMLButtonElement | null>(null)
 const profileMenuOpen = ref(false)
+// View-only auth state: input focus drives the character animation and the
+// visibility toggle swaps the password input type.
+const passwordVisible = ref(false)
+const passwordFocused = ref(false)
 
 function closeProfileMenu(restoreFocus = false) {
   profileMenuOpen.value = false
@@ -119,7 +127,11 @@ function handleProfileKeydown(event: KeyboardEvent) {
   }
 }
 
-watch([mode, page], () => closeProfileMenu())
+watch([mode, page], () => {
+  closeProfileMenu()
+  passwordVisible.value = false
+  passwordFocused.value = false
+})
 
 onMounted(() => {
   document.addEventListener('pointerdown', handleProfilePointerDown)
@@ -167,74 +179,100 @@ onBeforeUnmount(() => {
         @toggle-theme="toggleTheme"
       />
     </div>
-    <form
-      class="auth-card"
-      @submit.prevent="mode === 'setup' ? setupAdmin() : login()"
-    >
-      <div class="auth-brand">
-        <div class="auth-logo-wrap"><img class="logo-mark" :src="logoUrl" alt="Emby Panel" /></div>
-        <div>
-          <span class="eyebrow">MEDIA CONTROL / 302</span>
-          <h1>Emby Panel</h1>
-          <p>{{ mode === 'setup' ? t('首次初始化') : t('管理员登录') }}</p>
-        </div>
+    <div class="auth-login">
+      <div class="auth-characters" aria-hidden="true">
+        <AnimatedCharacters
+          :is-typing="passwordFocused"
+          :show-password="passwordVisible"
+          :password-length="credentials.password.length"
+          :login-failed="Boolean(error)"
+        />
       </div>
-      <div v-if="error" class="notice error" role="alert">{{ error }}</div>
-      <label>
-        <span>{{ t('用户名') }}</span>
-        <input
-          v-model="credentials.username"
-          name="username"
-          autocomplete="username"
-          required
-        />
-      </label>
-      <label>
-        <span>{{ t('密码') }}</span>
-        <input
-          v-model="credentials.password"
-          name="password"
-          type="password"
-          :autocomplete="mode === 'setup' ? 'new-password' : 'current-password'"
-          required
-        />
-      </label>
-      <template v-if="mode === 'login' && secondFactorRequired">
-        <label v-if="secondFactorMode === 'totp'">
-          <span>{{ t('TOTP 验证码') }}</span>
+      <form
+        class="auth-card"
+        @submit.prevent="mode === 'setup' ? setupAdmin() : login()"
+      >
+        <div class="auth-brand">
+          <div class="auth-logo-wrap"><img class="logo-mark" :src="logoUrl" alt="Emby Panel" /></div>
+          <div>
+            <span class="eyebrow">MEDIA CONTROL / 302</span>
+            <h1>Emby Panel</h1>
+            <p>{{ mode === 'setup' ? t('首次初始化') : t('管理员登录') }}</p>
+          </div>
+        </div>
+        <div v-if="error" class="notice error" role="alert">{{ error }}</div>
+        <label>
+          <span>{{ t('用户名') }}</span>
           <input
-            v-model="credentials.totp_code"
-            name="totp_code"
-            inputmode="numeric"
-            autocomplete="one-time-code"
-            :placeholder="t('输入 6 位验证码')"
+            v-model="credentials.username"
+            name="username"
+            autocomplete="username"
             required
           />
         </label>
-        <label v-else>
-          <span>{{ t('恢复码') }}</span>
-          <input
-            v-model="credentials.recovery_code"
-            name="recovery_code"
-            autocomplete="off"
-            :placeholder="t('输入恢复码')"
-            required
-          />
+        <label>
+          <span>{{ t('密码') }}</span>
+          <div class="auth-password">
+            <input
+              v-model="credentials.password"
+              name="password"
+              :type="passwordVisible ? 'text' : 'password'"
+              :autocomplete="mode === 'setup' ? 'new-password' : 'current-password'"
+              required
+              @focus="passwordFocused = true"
+              @blur="passwordFocused = false"
+            />
+            <button
+              class="icon-button auth-password-toggle"
+              type="button"
+              :aria-label="passwordVisible ? t('隐藏密码') : t('显示密码')"
+              :aria-pressed="passwordVisible"
+              :title="passwordVisible ? t('隐藏密码') : t('显示密码')"
+              @click.prevent="passwordVisible = !passwordVisible"
+            >
+              <EyeOff v-if="passwordVisible" :size="16" aria-hidden="true" />
+              <Eye v-else :size="16" aria-hidden="true" />
+            </button>
+          </div>
         </label>
-        <button
-          class="secondary wide"
-          type="button"
-          :disabled="saving"
-          @click="selectSecondFactorMode(secondFactorMode === 'totp' ? 'recovery' : 'totp')"
-        >
-          {{ secondFactorMode === 'totp' ? t('使用恢复码') : t('使用 TOTP 验证码') }}
+        <template v-if="mode === 'login' && secondFactorRequired">
+          <label v-if="secondFactorMode === 'totp'">
+            <span>{{ t('TOTP 验证码') }}</span>
+            <input
+              v-model="credentials.totp_code"
+              name="totp_code"
+              inputmode="numeric"
+              autocomplete="one-time-code"
+              :placeholder="t('输入 6 位验证码')"
+              required
+            />
+          </label>
+          <label v-else>
+            <span>{{ t('恢复码') }}</span>
+            <input
+              v-model="credentials.recovery_code"
+              name="recovery_code"
+              autocomplete="off"
+              :placeholder="t('输入恢复码')"
+              required
+            />
+          </label>
+          <button
+            class="secondary wide"
+            type="button"
+            :disabled="saving"
+            @click="selectSecondFactorMode(secondFactorMode === 'totp' ? 'recovery' : 'totp')"
+          >
+            {{ secondFactorMode === 'totp' ? t('使用恢复码') : t('使用 TOTP 验证码') }}
+          </button>
+        </template>
+        <button class="primary wide auth-submit" type="submit" :disabled="saving">
+          <span class="auth-submit-label">{{ saving ? t('处理中') : mode === 'setup' ? t('创建并进入') : t('登录') }}</span>
+          <ArrowRight class="auth-submit-icon" :size="18" aria-hidden="true" />
         </button>
-      </template>
-      <button class="primary wide" type="submit" :disabled="saving">
-        {{ saving ? t('处理中') : mode === 'setup' ? t('创建并进入') : t('登录') }}
-      </button>
-      <p class="auth-footnote">EmbyPanel · {{ appInfo.version || '0.2' }} · secure local console</p>
-    </form>
+        <p class="auth-footnote">EmbyPanel · {{ appInfo.version || '0.2' }} · secure local console</p>
+      </form>
+    </div>
   </main>
 
   <main v-else class="app-shell" :class="{ dark: darkMode, 'mobile-nav-open': mobileNavOpen }" @keydown.esc="closeMobileNav">
